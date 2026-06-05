@@ -1,0 +1,29 @@
+[package]
+name = "privacy-relayer"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Federation operator relayer: eth_sendRawTransaction shield/transfer/unshield submit + Bitcoin deposit watch (V1). No atomic-swap, no halo2."
+
+[[bin]]
+name = "privacy-relayer"
+path = "src/main.rs"
+
+[dependencies]
+privacy-core = { path = "../privacy-core" }
+anyhow = "1"
+axum = "0.7"
+clap = { version = "4", features = ["derive", "env"] }
+dotenvy = "0.15"
+glob = "0.3"
+hex = "0.4"
+k256 = { version = "0.13", features = ["ecdsa"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "native-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha3 = "0.10"
+sha2 = "0.10"
+bitcoin = { version = "0.32", features = ["rand-std"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
+tower-http = { version = "0.6", features = ["cors"] }
+url = "2"
