@@ -122,6 +122,10 @@ enum Command {
         chain_id: u64,
         #[arg(long, env = "PRIVACYBTC_RELAYER_PRIVATE_KEY")]
         private_key: String,
+        /// pERC20 issuer key (onlyIssuer). Used ONLY by /erc/mint/submit to sign+broadcast
+        /// the issuer-submitted `mint(...)`. Distinct from the relayer key above.
+        #[arg(long, env = "PERC20_ISSUER_PRIVATE_KEY")]
+        issuer_private_key: Option<String>,
         #[arg(long, env = "PRIVACYBTC_CONTRACT_ADDRESS")]
         contract: String,
         #[arg(long, env = "PRIVACYBTC_GAS_PRICE_GWEI", default_value_t = 1.0)]
@@ -238,6 +242,7 @@ async fn main() -> Result<()> {
             rpc_url,
             chain_id,
             private_key,
+            issuer_private_key,
             contract,
             gas_price_gwei,
             gas_limit_shield,
@@ -257,6 +262,7 @@ async fn main() -> Result<()> {
                 &rpc_url,
                 chain_id,
                 &private_key,
+                issuer_private_key.as_deref(),
                 &contract,
                 gas_price_gwei,
                 gas_limit_shield,
@@ -309,6 +315,8 @@ struct RelayerHttpConfig {
     rpc_url: String,
     chain_id: u64,
     private_key: String,
+    /// pERC20 issuer key (onlyIssuer), used only by /erc/mint/submit. None if unset.
+    issuer_private_key: Option<String>,
     contract: String,
     gas_price_gwei: f64,
     gas_limit_shield: u64,
@@ -437,11 +445,83 @@ async fn notify_pending_tx(indexer_url: Option<String>, tx_hash: String, contrac
     }
 }
 
+#[derive(Deserialize)]
+struct FrozenRootResp {
+    /// `rt_frozen` as 0x-prefixed little-endian 32-byte hex (indexer convention).
+    root_hex: String,
+}
+
+/// `GET {indexer}/frozen_root?pool={contract}` → `rt_frozen` as **big-endian** 32 bytes.
+///
+/// The indexer publishes the root little-endian (its on-the-wire convention, matching
+/// `/merkle_path` siblings); `pubFields` are big-endian `uint256` words, so we flip it
+/// here to compare in the same order.
+async fn fetch_frozen_root_be(indexer_base: &str, contract: &str) -> Result<[u8; 32]> {
+    let url = format!("{}/frozen_root?pool={}", indexer_base.trim_end_matches('/'), contract);
+    let client = reqwest::Client::builder().no_proxy().build().unwrap_or_default();
+    let resp: FrozenRootResp = client
+        .get(&url)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let mut bytes = parse_hex32(&resp.root_hex)?; // little-endian
+    bytes.reverse(); // → big-endian, matching pubFields[7]
+    Ok(bytes)
+}
+
+/// Pre-broadcast compliance gate. Every action's `pubFields[7]` (rt_frozen) must equal
+/// the indexer's current `/frozen_root`; otherwise the proof was built against a stale
+/// blacklist and the on-chain `_verifyAction` would revert with `BadFrozenRoot`. Catching
+/// it here turns a wasted, reverting broadcast into a clear, actionable error.
+///
+/// Best-effort on availability: if no `indexer_url` is configured, or the indexer is
+/// unreachable, this logs and proceeds (the on-chain check stays the ultimate gate). A
+/// *reachable* indexer reporting a mismatch is a hard error.
+async fn enforce_frozen_compliance(
+    indexer_url: Option<&str>,
+    contract: &str,
+    bundle: &OrchardStoredBundle,
+) -> Result<()> {
+    let Some(base) = indexer_url else { return Ok(()) };
+    let expected_be = match fetch_frozen_root_be(base, contract).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "[relayer] frozen-root preflight skipped (indexer unreachable: {e:#}); \
+                 relying on the on-chain BadFrozenRoot guard"
+            );
+            return Ok(());
+        }
+    };
+    for (i, a) in bundle.actions.iter().enumerate() {
+        let pf = a
+            .pub_fields_bn254
+            .as_ref()
+            .ok_or_else(|| anyhow!("action {i} missing pub_fields_bn254"))?;
+        let got = pf
+            .get(7)
+            .ok_or_else(|| anyhow!("action {i} pub_fields_bn254 has fewer than 8 entries"))?;
+        if got.as_slice() != expected_be {
+            return Err(anyhow!(
+                "action {i} pubFields[7] (rt_frozen) does not match the indexer's /frozen_root: \
+                 the proof was built against a stale compliance root. Re-prove against the current \
+                 frozen set (GET /frozen_witness). expected 0x{} got 0x{}",
+                hex::encode(expected_be),
+                hex::encode(got)
+            ));
+        }
+    }
+    Ok(())
+}
+
 async fn run_http_server(
     bind: &str,
     rpc_url: &str,
     chain_id: u64,
     private_key: &str,
+    issuer_private_key: Option<&str>,
     contract: &str,
     gas_price_gwei: f64,
     gas_limit_shield: u64,
@@ -473,6 +553,7 @@ async fn run_http_server(
         rpc_url: rpc_url.to_string(),
         chain_id,
         private_key: private_key.to_string(),
+        issuer_private_key: issuer_private_key.map(|s| s.to_string()),
         contract: contract.to_string(),
         gas_price_gwei,
         gas_limit_shield,
@@ -499,6 +580,7 @@ async fn run_http_server(
         .route("/unshield/finalize", post(http_unshield_finalize))  // legacy, kept for compat
         .route("/erc/shield/submit", post(http_erc_shield_submit))
         .route("/submit_raw", post(http_submit_raw))
+        .route("/erc/mint/submit", post(http_erc_mint_submit))
         .layer(build_cors_layer())
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(bind)
@@ -648,6 +730,7 @@ async fn http_shield_auto(
             cfg.gas_price_gwei,
             cfg.gas_limit_shield,
             &cfg.nonce_cache,
+            cfg.indexer_url.as_deref(),
         )
         .await?;
         tokio::spawn(notify_pending_tx(
@@ -696,6 +779,7 @@ async fn http_shield_submit(
         cfg.gas_price_gwei,
         cfg.gas_limit_shield,
         &cfg.nonce_cache,
+        cfg.indexer_url.as_deref(),
     )
     .await
     .map_err(http_error)?;
@@ -729,6 +813,7 @@ async fn http_transfer_auto(
             cfg.gas_price_gwei,
             cfg.gas_limit_transfer,
             &cfg.nonce_cache,
+            cfg.indexer_url.as_deref(),
         )
         .await?;
         {
@@ -791,6 +876,7 @@ async fn http_transfer_submit(
         cfg.gas_price_gwei,
         cfg.gas_limit_transfer,
         &cfg.nonce_cache,
+        cfg.indexer_url.as_deref(),
     )
     .await
     .map_err(http_error)?;
@@ -913,6 +999,7 @@ async fn http_unshield_submit(
         cfg.gas_price_gwei,
         cfg.gas_limit_unshield,
         &cfg.nonce_cache,
+        cfg.indexer_url.as_deref(),
     )
     .await
     .map_err(http_error)?;
@@ -976,6 +1063,86 @@ struct HttpErcShieldSubmitRequest {
 
 // /erc/unshield/submit removed — use /unshield/submit with recipient_evm instead.
 
+#[derive(Deserialize)]
+struct HttpMintSubmitRequest {
+    /// pERC20 pool (asset) address, 0x + 40 hex.
+    contract: String,
+    /// Full `mint(uint256,(bytes,uint256[3]))` calldata as 0x hex, built off-chain (forge).
+    calldata: String,
+}
+
+/// Submit an issuer-signed pERC20 `mint(...)`: broadcast pre-built calldata to the pool, signed
+/// with the configured issuer key (`PERC20_ISSUER_PRIVATE_KEY`). `mint` is `onlyIssuer`, so the
+/// relayer's normal key cannot be used. The compliance `frozenRoot` is a separate one-time
+/// issuer setup (handled outside the relayer), not part of this call.
+async fn http_erc_mint_submit(
+    State(cfg): State<Arc<RelayerHttpConfig>>,
+    Json(req): Json<HttpMintSubmitRequest>,
+) -> Result<Json<HttpTxResponse>, (StatusCode, Json<HttpErrorResponse>)> {
+    let issuer_key = cfg.issuer_private_key.as_deref().ok_or_else(|| {
+        http_error(anyhow!(
+            "mint submit disabled: set PERC20_ISSUER_PRIVATE_KEY on the relayer (mint is onlyIssuer)"
+        ))
+    })?;
+    let cd_hex = req.calldata.strip_prefix("0x").unwrap_or(&req.calldata);
+    let calldata =
+        hex::decode(cd_hex).map_err(|e| http_error(anyhow!("bad calldata hex: {e}")))?;
+
+    // mint() is the heaviest op (Groth16 pairing + Poseidon depth-32 Merkle insert + Baby JubJub
+    // Schnorr verify), so the shield/transfer budgets out-of-gas. But a fixed large limit gets
+    // rejected by some providers (e.g. Sepolia/Infura: "gas limit too high"). So estimate gas
+    // from the actual calldata and add a 30% margin. An explicit PERC20_MINT_GAS_LIMIT overrides
+    // estimation; if estimation fails (e.g. the pool's frozenRoot isn't set yet) fall back to 8M.
+    let mint_gas_limit: u64 = match std::env::var("PERC20_MINT_GAS_LIMIT")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        Some(g) => g,
+        None => {
+            let issuer_addr = match parse_hex_key(issuer_key) {
+                Ok(sk) => format!("0x{}", hex::encode(eth_address_from_signing_key(&sk))),
+                Err(e) => return Err(http_error(anyhow!("bad issuer key: {e}"))),
+            };
+            let est_client = EthRpcClient::new(cfg.rpc_url.clone());
+            let estimated = match est_client.estimate_gas(&issuer_addr, &req.contract, &calldata).await {
+                Ok(est) => est.saturating_mul(13) / 10, // +30% margin
+                Err(e) => {
+                    eprintln!("[mint] eth_estimateGas failed ({e}); using floor");
+                    0
+                }
+            };
+            // Clamp: a pERC20 mint needs ~5M gas. Floor at 8M so a low/flaky estimate — e.g. an
+            // RPC fallback to a chain where the pool has no code returns ~intrinsic — can't yield
+            // an "intrinsic gas too low" tx; cap at 15M to stay under provider per-tx limits
+            // ("gas limit too high"). Set PERC20_MINT_GAS_LIMIT to override entirely.
+            estimated.clamp(8_000_000, 15_000_000)
+        }
+    };
+    eprintln!("[mint] gas limit = {mint_gas_limit}");
+    // Fresh nonce cache: the issuer sender differs from the relayer's normal key, so it must
+    // sync its own nonce from chain rather than reuse the relayer's in-process counter.
+    let nonce_cache = Arc::new(Mutex::new(None));
+    let tx_hash = send_raw_calldata(
+        &cfg.rpc_url,
+        cfg.chain_id,
+        issuer_key,
+        &req.contract,
+        calldata,
+        0,
+        cfg.gas_price_gwei,
+        mint_gas_limit,
+        &nonce_cache,
+    )
+    .await
+    .map_err(http_error)?;
+
+    if let Some(indexer) = cfg.indexer_url.clone() {
+        tokio::spawn(notify_pending_tx(Some(indexer), tx_hash.clone(), req.contract.clone()));
+    }
+    println!("erc mint eth_sendRawTransaction ok: {tx_hash}");
+    Ok(Json(HttpTxResponse { tx_hash }))
+}
+
 async fn http_erc_shield_submit(
     State(cfg): State<Arc<RelayerHttpConfig>>,
     Json(req): Json<HttpErcShieldSubmitRequest>,
@@ -999,6 +1166,10 @@ async fn http_erc_shield_submit(
         [0u8; 32]
     };
 
+
+    enforce_frozen_compliance(cfg.indexer_url.as_deref(), &cfg.contract, &req.bundle)
+        .await
+        .map_err(http_error)?;
 
     let actions     = bundle_to_action_args(&req.bundle).map_err(|e| http_error(anyhow!("bundle decode: {e}")))?;
     let binding_sig = bundle_binding_sig(&req.bundle).map_err(|e| http_error(anyhow!("binding_sig: {e}")))?;
@@ -1487,6 +1658,7 @@ async fn shield_submit(
         gas_price_gwei,
         gas_limit,
         &cli_nonce_cache,
+        None,
     )
     .await?;
     println!("eth_sendRawTransaction ok: {tx_hash}");
@@ -1507,7 +1679,10 @@ async fn submit_shield_bundle(
     gas_price_gwei: f64,
     gas_limit: u64,
     nonce_cache: &Arc<Mutex<Option<u64>>>,
+    indexer_url: Option<&str>,
 ) -> Result<String> {
+    enforce_frozen_compliance(indexer_url, contract, bundle).await?;
+
     let binding_sig = bundle
         .binding_sig_bn254
         .ok_or_else(|| anyhow!("bundle.binding_sig_bn254 is missing"))?;
@@ -1575,7 +1750,10 @@ async fn submit_transfer_bundle(
     gas_price_gwei: f64,
     gas_limit: u64,
     nonce_cache: &Arc<Mutex<Option<u64>>>,
+    indexer_url: Option<&str>,
 ) -> Result<String> {
+    enforce_frozen_compliance(indexer_url, contract, bundle).await?;
+
     let binding_sig = bundle
         .binding_sig_bn254
         .ok_or_else(|| anyhow!("bundle.binding_sig_bn254 is missing"))?;
@@ -1648,7 +1826,10 @@ async fn submit_unshield_bundle(
     gas_price_gwei: f64,
     gas_limit: u64,
     nonce_cache: &Arc<Mutex<Option<u64>>>,
+    indexer_url: Option<&str>,
 ) -> Result<String> {
+    enforce_frozen_compliance(indexer_url, contract, bundle).await?;
+
     let binding_sig = bundle
         .binding_sig_bn254
         .ok_or_else(|| anyhow!(
@@ -2141,15 +2322,21 @@ struct EthRpcClient {
 
 impl EthRpcClient {
     fn new(url: String) -> Self {
-        let fallbacks = vec![
-            "https://arb1.arbitrum.io/rpc".to_string(),
-            "https://rpc.ankr.com/arbitrum".to_string(),
-            "https://arb-mainnet.g.alchemy.com/v2/6FmdfM7xgfxf6tJwJpnQi".to_string(),
-        ];
+        // Optional fallback RPCs, comma-separated in PRIVACYBTC_ETH_RPC_FALLBACK_URLS. Default:
+        // NONE (use only the configured primary). These MUST be on the SAME chain as `url`.
+        //
+        // This previously hardcoded Arbitrum-mainnet URLs, which silently returned WRONG-CHAIN
+        // results whenever the primary RPC hiccuped: e.g. on a Sepolia deployment, eth_estimateGas
+        // would fall back to Arbitrum (where the pool has no code) and return ~intrinsic gas,
+        // producing an unsendable "intrinsic gas too low" mint tx. Cross-chain fallbacks are
+        // never safe, so they are no longer baked in.
         let mut urls = vec![url.clone()];
-        for f in fallbacks {
-            if f != url && !urls.contains(&f) {
-                urls.push(f);
+        if let Ok(extra) = std::env::var("PRIVACYBTC_ETH_RPC_FALLBACK_URLS") {
+            for f in extra.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                let f = f.to_string();
+                if f != url && !urls.contains(&f) {
+                    urls.push(f);
+                }
             }
         }
         let http = Client::builder()
@@ -2180,6 +2367,20 @@ impl EthRpcClient {
         let hex_tx = format!("0x{}", hex::encode(raw_tx));
         self.rpc_call("eth_sendRawTransaction", serde_json::json!([hex_tx]))
             .await
+    }
+
+    /// `eth_estimateGas` for a call `{from, to, data}` against the latest state. Returns the
+    /// estimated gas units. Used to size mint() (heavy: pairing + Poseidon Merkle + Schnorr)
+    /// without hardcoding a limit that may exceed a provider's per-tx cap.
+    async fn estimate_gas(&self, from: &str, to: &str, data: &[u8]) -> Result<u64> {
+        let hex_data = format!("0x{}", hex::encode(data));
+        let hex_gas: String = self
+            .rpc_call(
+                "eth_estimateGas",
+                serde_json::json!([{ "from": from, "to": to, "data": hex_data }]),
+            )
+            .await?;
+        parse_hex_u64(&hex_gas)
     }
 
     /// Current `baseFeePerGas` (wei) from the latest block (EIP-1559 chains).
