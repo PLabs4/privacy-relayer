@@ -15,6 +15,10 @@ use privacy_core::ethereum::{
     bundle_value_balance_be, evm_address_to_recipient_meta, parse_evm_address_hex,
     BundleActionArgs, BundleCalldataArgs, ErcShieldCalldataArgs,
     FinalizeWithdrawCalldataArgs,
+    // WS-6: WrappedPERC20 + SwapCoordinator calldata (privacy-core 0.1.2).
+    compute_swap_id, encode_swap_initiate_calldata, encode_swap_join_calldata,
+    encode_swap_settle_calldata, encode_wrapped_shield_calldata, encode_wrapped_unshield_calldata,
+    privacy_call_commit, PrivacyCallArgs,
 };
 use reqwest::Client;
 use serde::de::DeserializeOwned;
@@ -137,6 +141,14 @@ enum Command {
         gas_limit_unshield: u64,
         #[arg(long, env = "PRIVACYBTC_GAS_LIMIT_TRANSFER", default_value_t = 5_000_000)]
         gas_limit_transfer: u64,
+        /// Address of the `SwapCoordinator` for 3-tx atomic swaps. Required for /swap/* routes;
+        /// each request may also override it per-call.
+        #[arg(long, env = "PRIVACYBTC_SWAP_COORDINATOR_ADDRESS")]
+        swap_coordinator: Option<String>,
+        /// Gas limit for `settle` (two Groth16 verifies + two transfers — the heaviest call).
+        /// `initiateSwap`/`joinSwap` use a small fixed limit.
+        #[arg(long, env = "PRIVACYBTC_GAS_LIMIT_SWAP", default_value_t = 9_000_000)]
+        gas_limit_swap: u64,
         /// Optional: enable automatic shield submit from Bitcoin deposits.
         #[arg(long, env = "PRIVACYBTC_BTC_RPC_URL")]
         btc_rpc_url: Option<String>,
@@ -248,6 +260,8 @@ async fn main() -> Result<()> {
             gas_limit_shield,
             gas_limit_unshield,
             gas_limit_transfer,
+            swap_coordinator,
+            gas_limit_swap,
             btc_rpc_url,
             deposit_address,
             intent_dir,
@@ -268,6 +282,8 @@ async fn main() -> Result<()> {
                 gas_limit_shield,
                 gas_limit_unshield,
                 gas_limit_transfer,
+                swap_coordinator.as_deref(),
+                gas_limit_swap,
                 btc_rpc_url.as_deref(),
                 deposit_address.as_deref(),
                 intent_dir.as_deref(),
@@ -322,6 +338,10 @@ struct RelayerHttpConfig {
     gas_limit_shield: u64,
     gas_limit_unshield: u64,
     gas_limit_transfer: u64,
+    /// Default `SwapCoordinator` address for /swap/* routes (per-request override allowed).
+    swap_coordinator: Option<String>,
+    /// Gas limit for `settle` (heaviest swap call).
+    gas_limit_swap: u64,
     auto_shield: Option<AutoShieldConfig>,
     auto_transfer: Option<AutoTransferConfig>,
     /// WIF-encoded secp256k1 private key for the federation payout wallet.
@@ -527,6 +547,8 @@ async fn run_http_server(
     gas_limit_shield: u64,
     gas_limit_unshield: u64,
     gas_limit_transfer: u64,
+    swap_coordinator: Option<&str>,
+    gas_limit_swap: u64,
     btc_rpc_url: Option<&str>,
     deposit_address: Option<&str>,
     intent_dir: Option<&Path>,
@@ -559,6 +581,8 @@ async fn run_http_server(
         gas_limit_shield,
         gas_limit_unshield,
         gas_limit_transfer,
+        swap_coordinator: swap_coordinator.map(|s| s.to_string()),
+        gas_limit_swap,
         auto_shield,
         auto_transfer,
         btc_payout_wif: btc_payout_wif.map(|s| s.to_string()),
@@ -581,6 +605,12 @@ async fn run_http_server(
         .route("/erc/shield/submit", post(http_erc_shield_submit))
         .route("/submit_raw", post(http_submit_raw))
         .route("/erc/mint/submit", post(http_erc_mint_submit))
+        // ── WS-6: WrappedPERC20 shield/unshield + 3-tx atomic swap ──
+        .route("/wrapped/shield/calldata", post(http_wrapped_shield_calldata))
+        .route("/wrapped/unshield/submit", post(http_wrapped_unshield_submit))
+        .route("/swap/initiate", post(http_swap_initiate))
+        .route("/swap/join", post(http_swap_join))
+        .route("/swap/settle", post(http_swap_settle))
         .layer(build_cors_layer())
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(bind)
@@ -1251,6 +1281,324 @@ fn bundle_to_action_args(bundle: &OrchardStoredBundle) -> Result<Vec<BundleActio
 fn bundle_binding_sig(bundle: &OrchardStoredBundle) -> Result<[[u8; 32]; 3]> {
     bundle.binding_sig_bn254
         .ok_or_else(|| anyhow!("bundle.binding_sig_bn254 is missing"))
+}
+
+// ── WS-6: WrappedPERC20 + SwapCoordinator submit/orchestration ────────────────
+//
+// Custody model: **raw_relay**. The relayer never holds or approves the underlying
+// ERC20. `shield` (which pulls funds from `msg.sender`) is returned as calldata for the
+// depositor to sign and send (or push via /submit_raw). `unshield`/`swap` are value-neutral
+// or recipient-bound at the contract layer, so the relayer can sign them as the orchestrator
+// without custody risk. The relayer only forwards already-proved, already-signed bundles
+// (v2 sighash, executor bound by the prover); it never re-signs the Schnorr layer.
+
+/// `initiateSwap`/`joinSwap` only store state (+ verify the joiner's Schnorr); keep them well
+/// under the heavy `settle` budget.
+const SWAP_INIT_JOIN_GAS: u64 = 1_500_000;
+
+/// Build a `PrivacyCall` (actions + bindingSig) from a proved bundle.
+fn bundle_to_privacy_call(bundle: &OrchardStoredBundle) -> Result<PrivacyCallArgs> {
+    Ok(PrivacyCallArgs {
+        actions: bundle_to_action_args(bundle)?,
+        binding_sig: bundle_binding_sig(bundle)?,
+    })
+}
+
+/// Resolve the coordinator address: per-request override, else the configured default.
+fn resolve_coordinator(cfg: &RelayerHttpConfig, override_: &Option<String>) -> Result<String> {
+    override_
+        .clone()
+        .or_else(|| cfg.swap_coordinator.clone())
+        .ok_or_else(|| {
+            anyhow!("no SwapCoordinator configured (set PRIVACYBTC_SWAP_COORDINATOR_ADDRESS or pass `coordinator`)")
+        })
+}
+
+/// 20-byte EVM address of the relayer EOA (derived from its signing key).
+fn relayer_address20(private_key: &str) -> Result<[u8; 20]> {
+    let sk = parse_hex_key(private_key)?;
+    Ok(eth_address_from_signing_key(&sk))
+}
+
+/// Parse a 96-byte (`uint256[3]`) Schnorr signature hex into `[[u8;32];3]`.
+fn parse_sig96_hex(s: &str) -> Result<[[u8; 32]; 3]> {
+    let bytes = hex::decode(strip_0x(s)).context("invalid signature hex")?;
+    if bytes.len() != 96 {
+        return Err(anyhow!("signature must be 96 bytes (uint256[3]), got {}", bytes.len()));
+    }
+    Ok([
+        bytes[0..32].try_into().unwrap(),
+        bytes[32..64].try_into().unwrap(),
+        bytes[64..96].try_into().unwrap(),
+    ])
+}
+
+/// Resolve a leg commitment: explicit `commit_hex`, else `keccak256(abi.encode(PrivacyCall))`
+/// derived from the proved `bundle`.
+fn resolve_commit(commit_hex: &Option<String>, bundle: &Option<OrchardStoredBundle>) -> Result<[u8; 32]> {
+    if let Some(h) = commit_hex {
+        return parse_hex32(h);
+    }
+    let b = bundle
+        .as_ref()
+        .ok_or_else(|| anyhow!("provide either commit hex or the proved bundle to derive it"))?;
+    Ok(privacy_call_commit(&bundle_to_privacy_call(b)?))
+}
+
+#[derive(Debug, Deserialize)]
+struct WrappedShieldCalldataRequest {
+    /// WrappedPERC20 pool address.
+    contract: String,
+    bundle: OrchardStoredBundle,
+    /// Deposit amount in NOTE UNITS (contract pulls `amount_units * scale` underlying).
+    amount_units: u64,
+}
+
+#[derive(serde::Serialize)]
+struct CalldataResponse {
+    to: String,
+    data: String,
+    value: String,
+}
+
+/// `shield` is custody-sensitive (pulls underlying from `msg.sender`), so under the raw_relay
+/// model the relayer returns the calldata for the depositor to sign + send themselves (or push
+/// via /submit_raw). It does not sign.
+async fn http_wrapped_shield_calldata(
+    State(cfg): State<Arc<RelayerHttpConfig>>,
+    Json(req): Json<WrappedShieldCalldataRequest>,
+) -> Result<Json<CalldataResponse>, (StatusCode, Json<HttpErrorResponse>)> {
+    enforce_frozen_compliance(cfg.indexer_url.as_deref(), &req.contract, &req.bundle)
+        .await
+        .map_err(http_error)?;
+    let call = bundle_to_privacy_call(&req.bundle).map_err(http_error)?;
+    let calldata = encode_wrapped_shield_calldata(req.amount_units, &call);
+    Ok(Json(CalldataResponse {
+        to: req.contract,
+        data: format!("0x{}", hex::encode(calldata)),
+        value: "0x0".to_string(),
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct WrappedUnshieldSubmitRequest {
+    /// WrappedPERC20 pool address.
+    contract: String,
+    bundle: OrchardStoredBundle,
+    /// Withdraw amount in NOTE UNITS.
+    amount_units: u64,
+    /// EVM recipient of the released underlying. MUST match the `recipientMeta` bound in the
+    /// proved binding signature, or the contract reverts.
+    recipient_evm: String,
+}
+
+/// `unshield(amount, recipient, call)` — relayer-signed (gasless withdraw). No custody risk:
+/// the recipient is bound into the on-chain sighash, so the relayer cannot redirect funds.
+async fn http_wrapped_unshield_submit(
+    State(cfg): State<Arc<RelayerHttpConfig>>,
+    Json(req): Json<WrappedUnshieldSubmitRequest>,
+) -> Result<Json<HttpTxResponse>, (StatusCode, Json<HttpErrorResponse>)> {
+    enforce_frozen_compliance(cfg.indexer_url.as_deref(), &req.contract, &req.bundle)
+        .await
+        .map_err(http_error)?;
+    let recipient = parse_evm_address_hex(&req.recipient_evm)
+        .map_err(|e| http_error(anyhow!("bad recipient_evm: {e}")))?;
+    let call = bundle_to_privacy_call(&req.bundle).map_err(http_error)?;
+    let calldata = encode_wrapped_unshield_calldata(req.amount_units, &recipient, &call);
+    let tx_hash = send_raw_calldata(
+        &cfg.rpc_url,
+        cfg.chain_id,
+        &cfg.private_key,
+        &req.contract,
+        calldata,
+        0,
+        cfg.gas_price_gwei,
+        cfg.gas_limit_unshield,
+        &cfg.nonce_cache,
+    )
+    .await
+    .map_err(http_error)?;
+    tokio::spawn(notify_pending_tx(cfg.indexer_url.clone(), tx_hash.clone(), req.contract.clone()));
+    println!("[wrapped/unshield] submitted: tx={tx_hash} amount_units={}", req.amount_units);
+    Ok(Json(HttpTxResponse { tx_hash }))
+}
+
+#[derive(Debug, Deserialize)]
+struct SwapInitiateRequest {
+    #[serde(default)]
+    coordinator: Option<String>,
+    pool_a: String,
+    pool_b: String,
+    htlc_hash_hex: String,
+    deadline: u64,
+    salt_hex: String,
+    /// Leg-A commitment, or the proved leg-A bundle to derive it.
+    #[serde(default)]
+    commit_a_hex: Option<String>,
+    #[serde(default)]
+    bundle_a: Option<OrchardStoredBundle>,
+}
+
+#[derive(serde::Serialize)]
+struct SwapInitiateResponse {
+    tx_hash: String,
+    swap_id: String,
+    commit_a: String,
+    initiator: String,
+}
+
+/// `initiateSwap(...)` — relayer is the initiator EOA; returns the locally-derived `swap_id`
+/// so the caller can drive `joinSwap`/`settle` without parsing the receipt.
+async fn http_swap_initiate(
+    State(cfg): State<Arc<RelayerHttpConfig>>,
+    Json(req): Json<SwapInitiateRequest>,
+) -> Result<Json<SwapInitiateResponse>, (StatusCode, Json<HttpErrorResponse>)> {
+    async {
+        let coordinator = resolve_coordinator(&cfg, &req.coordinator)?;
+        let pool_a = parse_evm_address_hex(&req.pool_a).map_err(|e| anyhow!("bad pool_a: {e}"))?;
+        let pool_b = parse_evm_address_hex(&req.pool_b).map_err(|e| anyhow!("bad pool_b: {e}"))?;
+        let htlc_hash = parse_hex32(&req.htlc_hash_hex).context("htlc_hash_hex")?;
+        let salt = parse_hex32(&req.salt_hex).context("salt_hex")?;
+        let commit_a = resolve_commit(&req.commit_a_hex, &req.bundle_a)?;
+        let initiator = relayer_address20(&cfg.private_key)?;
+        let swap_id = compute_swap_id(&initiator, &pool_a, &pool_b, &htlc_hash, &commit_a, &salt);
+        let calldata =
+            encode_swap_initiate_calldata(&pool_a, &pool_b, &htlc_hash, &commit_a, req.deadline, &salt);
+        let tx_hash = send_raw_calldata(
+            &cfg.rpc_url,
+            cfg.chain_id,
+            &cfg.private_key,
+            &coordinator,
+            calldata,
+            0,
+            cfg.gas_price_gwei,
+            SWAP_INIT_JOIN_GAS,
+            &cfg.nonce_cache,
+        )
+        .await?;
+        println!("[swap/initiate] tx={tx_hash} swap_id=0x{}", hex::encode(swap_id));
+        Ok::<_, anyhow::Error>(SwapInitiateResponse {
+            tx_hash,
+            swap_id: format!("0x{}", hex::encode(swap_id)),
+            commit_a: format!("0x{}", hex::encode(commit_a)),
+            initiator: format!("0x{}", hex::encode(initiator)),
+        })
+    }
+    .await
+    .map(Json)
+    .map_err(http_error)
+}
+
+#[derive(Debug, Deserialize)]
+struct SwapJoinRequest {
+    #[serde(default)]
+    coordinator: Option<String>,
+    swap_id_hex: String,
+    /// Leg-B commitment, or the proved leg-B bundle to derive it.
+    #[serde(default)]
+    commit_b_hex: Option<String>,
+    #[serde(default)]
+    bundle_b: Option<OrchardStoredBundle>,
+    /// Joiner's randomised spend-auth key coordinates (BE 32-byte hex).
+    rk_bx_hex: String,
+    rk_by_hex: String,
+    /// Joiner's Baby JubJub Schnorr signature over the join challenge (96-byte hex).
+    joiner_sig_hex: String,
+}
+
+/// `joinSwap(...)` — relayer-signed; joiner authentication is cryptographic (`rk_B` + sig),
+/// independent of `msg.sender`.
+async fn http_swap_join(
+    State(cfg): State<Arc<RelayerHttpConfig>>,
+    Json(req): Json<SwapJoinRequest>,
+) -> Result<Json<HttpTxResponse>, (StatusCode, Json<HttpErrorResponse>)> {
+    async {
+        let coordinator = resolve_coordinator(&cfg, &req.coordinator)?;
+        let swap_id = parse_hex32(&req.swap_id_hex).context("swap_id_hex")?;
+        let commit_b = resolve_commit(&req.commit_b_hex, &req.bundle_b)?;
+        let rk_bx = parse_hex32(&req.rk_bx_hex).context("rk_bx_hex")?;
+        let rk_by = parse_hex32(&req.rk_by_hex).context("rk_by_hex")?;
+        let joiner_sig = parse_sig96_hex(&req.joiner_sig_hex)?;
+        let calldata = encode_swap_join_calldata(&swap_id, &commit_b, &rk_bx, &rk_by, &joiner_sig);
+        let tx_hash = send_raw_calldata(
+            &cfg.rpc_url,
+            cfg.chain_id,
+            &cfg.private_key,
+            &coordinator,
+            calldata,
+            0,
+            cfg.gas_price_gwei,
+            SWAP_INIT_JOIN_GAS,
+            &cfg.nonce_cache,
+        )
+        .await?;
+        println!("[swap/join] tx={tx_hash} swap_id={}", req.swap_id_hex);
+        Ok::<_, anyhow::Error>(HttpTxResponse { tx_hash })
+    }
+    .await
+    .map(Json)
+    .map_err(http_error)
+}
+
+#[derive(Debug, Deserialize)]
+struct SwapSettleRequest {
+    #[serde(default)]
+    coordinator: Option<String>,
+    swap_id_hex: String,
+    /// HTLC preimage (bytes32 hex).
+    secret_hex: String,
+    /// Proved leg-A and leg-B bundles (executor = coordinator, bound by the prover).
+    bundle_a: OrchardStoredBundle,
+    bundle_b: OrchardStoredBundle,
+    /// Optional pool addresses to notify the indexer of the broadcast tx.
+    #[serde(default)]
+    pool_a: Option<String>,
+    #[serde(default)]
+    pool_b: Option<String>,
+}
+
+/// `settle(swapId, secret, callA, callB)` — relayer-signed; atomically executes both legs.
+async fn http_swap_settle(
+    State(cfg): State<Arc<RelayerHttpConfig>>,
+    Json(req): Json<SwapSettleRequest>,
+) -> Result<Json<HttpTxResponse>, (StatusCode, Json<HttpErrorResponse>)> {
+    let coordinator = resolve_coordinator(&cfg, &req.coordinator).map_err(http_error)?;
+    let swap_id = parse_hex32(&req.swap_id_hex)
+        .map_err(|e| http_error(anyhow!("swap_id_hex: {e}")))?;
+    let secret = parse_hex32(&req.secret_hex)
+        .map_err(|e| http_error(anyhow!("secret_hex: {e}")))?;
+    // Frozen-compliance preflight on both legs (the on-chain settle would otherwise revert late).
+    if let Some(pool) = req.pool_a.as_deref() {
+        enforce_frozen_compliance(cfg.indexer_url.as_deref(), pool, &req.bundle_a)
+            .await
+            .map_err(http_error)?;
+    }
+    if let Some(pool) = req.pool_b.as_deref() {
+        enforce_frozen_compliance(cfg.indexer_url.as_deref(), pool, &req.bundle_b)
+            .await
+            .map_err(http_error)?;
+    }
+    let call_a = bundle_to_privacy_call(&req.bundle_a).map_err(http_error)?;
+    let call_b = bundle_to_privacy_call(&req.bundle_b).map_err(http_error)?;
+    let calldata = encode_swap_settle_calldata(&swap_id, &secret, &call_a, &call_b);
+    let tx_hash = send_raw_calldata(
+        &cfg.rpc_url,
+        cfg.chain_id,
+        &cfg.private_key,
+        &coordinator,
+        calldata,
+        0,
+        cfg.gas_price_gwei,
+        cfg.gas_limit_swap,
+        &cfg.nonce_cache,
+    )
+    .await
+    .map_err(http_error)?;
+    for pool in [req.pool_a.clone(), req.pool_b.clone()].into_iter().flatten() {
+        tokio::spawn(notify_pending_tx(cfg.indexer_url.clone(), tx_hash.clone(), pool));
+    }
+    println!("[swap/settle] tx={tx_hash} swap_id={}", req.swap_id_hex);
+    Ok(Json(HttpTxResponse { tx_hash }))
 }
 
 /// Acquire the next sequential nonce.
