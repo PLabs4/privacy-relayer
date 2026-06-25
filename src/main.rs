@@ -1432,6 +1432,11 @@ struct SwapInitiateRequest {
     htlc_hash_hex: String,
     deadline: u64,
     salt_hex: String,
+    /// Joiner's randomised spend-auth key coordinates (BE 32-byte hex), agreed off-chain during
+    /// matching and pre-committed by the initiator (audit A-1). They are part of `swap_id` and the
+    /// join challenge; only the counterparty controlling `rkB` can later `joinSwap`.
+    rk_bx_hex: String,
+    rk_by_hex: String,
     /// Leg-A commitment, or the proved leg-A bundle to derive it.
     #[serde(default)]
     commit_a_hex: Option<String>,
@@ -1459,11 +1464,15 @@ async fn http_swap_initiate(
         let pool_b = parse_evm_address_hex(&req.pool_b).map_err(|e| anyhow!("bad pool_b: {e}"))?;
         let htlc_hash = parse_hex32(&req.htlc_hash_hex).context("htlc_hash_hex")?;
         let salt = parse_hex32(&req.salt_hex).context("salt_hex")?;
+        let rk_bx = parse_hex32(&req.rk_bx_hex).context("rk_bx_hex")?;
+        let rk_by = parse_hex32(&req.rk_by_hex).context("rk_by_hex")?;
         let commit_a = resolve_commit(&req.commit_a_hex, &req.bundle_a)?;
         let initiator = relayer_address20(&cfg.private_key)?;
-        let swap_id = compute_swap_id(&initiator, &pool_a, &pool_b, &htlc_hash, &commit_a, &salt);
-        let calldata =
-            encode_swap_initiate_calldata(&pool_a, &pool_b, &htlc_hash, &commit_a, req.deadline, &salt);
+        let swap_id =
+            compute_swap_id(&initiator, &pool_a, &pool_b, &htlc_hash, &commit_a, &rk_bx, &rk_by, &salt);
+        let calldata = encode_swap_initiate_calldata(
+            &pool_a, &pool_b, &htlc_hash, &commit_a, &rk_bx, &rk_by, req.deadline, &salt,
+        );
         let tx_hash = send_raw_calldata(
             &cfg.rpc_url,
             cfg.chain_id,
@@ -1499,9 +1508,12 @@ struct SwapJoinRequest {
     commit_b_hex: Option<String>,
     #[serde(default)]
     bundle_b: Option<OrchardStoredBundle>,
-    /// Joiner's randomised spend-auth key coordinates (BE 32-byte hex).
-    rk_bx_hex: String,
-    rk_by_hex: String,
+    /// Joiner's randomised spend-auth key coordinates (BE 32-byte hex). Accepted for backward
+    /// compatibility but no longer used on-chain: `rkB` is read from the swap the initiator opened.
+    #[serde(default)]
+    rk_bx_hex: Option<String>,
+    #[serde(default)]
+    rk_by_hex: Option<String>,
     /// Joiner's Baby JubJub Schnorr signature over the join challenge (96-byte hex).
     joiner_sig_hex: String,
 }
@@ -1516,10 +1528,9 @@ async fn http_swap_join(
         let coordinator = resolve_coordinator(&cfg, &req.coordinator)?;
         let swap_id = parse_hex32(&req.swap_id_hex).context("swap_id_hex")?;
         let commit_b = resolve_commit(&req.commit_b_hex, &req.bundle_b)?;
-        let rk_bx = parse_hex32(&req.rk_bx_hex).context("rk_bx_hex")?;
-        let rk_by = parse_hex32(&req.rk_by_hex).context("rk_by_hex")?;
+        let _ = (&req.rk_bx_hex, &req.rk_by_hex); // rkB is read from storage on-chain (audit A-1)
         let joiner_sig = parse_sig96_hex(&req.joiner_sig_hex)?;
-        let calldata = encode_swap_join_calldata(&swap_id, &commit_b, &rk_bx, &rk_by, &joiner_sig);
+        let calldata = encode_swap_join_calldata(&swap_id, &commit_b, &joiner_sig);
         let tx_hash = send_raw_calldata(
             &cfg.rpc_url,
             cfg.chain_id,
