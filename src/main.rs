@@ -4,6 +4,8 @@
 //! **Multisig / policy**: deploy a Gnosis Safe (or similar) as `PrivacyBTC.federation` so the
 //! relay EOA is replaced by multisig execution; this binary stays single-key for local signing.
 
+mod screening;
+
 use anyhow::{anyhow, Context, Result};
 use axum::{extract::{Query, State}, http::StatusCode, routing::get, routing::post, Json, Router};
 use clap::{Parser, Subcommand};
@@ -355,6 +357,8 @@ struct RelayerHttpConfig {
     /// In-process nonce counter. Initialized from chain on first use, then incremented
     /// locally so concurrent / back-to-back requests never reuse the same nonce.
     nonce_cache: Arc<Mutex<Option<u64>>>,
+    /// Layer 1 sanctions screening (off by default; configured via `SCREENING_*` env).
+    screening: Arc<screening::ScreeningConfig>,
 }
 
 #[derive(Clone)]
@@ -435,6 +439,9 @@ struct HttpAutoTransferResponse {
 #[derive(serde::Serialize)]
 struct HttpErrorResponse {
     error: String,
+    /// Stable machine-readable code (e.g. `SANCTIONED_ADDRESS`) when applicable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<String>,
 }
 
 /// Notify the indexer of a broadcast tx hash so it can recover events
@@ -589,6 +596,7 @@ async fn run_http_server(
         btc_payout_fee_sat_vb,
         indexer_url,
         nonce_cache: Arc::new(Mutex::new(None)),
+        screening: Arc::new(screening::ScreeningConfig::from_env()),
     });
     let app = Router::new()
         .route("/healthz", get(|| async { "ok" }))
@@ -995,14 +1003,17 @@ async fn http_unshield_submit(
             let addr = parse_evm_address_hex(evm)
                 .map_err(|e| (StatusCode::BAD_REQUEST, Json(HttpErrorResponse {
                     error: format!("bad recipient_evm: {e}"),
+                    code: None,
                 })))?;
             format!("0x{}", hex::encode(evm_address_to_recipient_meta(&addr)))
         }
         (Some(_), Some(_)) => return Err((StatusCode::BAD_REQUEST, Json(HttpErrorResponse {
             error: "supply exactly one of recipient_meta_hex or recipient_evm".into(),
+            code: None,
         }))),
         (None, None) => return Err((StatusCode::BAD_REQUEST, Json(HttpErrorResponse {
             error: "recipient_meta_hex or recipient_evm is required".into(),
+            code: None,
         }))),
     };
 
@@ -1013,6 +1024,7 @@ async fn http_unshield_submit(
         if computed != expected {
             return Err((StatusCode::BAD_REQUEST, Json(HttpErrorResponse {
                 error: format!("recipient_btc_address sha256 mismatch: computed {computed}, expected {expected}"),
+                code: None,
             })));
         }
     }
@@ -1099,6 +1111,11 @@ struct HttpMintSubmitRequest {
     contract: String,
     /// Full `mint(uint256,(bytes,uint256[3]))` calldata as 0x hex, built off-chain (forge).
     calldata: String,
+    /// Optional beneficiary / depositor EVM address screened per issuer policy when
+    /// Layer 1 screening is enabled. The mint calldata itself is opaque (the note's
+    /// recipient is a shielded address), so this is supplied out-of-band by the issuer.
+    #[serde(default)]
+    beneficiary_evm: Option<String>,
 }
 
 /// Submit an issuer-signed pERC20 `mint(...)`: broadcast pre-built calldata to the pool, signed
@@ -1109,6 +1126,11 @@ async fn http_erc_mint_submit(
     State(cfg): State<Arc<RelayerHttpConfig>>,
     Json(req): Json<HttpMintSubmitRequest>,
 ) -> Result<Json<HttpTxResponse>, (StatusCode, Json<HttpErrorResponse>)> {
+    // Layer 1: screen the issuer-declared beneficiary when provided (per issuer policy).
+    cfg.screening
+        .screen_optional(req.beneficiary_evm.as_deref(), "mint_beneficiary")
+        .await
+        .map_err(http_rejection)?;
     let issuer_key = cfg.issuer_private_key.as_deref().ok_or_else(|| {
         http_error(anyhow!(
             "mint submit disabled: set PERC20_ISSUER_PRIVATE_KEY on the relayer (mint is onlyIssuer)"
@@ -1352,6 +1374,11 @@ struct WrappedShieldCalldataRequest {
     bundle: OrchardStoredBundle,
     /// Deposit amount in NOTE UNITS (contract pulls `amount_units * scale` underlying).
     amount_units: u64,
+    /// Depositor EVM address (the wallet that will sign + send `shield`, i.e. the
+    /// underlying payer). Required only when Layer 1 screening is enabled; ignored
+    /// otherwise. See `compliance-implementation.md` §"Scope".
+    #[serde(default)]
+    depositor_evm: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -1368,6 +1395,11 @@ async fn http_wrapped_shield_calldata(
     State(cfg): State<Arc<RelayerHttpConfig>>,
     Json(req): Json<WrappedShieldCalldataRequest>,
 ) -> Result<Json<CalldataResponse>, (StatusCode, Json<HttpErrorResponse>)> {
+    // Layer 1: screen the depositor before building any shield calldata.
+    cfg.screening
+        .screen_required(req.depositor_evm.as_deref(), "shield_depositor")
+        .await
+        .map_err(http_rejection)?;
     enforce_frozen_compliance(cfg.indexer_url.as_deref(), &req.contract, &req.bundle)
         .await
         .map_err(http_error)?;
@@ -1398,6 +1430,12 @@ async fn http_wrapped_unshield_submit(
     State(cfg): State<Arc<RelayerHttpConfig>>,
     Json(req): Json<WrappedUnshieldSubmitRequest>,
 ) -> Result<Json<HttpTxResponse>, (StatusCode, Json<HttpErrorResponse>)> {
+    // Layer 1: screen the declared recipient (the payout target, not the relayer)
+    // before broadcasting. Recipient binding makes this the address that matters.
+    cfg.screening
+        .screen_required(Some(&req.recipient_evm), "unshield_recipient")
+        .await
+        .map_err(http_rejection)?;
     enforce_frozen_compliance(cfg.indexer_url.as_deref(), &req.contract, &req.bundle)
         .await
         .map_err(http_error)?;
@@ -1950,6 +1988,19 @@ fn http_error(err: anyhow::Error) -> (StatusCode, Json<HttpErrorResponse>) {
         StatusCode::BAD_REQUEST,
         Json(HttpErrorResponse {
             error: format!("{err:#}"),
+            code: None,
+        }),
+    )
+}
+
+/// Map a Layer 1 screening rejection to an HTTP response with a stable error code.
+fn http_rejection(r: screening::ScreenRejection) -> (StatusCode, Json<HttpErrorResponse>) {
+    let status = StatusCode::from_u16(r.http_status).unwrap_or(StatusCode::FORBIDDEN);
+    (
+        status,
+        Json(HttpErrorResponse {
+            error: r.message,
+            code: Some(r.code.to_string()),
         }),
     )
 }

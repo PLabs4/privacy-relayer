@@ -5,6 +5,10 @@
 #
 # The relayer broadcasts client-signed/encoded calldata via /submit_raw so that a
 # holder's EOA never appears on-chain. The relayer pays gas from its own key.
+#
+# Layer 1 screening (SCREENING_ENABLED=true in .env) makes outbound HTTPS calls to
+# TRM / Chainalysis — ensure the deployment network allows egress to those hosts.
+# All SCREENING_* vars are read from the env_file below; no structural change needed.
 services:
   relayer:
     build: .
