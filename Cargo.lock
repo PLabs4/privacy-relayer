@@ -1447,6 +1447,7 @@ dependencies = [
  "dotenvy",
  "glob",
  "hex",
+ "http-body-util",
  "k256",
  "privacy-core",
  "reqwest",
@@ -1455,6 +1456,7 @@ dependencies = [
  "sha2",
  "sha3",
  "tokio",
+ "tower",
  "tower-http",
  "url",
 ]

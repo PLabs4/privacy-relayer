@@ -28,6 +28,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use sha2::Sha256;
 use sha3::{Digest, Keccak256};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -359,6 +360,8 @@ struct RelayerHttpConfig {
     nonce_cache: Arc<Mutex<Option<u64>>>,
     /// Layer 1 sanctions screening (off by default; configured via `SCREENING_*` env).
     screening: Arc<screening::ScreeningConfig>,
+    /// In-memory LP swap order book (offers + orders). See `SwapBook` / docs/lp-swap-design.md.
+    swap_book: Arc<Mutex<SwapBook>>,
 }
 
 #[derive(Clone)]
@@ -597,8 +600,21 @@ async fn run_http_server(
         indexer_url,
         nonce_cache: Arc::new(Mutex::new(None)),
         screening: Arc::new(screening::ScreeningConfig::from_env()),
+        swap_book: Arc::new(Mutex::new(SwapBook::default())),
     });
-    let app = Router::new()
+    let app = build_router(state);
+    let listener = tokio::net::TcpListener::bind(bind)
+        .await
+        .with_context(|| format!("bind {bind}"))?;
+    println!("relayer http listening on {bind}");
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+/// Build the relayer's axum router with all routes wired to `state`. Split out of `run_http`
+/// so integration tests can drive the HTTP surface (notably the LP order book) in-process.
+fn build_router(state: Arc<RelayerHttpConfig>) -> Router {
+    Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/tx/status", get(http_tx_status))
         .route("/shield/address", get(http_shield_address))
@@ -619,14 +635,13 @@ async fn run_http_server(
         .route("/swap/initiate", post(http_swap_initiate))
         .route("/swap/join", post(http_swap_join))
         .route("/swap/settle", post(http_swap_settle))
+        // ── LP swap order book (matching layer; see docs/lp-swap-design.md) ──
+        .route("/swap/offers", get(http_swap_offer_list).post(http_swap_offer_post))
+        .route("/swap/accept", post(http_swap_accept))
+        .route("/swap/requests", get(http_swap_requests))
+        .route("/swap/order", get(http_swap_order))
         .layer(build_cors_layer())
-        .with_state(state);
-    let listener = tokio::net::TcpListener::bind(bind)
-        .await
-        .with_context(|| format!("bind {bind}"))?;
-    println!("relayer http listening on {bind}");
-    axum::serve(listener, app).await?;
-    Ok(())
+        .with_state(state)
 }
 
 /// Return the configured BTC deposit address so the frontend can send BTC before proving.
@@ -1461,6 +1476,309 @@ async fn http_wrapped_unshield_submit(
     Ok(Json(HttpTxResponse { tx_hash }))
 }
 
+// ─────────────────────────── LP swap order book (in-memory) ────────────────────────────
+//
+// The order book is the matching layer for the LP+swap flow (see docs/lp-swap-design.md).
+// It is intentionally in-memory: orders are short-lived matching state, a relayer restart
+// loses them, and the on-chain `cancel` + client retry are the safety net. The on-chain
+// actions still go through the stateless `/swap/initiate|join|settle` handlers; these order
+// endpoints only shuttle the accept (user → LP) and swap_id (LP → user) and track status.
+//
+// Role mapping (see §2.1 of the design doc):
+//   poolA = the asset the LP spends (= what the user receives);   leg-A proved by the LP bot.
+//   poolB = the asset the user spends (= what the LP receives);   leg-B proved by the user.
+//   initiator = LP (holds the HTLC secret, settles last); joiner = user (signs the join).
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn default_offer_ttl() -> u64 { 120 }
+fn default_max_amount_b() -> u64 { u64::MAX }
+/// Stale Accepted/Initiated/Joined orders expire after this many seconds.
+const ORDER_TTL_SECS: u64 = 3600;
+
+#[derive(Clone, serde::Serialize)]
+struct SwapOffer {
+    offer_id: String,
+    chain_id: u64,
+    coordinator: String,
+    pool_a: String,
+    pool_b: String,
+    pool_a_symbol: String,
+    pool_b_symbol: String,
+    /// LP privacy address that receives leg-B's output (the poolB asset).
+    initiator_addr: String,
+    /// 1 unit of poolB = `rate` units of poolA (display / sanity hint; not enforced on-chain).
+    rate: f64,
+    min_amount_b: u64,
+    max_amount_b: u64,
+    expires_at: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+enum SwapOrderStatus { Accepted, Initiated, Joined, Settled, Failed, Expired }
+
+#[derive(Clone, serde::Serialize)]
+struct SwapOrder {
+    request_id: String,
+    offer_id: String,
+    chain_id: u64,
+    coordinator: String,
+    pool_a: String,
+    pool_b: String,
+    pool_a_symbol: String,
+    pool_b_symbol: String,
+    amount_a: u64,
+    amount_b: u64,
+    /// User privacy address that receives leg-A's output (the poolA asset).
+    joiner_addr: String,
+    rk_bx: String,
+    rk_by: String,
+    commit_b: String,
+    /// User's proved leg-B bundle. Only handed to the LP bot via `/swap/requests`; never
+    /// echoed back on `/swap/order` (it is the bot's settle input, not user-facing state).
+    #[serde(skip_serializing)]
+    bundle_b: Value,
+    status: SwapOrderStatus,
+    swap_id: Option<String>,
+    created_at: u64,
+    updated_at: u64,
+}
+
+#[derive(Default)]
+struct SwapBook {
+    offers: HashMap<String, SwapOffer>,
+    orders: HashMap<String, SwapOrder>,
+    seq: u64,
+}
+
+impl SwapBook {
+    fn next_id(&mut self, prefix: &str) -> String {
+        self.seq += 1;
+        format!("{prefix}-{}-{}", now_unix(), self.seq)
+    }
+
+    /// Drop expired offers and time out stale in-flight orders. Cheap; called on every access.
+    fn prune(&mut self) {
+        let now = now_unix();
+        self.offers.retain(|_, o| o.expires_at > now);
+        for o in self.orders.values_mut() {
+            if matches!(
+                o.status,
+                SwapOrderStatus::Accepted | SwapOrderStatus::Initiated | SwapOrderStatus::Joined
+            ) && now.saturating_sub(o.created_at) > ORDER_TTL_SECS
+            {
+                o.status = SwapOrderStatus::Expired;
+                o.updated_at = now;
+            }
+        }
+        // Garbage-collect terminal orders an hour after their last update.
+        self.orders.retain(|_, o| {
+            !matches!(o.status, SwapOrderStatus::Settled | SwapOrderStatus::Failed | SwapOrderStatus::Expired)
+                || now.saturating_sub(o.updated_at) <= ORDER_TTL_SECS
+        });
+    }
+
+    fn set_status_by_request(&mut self, request_id: &str, status: SwapOrderStatus, swap_id: Option<String>) {
+        if let Some(o) = self.orders.get_mut(request_id) {
+            o.status = status;
+            if let Some(sid) = swap_id {
+                o.swap_id = Some(sid);
+            }
+            o.updated_at = now_unix();
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct PostOfferReq {
+    chain_id: u64,
+    coordinator: String,
+    pool_a: String,
+    pool_b: String,
+    #[serde(default)]
+    pool_a_symbol: String,
+    #[serde(default)]
+    pool_b_symbol: String,
+    initiator_addr: String,
+    rate: f64,
+    #[serde(default)]
+    min_amount_b: u64,
+    #[serde(default = "default_max_amount_b")]
+    max_amount_b: u64,
+    #[serde(default = "default_offer_ttl")]
+    ttl_secs: u64,
+    /// Optional stable id so a bot can refresh the same offer instead of creating duplicates.
+    #[serde(default)]
+    offer_id: Option<String>,
+}
+
+/// LP bot publishes / refreshes a standing offer.
+async fn http_swap_offer_post(
+    State(cfg): State<Arc<RelayerHttpConfig>>,
+    Json(req): Json<PostOfferReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<HttpErrorResponse>)> {
+    let mut book = cfg.swap_book.lock().await;
+    book.prune();
+    let offer_id = req.offer_id.clone().unwrap_or_else(|| book.next_id("offer"));
+    let offer = SwapOffer {
+        offer_id: offer_id.clone(),
+        chain_id: req.chain_id,
+        coordinator: req.coordinator,
+        pool_a: req.pool_a,
+        pool_b: req.pool_b,
+        pool_a_symbol: req.pool_a_symbol,
+        pool_b_symbol: req.pool_b_symbol,
+        initiator_addr: req.initiator_addr,
+        rate: req.rate,
+        min_amount_b: req.min_amount_b,
+        max_amount_b: req.max_amount_b,
+        expires_at: now_unix() + req.ttl_secs.max(1),
+    };
+    book.offers.insert(offer_id.clone(), offer);
+    Ok(Json(serde_json::json!({ "offer_id": offer_id })))
+}
+
+/// Users list available LP offers (non-expired) to pick a pair and quote.
+async fn http_swap_offer_list(
+    State(cfg): State<Arc<RelayerHttpConfig>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<HttpErrorResponse>)> {
+    let mut book = cfg.swap_book.lock().await;
+    book.prune();
+    let offers: Vec<&SwapOffer> = book.offers.values().collect();
+    Ok(Json(serde_json::json!({ "offers": offers })))
+}
+
+#[derive(Debug, Deserialize)]
+struct PostAcceptReq {
+    offer_id: String,
+    chain_id: u64,
+    coordinator: String,
+    pool_a: String,
+    pool_b: String,
+    #[serde(default)]
+    pool_a_symbol: String,
+    #[serde(default)]
+    pool_b_symbol: String,
+    amount_a: u64,
+    amount_b: u64,
+    joiner_addr: String,
+    rk_bx: String,
+    rk_by: String,
+    commit_b: String,
+    /// User's proved leg-B bundle (executor = coordinator).
+    bundle_b: Value,
+}
+
+/// User submits a proved leg-B and opens an order against an LP offer.
+async fn http_swap_accept(
+    State(cfg): State<Arc<RelayerHttpConfig>>,
+    Json(req): Json<PostAcceptReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<HttpErrorResponse>)> {
+    let mut book = cfg.swap_book.lock().await;
+    book.prune();
+    let offer = book
+        .offers
+        .get(&req.offer_id)
+        .cloned()
+        .ok_or_else(|| http_error(anyhow!("offer not found or expired: {}", req.offer_id)))?;
+    if offer.pool_a.to_lowercase() != req.pool_a.to_lowercase()
+        || offer.pool_b.to_lowercase() != req.pool_b.to_lowercase()
+    {
+        return Err(http_error(anyhow!("accept pools do not match offer")));
+    }
+    if req.amount_b < offer.min_amount_b || req.amount_b > offer.max_amount_b {
+        return Err(http_error(anyhow!(
+            "amount_b {} outside offer range [{}, {}]",
+            req.amount_b, offer.min_amount_b, offer.max_amount_b
+        )));
+    }
+    if req.amount_a == 0 || req.amount_b == 0 {
+        return Err(http_error(anyhow!("amount_a and amount_b must be > 0")));
+    }
+    let now = now_unix();
+    let request_id = book.next_id("req");
+    let order = SwapOrder {
+        request_id: request_id.clone(),
+        offer_id: req.offer_id,
+        chain_id: req.chain_id,
+        coordinator: req.coordinator,
+        pool_a: req.pool_a,
+        pool_b: req.pool_b,
+        pool_a_symbol: if req.pool_a_symbol.is_empty() { offer.pool_a_symbol.clone() } else { req.pool_a_symbol },
+        pool_b_symbol: if req.pool_b_symbol.is_empty() { offer.pool_b_symbol.clone() } else { req.pool_b_symbol },
+        amount_a: req.amount_a,
+        amount_b: req.amount_b,
+        joiner_addr: req.joiner_addr,
+        rk_bx: req.rk_bx,
+        rk_by: req.rk_by,
+        commit_b: req.commit_b,
+        bundle_b: req.bundle_b,
+        status: SwapOrderStatus::Accepted,
+        swap_id: None,
+        created_at: now,
+        updated_at: now,
+    };
+    book.orders.insert(request_id.clone(), order);
+    Ok(Json(serde_json::json!({ "request_id": request_id })))
+}
+
+/// LP bot pulls pending accepts (status = Accepted), including `bundle_b` to settle with later.
+async fn http_swap_requests(
+    State(cfg): State<Arc<RelayerHttpConfig>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<HttpErrorResponse>)> {
+    let mut book = cfg.swap_book.lock().await;
+    book.prune();
+    let requests: Vec<serde_json::Value> = book
+        .orders
+        .values()
+        .filter(|o| o.status == SwapOrderStatus::Accepted)
+        .map(|o| {
+            serde_json::json!({
+                "request_id": o.request_id,
+                "offer_id": o.offer_id,
+                "chain_id": o.chain_id,
+                "coordinator": o.coordinator,
+                "pool_a": o.pool_a,
+                "pool_b": o.pool_b,
+                "pool_a_symbol": o.pool_a_symbol,
+                "pool_b_symbol": o.pool_b_symbol,
+                "amount_a": o.amount_a,
+                "amount_b": o.amount_b,
+                "joiner_addr": o.joiner_addr,
+                "rk_bx": o.rk_bx,
+                "rk_by": o.rk_by,
+                "commit_b": o.commit_b,
+                "bundle_b": o.bundle_b,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "requests": requests })))
+}
+
+/// User / bot polls a single order's status (and swap_id once the LP has initiated).
+async fn http_swap_order(
+    State(cfg): State<Arc<RelayerHttpConfig>>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<SwapOrder>, (StatusCode, Json<HttpErrorResponse>)> {
+    let request_id = params
+        .get("request_id")
+        .ok_or_else(|| http_error(anyhow!("missing query param request_id")))?;
+    let mut book = cfg.swap_book.lock().await;
+    book.prune();
+    let order = book
+        .orders
+        .get(request_id)
+        .cloned()
+        .ok_or_else(|| http_error(anyhow!("order not found: {request_id}")))?;
+    Ok(Json(order))
+}
+
 #[derive(Debug, Deserialize)]
 struct SwapInitiateRequest {
     #[serde(default)]
@@ -1480,6 +1798,10 @@ struct SwapInitiateRequest {
     commit_a_hex: Option<String>,
     #[serde(default)]
     bundle_a: Option<OrchardStoredBundle>,
+    /// Optional order-book request id; when present, the order is advanced to `Initiated`
+    /// and its `swap_id` recorded so the user can poll `/swap/order` to join.
+    #[serde(default)]
+    request_id: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -1523,10 +1845,17 @@ async fn http_swap_initiate(
             &cfg.nonce_cache,
         )
         .await?;
-        println!("[swap/initiate] tx={tx_hash} swap_id=0x{}", hex::encode(swap_id));
+        let swap_id_hex = format!("0x{}", hex::encode(swap_id));
+        if let Some(rid) = req.request_id.as_deref() {
+            cfg.swap_book
+                .lock()
+                .await
+                .set_status_by_request(rid, SwapOrderStatus::Initiated, Some(swap_id_hex.clone()));
+        }
+        println!("[swap/initiate] tx={tx_hash} swap_id={swap_id_hex}");
         Ok::<_, anyhow::Error>(SwapInitiateResponse {
             tx_hash,
-            swap_id: format!("0x{}", hex::encode(swap_id)),
+            swap_id: swap_id_hex,
             commit_a: format!("0x{}", hex::encode(commit_a)),
             initiator: format!("0x{}", hex::encode(initiator)),
         })
@@ -1554,6 +1883,9 @@ struct SwapJoinRequest {
     rk_by_hex: Option<String>,
     /// Joiner's Baby JubJub Schnorr signature over the join challenge (96-byte hex).
     joiner_sig_hex: String,
+    /// Optional order-book request id; when present, the order is advanced to `Joined`.
+    #[serde(default)]
+    request_id: Option<String>,
 }
 
 /// `joinSwap(...)` — relayer-signed; joiner authentication is cryptographic (`rk_B` + sig),
@@ -1581,6 +1913,12 @@ async fn http_swap_join(
             &cfg.nonce_cache,
         )
         .await?;
+        if let Some(rid) = req.request_id.as_deref() {
+            cfg.swap_book
+                .lock()
+                .await
+                .set_status_by_request(rid, SwapOrderStatus::Joined, None);
+        }
         println!("[swap/join] tx={tx_hash} swap_id={}", req.swap_id_hex);
         Ok::<_, anyhow::Error>(HttpTxResponse { tx_hash })
     }
@@ -1604,6 +1942,9 @@ struct SwapSettleRequest {
     pool_a: Option<String>,
     #[serde(default)]
     pool_b: Option<String>,
+    /// Optional order-book request id; when present, the order is advanced to `Settled`.
+    #[serde(default)]
+    request_id: Option<String>,
 }
 
 /// `settle(swapId, secret, callA, callB)` — relayer-signed; atomically executes both legs.
@@ -1645,6 +1986,12 @@ async fn http_swap_settle(
     .map_err(http_error)?;
     for pool in [req.pool_a.clone(), req.pool_b.clone()].into_iter().flatten() {
         tokio::spawn(notify_pending_tx(cfg.indexer_url.clone(), tx_hash.clone(), pool));
+    }
+    if let Some(rid) = req.request_id.as_deref() {
+        cfg.swap_book
+            .lock()
+            .await
+            .set_status_by_request(rid, SwapOrderStatus::Settled, None);
     }
     println!("[swap/settle] tx={tx_hash} swap_id={}", req.swap_id_hex);
     Ok(Json(HttpTxResponse { tx_hash }))
@@ -3015,5 +3362,221 @@ mod tests {
     fn bundle_path_sibling() {
         let p = PathBuf::from("/a/deposit-1.json");
         assert_eq!(bundle_path_for_intent(&p), PathBuf::from("/a/deposit-1.bundle.json"));
+    }
+
+    // ── LP swap order book ──────────────────────────────────────────────────
+
+    fn test_order(request_id: &str, status: SwapOrderStatus) -> SwapOrder {
+        let now = now_unix();
+        SwapOrder {
+            request_id: request_id.to_string(),
+            offer_id: "offer-1".into(),
+            chain_id: 1,
+            coordinator: "0xc".into(),
+            pool_a: "0xa".into(),
+            pool_b: "0xb".into(),
+            pool_a_symbol: "A".into(),
+            pool_b_symbol: "B".into(),
+            amount_a: 100,
+            amount_b: 50,
+            joiner_addr: "addr".into(),
+            rk_bx: "00".into(),
+            rk_by: "00".into(),
+            commit_b: "00".into(),
+            bundle_b: serde_json::json!({}),
+            status,
+            swap_id: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn swap_book_next_id_is_unique() {
+        let mut book = SwapBook::default();
+        let a = book.next_id("req");
+        let b = book.next_id("req");
+        assert_ne!(a, b);
+        assert!(a.starts_with("req-"));
+    }
+
+    #[test]
+    fn swap_book_status_machine_via_request_id() {
+        let mut book = SwapBook::default();
+        book.orders.insert("r1".into(), test_order("r1", SwapOrderStatus::Accepted));
+        // accepted → requests visible
+        assert_eq!(book.orders.get("r1").unwrap().status, SwapOrderStatus::Accepted);
+        // initiate records swap_id + advances
+        book.set_status_by_request("r1", SwapOrderStatus::Initiated, Some("0xswap".into()));
+        let o = book.orders.get("r1").unwrap();
+        assert_eq!(o.status, SwapOrderStatus::Initiated);
+        assert_eq!(o.swap_id.as_deref(), Some("0xswap"));
+        // join → joined; settle → settled (swap_id preserved)
+        book.set_status_by_request("r1", SwapOrderStatus::Joined, None);
+        assert_eq!(book.orders.get("r1").unwrap().status, SwapOrderStatus::Joined);
+        book.set_status_by_request("r1", SwapOrderStatus::Settled, None);
+        let o = book.orders.get("r1").unwrap();
+        assert_eq!(o.status, SwapOrderStatus::Settled);
+        assert_eq!(o.swap_id.as_deref(), Some("0xswap"), "swap_id preserved across joins");
+        // unknown request id is a no-op (does not panic)
+        book.set_status_by_request("nope", SwapOrderStatus::Failed, None);
+    }
+
+    #[test]
+    fn swap_book_prune_expires_offers() {
+        let mut book = SwapBook::default();
+        let now = now_unix();
+        book.offers.insert("live".into(), SwapOffer {
+            offer_id: "live".into(), chain_id: 1, coordinator: "0xc".into(),
+            pool_a: "0xa".into(), pool_b: "0xb".into(),
+            pool_a_symbol: "A".into(), pool_b_symbol: "B".into(),
+            initiator_addr: "addr".into(), rate: 1.0, min_amount_b: 0, max_amount_b: u64::MAX,
+            expires_at: now + 100,
+        });
+        book.offers.insert("dead".into(), SwapOffer {
+            offer_id: "dead".into(), chain_id: 1, coordinator: "0xc".into(),
+            pool_a: "0xa".into(), pool_b: "0xb".into(),
+            pool_a_symbol: "A".into(), pool_b_symbol: "B".into(),
+            initiator_addr: "addr".into(), rate: 1.0, min_amount_b: 0, max_amount_b: u64::MAX,
+            expires_at: now.saturating_sub(1),
+        });
+        book.prune();
+        assert!(book.offers.contains_key("live"));
+        assert!(!book.offers.contains_key("dead"), "expired offer pruned");
+    }
+
+    #[test]
+    fn swap_book_prune_gc_keeps_recent_terminal_orders() {
+        let mut book = SwapBook::default();
+        // A freshly-settled order is retained so the user can still read the final status.
+        book.orders.insert("r1".into(), test_order("r1", SwapOrderStatus::Settled));
+        book.prune();
+        assert!(book.orders.contains_key("r1"));
+    }
+
+    // ── End-to-end HTTP integration of the LP order-book matching layer ──────
+    //
+    // Drives the real axum router in-process (no chain): offer → list → accept → requests →
+    // order. The on-chain initiate/join/settle legs are covered separately by the Solidity
+    // `ShieldSwapE2E` suite; here we validate the matching surface the LP bot + frontend use.
+
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode as Sc};
+    use tower::ServiceExt; // for `oneshot`
+
+    fn test_state() -> Arc<RelayerHttpConfig> {
+        Arc::new(RelayerHttpConfig {
+            rpc_url: "http://127.0.0.1:0".into(),
+            chain_id: 1,
+            private_key: "00".repeat(32),
+            issuer_private_key: None,
+            contract: "0x".into(),
+            gas_price_gwei: 1.0,
+            gas_limit_shield: 0,
+            gas_limit_unshield: 0,
+            gas_limit_transfer: 0,
+            swap_coordinator: Some("0xcoordinator".into()),
+            gas_limit_swap: 0,
+            auto_shield: None,
+            auto_transfer: None,
+            btc_payout_wif: None,
+            btc_payout_fee_sat_vb: 1,
+            indexer_url: None,
+            nonce_cache: Arc::new(Mutex::new(None)),
+            screening: Arc::new(screening::ScreeningConfig::from_env()),
+            swap_book: Arc::new(Mutex::new(SwapBook::default())),
+        })
+    }
+
+    async fn call(app: &Router, method: &str, uri: &str, body: Option<Value>) -> (Sc, Value) {
+        let req = Request::builder().method(method).uri(uri);
+        let req = match body {
+            Some(b) => req.header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&b).unwrap())).unwrap(),
+            None => req.body(Body::empty()).unwrap(),
+        };
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let json = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn orderbook_http_offer_accept_request_order_flow() {
+        let app = build_router(test_state());
+
+        // 1. LP publishes an offer.
+        let (st, body) = call(&app, "POST", "/swap/offers", Some(serde_json::json!({
+            "chain_id": 1, "coordinator": "0xc",
+            "pool_a": "0xaaa", "pool_b": "0xbbb",
+            "pool_a_symbol": "A", "pool_b_symbol": "B",
+            "initiator_addr": "lpaddr", "rate": 2.0,
+            "min_amount_b": 1, "max_amount_b": 100, "ttl_secs": 60,
+        }))).await;
+        assert_eq!(st, Sc::OK);
+        let offer_id = body["offer_id"].as_str().unwrap().to_string();
+
+        // 2. User lists offers and sees it.
+        let (st, body) = call(&app, "GET", "/swap/offers", None).await;
+        assert_eq!(st, Sc::OK);
+        assert_eq!(body["offers"].as_array().unwrap().len(), 1);
+
+        // 3. User opens an order with a proved leg-B (bundle_b is opaque here).
+        let (st, body) = call(&app, "POST", "/swap/accept", Some(serde_json::json!({
+            "offer_id": offer_id, "chain_id": 1, "coordinator": "0xc",
+            "pool_a": "0xaaa", "pool_b": "0xbbb",
+            "amount_a": 200, "amount_b": 100, "joiner_addr": "useraddr",
+            "rk_bx": "0x01", "rk_by": "0x02", "commit_b": "0x03",
+            "bundle_b": { "actions": [] },
+        }))).await;
+        assert_eq!(st, Sc::OK);
+        let request_id = body["request_id"].as_str().unwrap().to_string();
+
+        // 4. LP bot pulls pending requests, including bundle_b for settle.
+        let (st, body) = call(&app, "GET", "/swap/requests", None).await;
+        assert_eq!(st, Sc::OK);
+        let reqs = body["requests"].as_array().unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0]["request_id"].as_str().unwrap(), request_id);
+        assert!(reqs[0].get("bundle_b").is_some(), "bot needs bundle_b to settle");
+
+        // 5. User polls the order — still Accepted (LP hasn't initiated yet).
+        let (st, body) = call(&app, "GET", &format!("/swap/order?request_id={request_id}"), None).await;
+        assert_eq!(st, Sc::OK);
+        assert_eq!(body["status"].as_str().unwrap(), "accepted");
+        // bundle_b must NOT be echoed to the user-facing order view.
+        assert!(body.get("bundle_b").is_none());
+    }
+
+    #[tokio::test]
+    async fn orderbook_http_accept_validation() {
+        let app = build_router(test_state());
+        // Accept against a non-existent offer is rejected.
+        let (st, _) = call(&app, "POST", "/swap/accept", Some(serde_json::json!({
+            "offer_id": "missing", "chain_id": 1, "coordinator": "0xc",
+            "pool_a": "0xaaa", "pool_b": "0xbbb",
+            "amount_a": 200, "amount_b": 100, "joiner_addr": "u",
+            "rk_bx": "0x01", "rk_by": "0x02", "commit_b": "0x03", "bundle_b": {},
+        }))).await;
+        assert_ne!(st, Sc::OK);
+
+        // Publish an offer with a tight range, then accept out of range.
+        let (_, body) = call(&app, "POST", "/swap/offers", Some(serde_json::json!({
+            "chain_id": 1, "coordinator": "0xc", "pool_a": "0xaaa", "pool_b": "0xbbb",
+            "initiator_addr": "lp", "rate": 1.0, "min_amount_b": 10, "max_amount_b": 20, "ttl_secs": 60,
+        }))).await;
+        let offer_id = body["offer_id"].as_str().unwrap().to_string();
+        let (st, _) = call(&app, "POST", "/swap/accept", Some(serde_json::json!({
+            "offer_id": offer_id, "chain_id": 1, "coordinator": "0xc",
+            "pool_a": "0xaaa", "pool_b": "0xbbb",
+            "amount_a": 1000, "amount_b": 1000, "joiner_addr": "u",
+            "rk_bx": "0x01", "rk_by": "0x02", "commit_b": "0x03", "bundle_b": {},
+        }))).await;
+        assert_ne!(st, Sc::OK, "amount_b above max must be rejected");
+
+        // Unknown order id returns an error, not a panic.
+        let (st, _) = call(&app, "GET", "/swap/order?request_id=nope", None).await;
+        assert_ne!(st, Sc::OK);
     }
 }
