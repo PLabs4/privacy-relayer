@@ -1546,6 +1546,9 @@ struct SwapOrder {
     bundle_b: Value,
     status: SwapOrderStatus,
     swap_id: Option<String>,
+    initiate_tx_hash: Option<String>,
+    join_tx_hash: Option<String>,
+    settle_tx_hash: Option<String>,
     created_at: u64,
     updated_at: u64,
 }
@@ -1590,6 +1593,30 @@ impl SwapBook {
             if let Some(sid) = swap_id {
                 o.swap_id = Some(sid);
             }
+            o.updated_at = now_unix();
+        }
+    }
+
+    fn set_initiated_by_request(&mut self, request_id: &str, swap_id: String, tx_hash: String) {
+        if let Some(o) = self.orders.get_mut(request_id) {
+            o.status = SwapOrderStatus::Initiated;
+            o.swap_id = Some(swap_id);
+            o.initiate_tx_hash = Some(tx_hash);
+            o.updated_at = now_unix();
+        }
+    }
+
+    fn set_joined_by_request(&mut self, request_id: &str, tx_hash: String) {
+        if let Some(o) = self.orders.get_mut(request_id) {
+            o.status = SwapOrderStatus::Joined;
+            o.join_tx_hash = Some(tx_hash);
+            o.updated_at = now_unix();
+        }
+    }
+
+    fn set_settle_tx_by_request(&mut self, request_id: &str, tx_hash: String) {
+        if let Some(o) = self.orders.get_mut(request_id) {
+            o.settle_tx_hash = Some(tx_hash);
             o.updated_at = now_unix();
         }
     }
@@ -1721,6 +1748,9 @@ async fn http_swap_accept(
         bundle_b: req.bundle_b,
         status: SwapOrderStatus::Accepted,
         swap_id: None,
+        initiate_tx_hash: None,
+        join_tx_hash: None,
+        settle_tx_hash: None,
         created_at: now,
         updated_at: now,
     };
@@ -1850,7 +1880,7 @@ async fn http_swap_initiate(
             cfg.swap_book
                 .lock()
                 .await
-                .set_status_by_request(rid, SwapOrderStatus::Initiated, Some(swap_id_hex.clone()));
+                .set_initiated_by_request(rid, swap_id_hex.clone(), tx_hash.clone());
         }
         println!("[swap/initiate] tx={tx_hash} swap_id={swap_id_hex}");
         Ok::<_, anyhow::Error>(SwapInitiateResponse {
@@ -1917,7 +1947,7 @@ async fn http_swap_join(
             cfg.swap_book
                 .lock()
                 .await
-                .set_status_by_request(rid, SwapOrderStatus::Joined, None);
+                .set_joined_by_request(rid, tx_hash.clone());
         }
         println!("[swap/join] tx={tx_hash} swap_id={}", req.swap_id_hex);
         Ok::<_, anyhow::Error>(HttpTxResponse { tx_hash })
@@ -1996,6 +2026,7 @@ async fn http_swap_settle(
         let swap_book = Arc::clone(&cfg.swap_book);
         let rpc_url = cfg.rpc_url.clone();
         let tx_hash2 = tx_hash.clone();
+        swap_book.lock().await.set_settle_tx_by_request(&rid, tx_hash.clone());
         tokio::spawn(async move {
             let final_status = watch_tx_final_status(&rpc_url, &tx_hash2).await;
             let order_status = settle_order_status(final_status);
@@ -3436,6 +3467,9 @@ mod tests {
             bundle_b: serde_json::json!({}),
             status,
             swap_id: None,
+            initiate_tx_hash: None,
+            join_tx_hash: None,
+            settle_tx_hash: None,
             created_at: now,
             updated_at: now,
         }
@@ -3456,20 +3490,28 @@ mod tests {
         book.orders.insert("r1".into(), test_order("r1", SwapOrderStatus::Accepted));
         // accepted → requests visible
         assert_eq!(book.orders.get("r1").unwrap().status, SwapOrderStatus::Accepted);
-        // initiate records swap_id + advances
-        book.set_status_by_request("r1", SwapOrderStatus::Initiated, Some("0xswap".into()));
+        // initiate records swap_id + tx hash and advances
+        book.set_initiated_by_request("r1", "0xswap".into(), "0xinit".into());
         let o = book.orders.get("r1").unwrap();
         assert_eq!(o.status, SwapOrderStatus::Initiated);
         assert_eq!(o.swap_id.as_deref(), Some("0xswap"));
-        // join → joined; settle → settled (swap_id preserved)
-        book.set_status_by_request("r1", SwapOrderStatus::Joined, None);
-        assert_eq!(book.orders.get("r1").unwrap().status, SwapOrderStatus::Joined);
+        assert_eq!(o.initiate_tx_hash.as_deref(), Some("0xinit"));
+        // join → joined; settle broadcast hash is recorded before final receipt status.
+        book.set_joined_by_request("r1", "0xjoin".into());
+        let o = book.orders.get("r1").unwrap();
+        assert_eq!(o.status, SwapOrderStatus::Joined);
+        assert_eq!(o.join_tx_hash.as_deref(), Some("0xjoin"));
+        book.set_settle_tx_by_request("r1", "0xsettle".into());
         book.set_status_by_request("r1", SwapOrderStatus::Settled, None);
         let o = book.orders.get("r1").unwrap();
         assert_eq!(o.status, SwapOrderStatus::Settled);
         assert_eq!(o.swap_id.as_deref(), Some("0xswap"), "swap_id preserved across joins");
+        assert_eq!(o.settle_tx_hash.as_deref(), Some("0xsettle"));
         // unknown request id is a no-op (does not panic)
         book.set_status_by_request("nope", SwapOrderStatus::Failed, None);
+        book.set_initiated_by_request("nope", "0xswap".into(), "0xinit".into());
+        book.set_joined_by_request("nope", "0xjoin".into());
+        book.set_settle_tx_by_request("nope", "0xsettle".into());
     }
 
     #[test]
