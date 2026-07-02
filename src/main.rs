@@ -1987,14 +1987,64 @@ async fn http_swap_settle(
     for pool in [req.pool_a.clone(), req.pool_b.clone()].into_iter().flatten() {
         tokio::spawn(notify_pending_tx(cfg.indexer_url.clone(), tx_hash.clone(), pool));
     }
-    if let Some(rid) = req.request_id.as_deref() {
-        cfg.swap_book
-            .lock()
-            .await
-            .set_status_by_request(rid, SwapOrderStatus::Settled, None);
+    // Do NOT mark the order Settled here: the tx is only broadcast, not yet mined. A settle
+    // can still revert on-chain (e.g. NullifierSpent when a leg's note was already spent), and
+    // prematurely reporting "settled" makes the LP bot finalize a phantom change note and shows
+    // the user a false success. Instead, watch the receipt in the background and transition to
+    // Settled (status=0x1) or Failed (status=0x0 / timeout) based on the on-chain outcome.
+    if let Some(rid) = req.request_id.clone() {
+        let swap_book = Arc::clone(&cfg.swap_book);
+        let rpc_url = cfg.rpc_url.clone();
+        let tx_hash2 = tx_hash.clone();
+        tokio::spawn(async move {
+            let final_status = watch_tx_final_status(&rpc_url, &tx_hash2).await;
+            let order_status = settle_order_status(final_status);
+            swap_book.lock().await.set_status_by_request(&rid, order_status, None);
+            match final_status {
+                Some(true) => println!("[swap/settle] confirmed settled tx={tx_hash2}"),
+                Some(false) => eprintln!("[swap/settle] REVERTED on-chain tx={tx_hash2} — marked failed"),
+                None => eprintln!("[swap/settle] receipt timeout tx={tx_hash2} — marked failed"),
+            }
+        });
     }
-    println!("[swap/settle] tx={tx_hash} swap_id={}", req.swap_id_hex);
+    println!("[swap/settle] tx={tx_hash} swap_id={} (awaiting receipt)", req.swap_id_hex);
     Ok(Json(HttpTxResponse { tx_hash }))
+}
+
+/// Map a settle tx's final on-chain outcome to the order status the swap book should record.
+///
+/// Only a mined-successful receipt (`Some(true)`) means the swap actually settled. A revert
+/// (`Some(false)`) or no receipt within the watch window (`None`) is a failure: the order is
+/// marked `Failed` so the LP bot releases its reserved notes and the UI stops showing a false
+/// "success". Previously the relayer marked every broadcast settle as `Settled` immediately,
+/// which reported phantom successes when the on-chain settle reverted (e.g. NullifierSpent).
+fn settle_order_status(receipt: Option<bool>) -> SwapOrderStatus {
+    match receipt {
+        Some(true) => SwapOrderStatus::Settled,
+        _ => SwapOrderStatus::Failed,
+    }
+}
+
+/// Poll for a tx receipt (up to ~5 min at 3s intervals). Returns `Some(true)` if the tx was
+/// mined successfully (status=0x1), `Some(false)` if it reverted (status=0x0), or `None` if
+/// no receipt appeared within the window (treated by callers as a failure).
+///
+/// The first check happens immediately (before any sleep) so chains that mine synchronously
+/// (e.g. anvil in tests) resolve without added latency, while a not-yet-mined tx is retried
+/// on the interval.
+async fn watch_tx_final_status(rpc_url: &str, tx_hash: &str) -> Option<bool> {
+    let client = EthRpcClient::new(rpc_url.to_string());
+    for i in 0..100 {
+        if i > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        }
+        match client.get_transaction_receipt_status(tx_hash).await {
+            Ok(Some(ok)) => return Some(ok),
+            Ok(None) => continue,
+            Err(_) => continue,
+        }
+    }
+    None
 }
 
 /// Acquire the next sequential nonce.
@@ -3578,5 +3628,41 @@ mod tests {
         // Unknown order id returns an error, not a panic.
         let (st, _) = call(&app, "GET", "/swap/order?request_id=nope", None).await;
         assert_ne!(st, Sc::OK);
+    }
+
+    // ── Settle receipt verification ─────────────────────────────────────────
+    //
+    // Regression for the "relayer marks settle done before the tx is mined" bug: the order
+    // must only become Settled when the settle tx is confirmed successful on-chain; a revert
+    // or a receipt timeout must land on Failed so the LP releases its reserved notes.
+
+    #[test]
+    fn settle_status_only_success_settles() {
+        assert_eq!(settle_order_status(Some(true)), SwapOrderStatus::Settled);
+        assert_eq!(settle_order_status(Some(false)), SwapOrderStatus::Failed);
+        assert_eq!(settle_order_status(None), SwapOrderStatus::Failed);
+    }
+
+    #[test]
+    fn settle_revert_does_not_leave_order_settled() {
+        let mut book = SwapBook::default();
+        book.orders.insert("r1".into(), test_order("r1", SwapOrderStatus::Joined));
+        // A reverted settle receipt (status=0x0) must transition Joined → Failed, never Settled.
+        book.set_status_by_request("r1", settle_order_status(Some(false)), None);
+        assert_eq!(book.orders.get("r1").unwrap().status, SwapOrderStatus::Failed);
+
+        // A confirmed-success receipt (status=0x1) is the only path to Settled.
+        book.orders.insert("r2".into(), test_order("r2", SwapOrderStatus::Joined));
+        book.set_status_by_request("r2", settle_order_status(Some(true)), None);
+        assert_eq!(book.orders.get("r2").unwrap().status, SwapOrderStatus::Settled);
+    }
+
+    #[test]
+    fn settle_receipt_timeout_marks_failed() {
+        let mut book = SwapBook::default();
+        book.orders.insert("r1".into(), test_order("r1", SwapOrderStatus::Joined));
+        // No receipt within the watch window (None) is treated as a failure, not a hang at Joined.
+        book.set_status_by_request("r1", settle_order_status(None), None);
+        assert_eq!(book.orders.get("r1").unwrap().status, SwapOrderStatus::Failed);
     }
 }
