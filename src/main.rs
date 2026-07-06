@@ -1370,16 +1370,31 @@ fn parse_sig96_hex(s: &str) -> Result<[[u8; 32]; 3]> {
     ])
 }
 
-/// Resolve a leg commitment: explicit `commit_hex`, else `keccak256(abi.encode(PrivacyCall))`
-/// derived from the proved `bundle`.
-fn resolve_commit(commit_hex: &Option<String>, bundle: &Option<OrchardStoredBundle>) -> Result<[u8; 32]> {
-    if let Some(h) = commit_hex {
-        return parse_hex32(h);
-    }
+/// Plan A (call-on-chain): the proved bundle is REQUIRED — the full `PrivacyCall` rides in the
+/// initiate/join tx calldata and the commitment is derived from it. When the client also sends
+/// an explicit commit hex, it is cross-checked against the derived one so an encoding divergence
+/// between client and relayer is rejected BEFORE anything hits the chain.
+fn leg_call_and_commit(
+    which: &str,
+    bundle: &Option<OrchardStoredBundle>,
+    commit_hex: &Option<String>,
+) -> Result<(PrivacyCallArgs, [u8; 32])> {
     let b = bundle
         .as_ref()
-        .ok_or_else(|| anyhow!("provide either commit hex or the proved bundle to derive it"))?;
-    Ok(privacy_call_commit(&bundle_to_privacy_call(b)?))
+        .ok_or_else(|| anyhow!("{which} is required (full leg goes on-chain in calldata)"))?;
+    let call = bundle_to_privacy_call(b)?;
+    let commit = privacy_call_commit(&call);
+    if let Some(h) = commit_hex {
+        let claimed = parse_hex32(h)?;
+        if claimed != commit {
+            return Err(anyhow!(
+                "commit mismatch for {which}: client 0x{} vs derived 0x{} — encoding divergence",
+                hex::encode(claimed),
+                hex::encode(commit)
+            ));
+        }
+    }
+    Ok((call, commit))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1823,9 +1838,12 @@ struct SwapInitiateRequest {
     /// join challenge; only the counterparty controlling `rkB` can later `joinSwap`.
     rk_bx_hex: String,
     rk_by_hex: String,
-    /// Leg-A commitment, or the proved leg-A bundle to derive it.
+    /// Optional leg-A commitment for cross-checking; the commitment actually used is always
+    /// derived from `bundle_a`.
     #[serde(default)]
     commit_a_hex: Option<String>,
+    /// The proved leg-A bundle. REQUIRED (plan A): the full `PrivacyCall` is ABI-encoded into
+    /// the `initiateSwap` tx calldata so the joiner can trial-decrypt it from chain.
     #[serde(default)]
     bundle_a: Option<OrchardStoredBundle>,
     /// Optional order-book request id; when present, the order is advanced to `Initiated`
@@ -1856,12 +1874,12 @@ async fn http_swap_initiate(
         let salt = parse_hex32(&req.salt_hex).context("salt_hex")?;
         let rk_bx = parse_hex32(&req.rk_bx_hex).context("rk_bx_hex")?;
         let rk_by = parse_hex32(&req.rk_by_hex).context("rk_by_hex")?;
-        let commit_a = resolve_commit(&req.commit_a_hex, &req.bundle_a)?;
+        let (call_a, commit_a) = leg_call_and_commit("bundle_a", &req.bundle_a, &req.commit_a_hex)?;
         let initiator = relayer_address20(&cfg.private_key)?;
         let swap_id =
             compute_swap_id(&initiator, &pool_a, &pool_b, &htlc_hash, &commit_a, &rk_bx, &rk_by, &salt);
         let calldata = encode_swap_initiate_calldata(
-            &pool_a, &pool_b, &htlc_hash, &commit_a, &rk_bx, &rk_by, req.deadline, &salt,
+            &pool_a, &pool_b, &call_a, &htlc_hash, &rk_bx, &rk_by, req.deadline, &salt,
         );
         let tx_hash = send_raw_calldata(
             &cfg.rpc_url,
@@ -1900,9 +1918,13 @@ struct SwapJoinRequest {
     #[serde(default)]
     coordinator: Option<String>,
     swap_id_hex: String,
-    /// Leg-B commitment, or the proved leg-B bundle to derive it.
+    /// Optional leg-B commitment for cross-checking; the commitment actually used is always
+    /// derived from `bundle_b`. NOTE: the joiner's signature binds `commitB`, so a mismatch
+    /// here means the join would revert on-chain anyway — better to reject it at the API.
     #[serde(default)]
     commit_b_hex: Option<String>,
+    /// The proved leg-B bundle. REQUIRED (plan A): the full `PrivacyCall` is ABI-encoded into
+    /// the `joinSwap` tx calldata so the initiator can cross-check it from chain before settle.
     #[serde(default)]
     bundle_b: Option<OrchardStoredBundle>,
     /// Joiner's randomised spend-auth key coordinates (BE 32-byte hex). Accepted for backward
@@ -1927,10 +1949,10 @@ async fn http_swap_join(
     async {
         let coordinator = resolve_coordinator(&cfg, &req.coordinator)?;
         let swap_id = parse_hex32(&req.swap_id_hex).context("swap_id_hex")?;
-        let commit_b = resolve_commit(&req.commit_b_hex, &req.bundle_b)?;
+        let (call_b, _commit_b) = leg_call_and_commit("bundle_b", &req.bundle_b, &req.commit_b_hex)?;
         let _ = (&req.rk_bx_hex, &req.rk_by_hex); // rkB is read from storage on-chain (audit A-1)
         let joiner_sig = parse_sig96_hex(&req.joiner_sig_hex)?;
-        let calldata = encode_swap_join_calldata(&swap_id, &commit_b, &joiner_sig);
+        let calldata = encode_swap_join_calldata(&swap_id, &call_b, &joiner_sig);
         let tx_hash = send_raw_calldata(
             &cfg.rpc_url,
             cfg.chain_id,
@@ -3706,5 +3728,76 @@ mod tests {
         // No receipt within the watch window (None) is treated as a failure, not a hang at Joined.
         book.set_status_by_request("r1", settle_order_status(None), None);
         assert_eq!(book.orders.get("r1").unwrap().status, SwapOrderStatus::Failed);
+    }
+
+    // ── Plan A (call-on-chain): leg → PrivacyCall → calldata pipeline ────────
+
+    /// A minimal proved bundle carrying everything `bundle_to_privacy_call` needs.
+    fn test_bundle() -> OrchardStoredBundle {
+        OrchardStoredBundle {
+            flags_orchard: 0,
+            value_balance_orchard: 0,
+            anchor_orchard: [0x0Au8; 32],
+            proofs_orchard: vec![],
+            actions: vec![privacy_core::types::OrchardStoredAction {
+                cv: [1u8; 32],
+                nullifier: [2u8; 32],
+                rk: [3u8; 32],
+                cmx: [4u8; 32],
+                ephemeral_key: [5u8; 32],
+                enc_ciphertext: vec![0xCCu8; 580],
+                out_ciphertext: vec![0xDDu8; 80],
+                spend_auth_sig: vec![0x66u8; 96],
+                ack_hash: None,
+                proof_bn254: Some(vec![0xABu8; 256]),
+                pub_fields_bn254: Some(vec![[7u8; 32]; 8]),
+            }],
+            binding_sig_orchard: vec![],
+            proof_bn254: None,
+            pub_fields_bn254: None,
+            binding_sig_bn254: Some([[8u8; 32]; 3]),
+            value_balance_bn254: 0,
+        }
+    }
+
+    #[test]
+    fn leg_call_and_commit_requires_bundle() {
+        let err = leg_call_and_commit("bundle_a", &None, &None).unwrap_err();
+        assert!(err.to_string().contains("bundle_a is required"), "{err}");
+    }
+
+    #[test]
+    fn leg_call_and_commit_cross_checks_client_commit() {
+        let bundle = Some(test_bundle());
+        // Derived-only path works and is deterministic.
+        let (_, commit) = leg_call_and_commit("bundle_b", &bundle, &None).unwrap();
+        // Matching explicit commit passes.
+        let hex_ok = Some(format!("0x{}", hex::encode(commit)));
+        let (_, commit2) = leg_call_and_commit("bundle_b", &bundle, &hex_ok).unwrap();
+        assert_eq!(commit, commit2);
+        // Diverging explicit commit is rejected before anything goes on-chain.
+        let hex_bad = Some(format!("0x{}", hex::encode([0xEEu8; 32])));
+        let err = leg_call_and_commit("bundle_b", &bundle, &hex_bad).unwrap_err();
+        assert!(err.to_string().contains("commit mismatch"), "{err}");
+    }
+
+    #[test]
+    fn swap_initiate_join_calldata_carries_full_leg() {
+        use privacy_core::ethereum::{decode_swap_initiate_calldata, decode_swap_join_calldata};
+        let bundle = Some(test_bundle());
+        let (call, commit) = leg_call_and_commit("bundle_a", &bundle, &None).unwrap();
+
+        let cd = encode_swap_initiate_calldata(
+            &[0xA1u8; 20], &[0xB2u8; 20], &call, &[0x11u8; 32], &[0x22u8; 32], &[0x33u8; 32],
+            1_800_000_000, &[0x44u8; 32],
+        );
+        let dec = decode_swap_initiate_calldata(&cd).expect("initiate calldata decodes");
+        assert_eq!(dec.commit_a(), commit, "on-chain commit == relayer-derived commit");
+        assert_eq!(dec.call_a.actions[0].enc_ciphertext, vec![0xCCu8; 580]);
+
+        let jd = encode_swap_join_calldata(&[0x99u8; 32], &call, &[[0x55u8; 32]; 3]);
+        let dej = decode_swap_join_calldata(&jd).expect("join calldata decodes");
+        assert_eq!(dej.commit_b(), commit);
+        assert_eq!(dej.swap_id, [0x99u8; 32]);
     }
 }
