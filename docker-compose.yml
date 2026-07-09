@@ -16,13 +16,22 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
-      # Bind on all interfaces inside the container (host maps the port below).
+      # Bind on all interfaces inside the container; the host mapping below is
+      # loopback-only by default so production traffic must enter via an
+      # authenticated/rate-limited reverse proxy.
       PRIVACYBTC_RELAYER_BIND: 0.0.0.0:8790
+      # Durable LP swap matching state. Keep this on a persistent volume.
+      PRIVACYBTC_SWAP_BOOK_PATH: /data/swap-book.json
     ports:
-      - "${RELAYER_HOST_PORT:-8790}:8790"
+      - "${RELAYER_HOST_BIND:-127.0.0.1}:${RELAYER_HOST_PORT:-8790}:8790"
+    volumes:
+      - relayer-data:/data
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8790/healthz"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 10s
+
+volumes:
+  relayer-data:

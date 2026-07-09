@@ -28,7 +28,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use sha2::Sha256;
 use sha3::{Digest, Keccak256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -129,10 +129,6 @@ enum Command {
         chain_id: u64,
         #[arg(long, env = "PRIVACYBTC_RELAYER_PRIVATE_KEY")]
         private_key: String,
-        /// pERC20 issuer key (onlyIssuer). Used ONLY by /erc/mint/submit to sign+broadcast
-        /// the issuer-submitted `mint(...)`. Distinct from the relayer key above.
-        #[arg(long, env = "PERC20_ISSUER_PRIVATE_KEY")]
-        issuer_private_key: Option<String>,
         #[arg(long, env = "PRIVACYBTC_CONTRACT_ADDRESS")]
         contract: String,
         #[arg(long, env = "PRIVACYBTC_GAS_PRICE_GWEI", default_value_t = 1.0)]
@@ -257,7 +253,6 @@ async fn main() -> Result<()> {
             rpc_url,
             chain_id,
             private_key,
-            issuer_private_key,
             contract,
             gas_price_gwei,
             gas_limit_shield,
@@ -279,7 +274,6 @@ async fn main() -> Result<()> {
                 &rpc_url,
                 chain_id,
                 &private_key,
-                issuer_private_key.as_deref(),
                 &contract,
                 gas_price_gwei,
                 gas_limit_shield,
@@ -334,8 +328,6 @@ struct RelayerHttpConfig {
     rpc_url: String,
     chain_id: u64,
     private_key: String,
-    /// pERC20 issuer key (onlyIssuer), used only by /erc/mint/submit. None if unset.
-    issuer_private_key: Option<String>,
     contract: String,
     gas_price_gwei: f64,
     gas_limit_shield: u64,
@@ -360,8 +352,86 @@ struct RelayerHttpConfig {
     nonce_cache: Arc<Mutex<Option<u64>>>,
     /// Layer 1 sanctions screening (off by default; configured via `SCREENING_*` env).
     screening: Arc<screening::ScreeningConfig>,
-    /// In-memory LP swap order book (offers + orders). See `SwapBook` / docs/lp-swap-design.md.
+    /// LP swap order book (offers + orders). Persisted when `swap_book_path` is configured.
     swap_book: Arc<Mutex<SwapBook>>,
+    /// Optional JSON snapshot path for the swap order book.
+    swap_book_path: Option<PathBuf>,
+    /// Production guard for /submit_raw. Calls are limited to these target addresses and selectors.
+    submit_raw_allowlist: SubmitRawAllowlist,
+}
+
+#[derive(Clone, Default)]
+struct SubmitRawAllowlist {
+    targets: HashSet<String>,
+    selectors: HashSet<[u8; 4]>,
+}
+
+impl SubmitRawAllowlist {
+    fn from_env() -> Result<Self> {
+        let targets = parse_allowed_targets(
+            std::env::var("PRIVACYBTC_SUBMIT_RAW_ALLOWED_TARGETS").unwrap_or_default().as_str(),
+        )?;
+        let selectors = parse_allowed_selectors(
+            std::env::var("PRIVACYBTC_SUBMIT_RAW_ALLOWED_SELECTORS").unwrap_or_default().as_str(),
+        )?;
+        Ok(Self { targets, selectors })
+    }
+
+    #[cfg(test)]
+    fn new(targets: &[&str], selectors: &[[u8; 4]]) -> Result<Self> {
+        Ok(Self {
+            targets: parse_allowed_targets(&targets.join(","))?,
+            selectors: selectors.iter().copied().collect(),
+        })
+    }
+
+    fn validate(&self, to: &str, calldata: &[u8]) -> Result<()> {
+        if self.targets.is_empty() || self.selectors.is_empty() {
+            return Err(anyhow!(
+                "submit_raw disabled: configure PRIVACYBTC_SUBMIT_RAW_ALLOWED_TARGETS and PRIVACYBTC_SUBMIT_RAW_ALLOWED_SELECTORS"
+            ));
+        }
+        let target = normalize_evm_address(to)?;
+        if !self.targets.contains(&target) {
+            return Err(anyhow!("submit_raw target {target} is not allow-listed"));
+        }
+        let selector: [u8; 4] = calldata
+            .get(0..4)
+            .ok_or_else(|| anyhow!("submit_raw calldata must include a 4-byte selector"))?
+            .try_into()
+            .expect("slice length checked");
+        if !self.selectors.contains(&selector) {
+            return Err(anyhow!(
+                "submit_raw selector 0x{} is not allow-listed",
+                hex::encode(selector)
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn parse_allowed_targets(raw: &str) -> Result<HashSet<String>> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(normalize_evm_address)
+        .collect()
+}
+
+fn parse_allowed_selectors(raw: &str) -> Result<HashSet<[u8; 4]>> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            let bytes = hex::decode(strip_0x(s)).with_context(|| format!("bad selector {s}"))?;
+            bytes.try_into().map_err(|_| anyhow!("selector {s} must be exactly 4 bytes"))
+        })
+        .collect()
+}
+
+fn normalize_evm_address(raw: &str) -> Result<String> {
+    let bytes = parse_evm_address_hex(raw).with_context(|| format!("bad EVM address {raw}"))?;
+    Ok(format!("0x{}", hex::encode(bytes)))
 }
 
 #[derive(Clone)]
@@ -551,7 +621,6 @@ async fn run_http_server(
     rpc_url: &str,
     chain_id: u64,
     private_key: &str,
-    issuer_private_key: Option<&str>,
     contract: &str,
     gas_price_gwei: f64,
     gas_limit_shield: u64,
@@ -581,11 +650,13 @@ async fn run_http_server(
         transfer_dir: transfer_dir.to_path_buf(),
         seen_bundle_paths: Arc::new(Mutex::new(std::collections::HashSet::new())),
     });
+    let submit_raw_allowlist = SubmitRawAllowlist::from_env()?;
+    let swap_book_path = swap_book_path_from_env();
+    let swap_book = load_swap_book(swap_book_path.as_deref())?;
     let state = Arc::new(RelayerHttpConfig {
         rpc_url: rpc_url.to_string(),
         chain_id,
         private_key: private_key.to_string(),
-        issuer_private_key: issuer_private_key.map(|s| s.to_string()),
         contract: contract.to_string(),
         gas_price_gwei,
         gas_limit_shield,
@@ -600,7 +671,9 @@ async fn run_http_server(
         indexer_url,
         nonce_cache: Arc::new(Mutex::new(None)),
         screening: Arc::new(screening::ScreeningConfig::from_env()),
-        swap_book: Arc::new(Mutex::new(SwapBook::default())),
+        swap_book: Arc::new(Mutex::new(swap_book)),
+        swap_book_path,
+        submit_raw_allowlist,
     });
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind(bind)
@@ -628,7 +701,6 @@ fn build_router(state: Arc<RelayerHttpConfig>) -> Router {
         .route("/unshield/finalize", post(http_unshield_finalize))  // legacy, kept for compat
         .route("/erc/shield/submit", post(http_erc_shield_submit))
         .route("/submit_raw", post(http_submit_raw))
-        .route("/erc/mint/submit", post(http_erc_mint_submit))
         // ── WS-6: WrappedPERC20 shield/unshield + 3-tx atomic swap ──
         .route("/wrapped/shield/calldata", post(http_wrapped_shield_calldata))
         .route("/wrapped/unshield/submit", post(http_wrapped_unshield_submit))
@@ -962,6 +1034,9 @@ async fn http_submit_raw(
 ) -> Result<Json<HttpTxResponse>, (StatusCode, Json<HttpErrorResponse>)> {
     let calldata = hex::decode(req.data.trim_start_matches("0x"))
         .map_err(|e| http_error(anyhow!("data is not valid hex: {e}")))?;
+    cfg.submit_raw_allowlist
+        .validate(&req.to, &calldata)
+        .map_err(http_error)?;
     let tx_hash = send_raw_calldata(
         &cfg.rpc_url,
         cfg.chain_id,
@@ -1119,96 +1194,6 @@ struct HttpErcShieldSubmitRequest {
 }
 
 // /erc/unshield/submit removed — use /unshield/submit with recipient_evm instead.
-
-#[derive(Deserialize)]
-struct HttpMintSubmitRequest {
-    /// pERC20 pool (asset) address, 0x + 40 hex.
-    contract: String,
-    /// Full `mint(uint256,(bytes,uint256[3]))` calldata as 0x hex, built off-chain (forge).
-    calldata: String,
-    /// Optional beneficiary / depositor EVM address screened per issuer policy when
-    /// Layer 1 screening is enabled. The mint calldata itself is opaque (the note's
-    /// recipient is a shielded address), so this is supplied out-of-band by the issuer.
-    #[serde(default)]
-    beneficiary_evm: Option<String>,
-}
-
-/// Submit an issuer-signed pERC20 `mint(...)`: broadcast pre-built calldata to the pool, signed
-/// with the configured issuer key (`PERC20_ISSUER_PRIVATE_KEY`). `mint` is `onlyIssuer`, so the
-/// relayer's normal key cannot be used. The compliance `frozenRoot` is a separate one-time
-/// issuer setup (handled outside the relayer), not part of this call.
-async fn http_erc_mint_submit(
-    State(cfg): State<Arc<RelayerHttpConfig>>,
-    Json(req): Json<HttpMintSubmitRequest>,
-) -> Result<Json<HttpTxResponse>, (StatusCode, Json<HttpErrorResponse>)> {
-    // Layer 1: screen the issuer-declared beneficiary when provided (per issuer policy).
-    cfg.screening
-        .screen_optional(req.beneficiary_evm.as_deref(), "mint_beneficiary")
-        .await
-        .map_err(http_rejection)?;
-    let issuer_key = cfg.issuer_private_key.as_deref().ok_or_else(|| {
-        http_error(anyhow!(
-            "mint submit disabled: set PERC20_ISSUER_PRIVATE_KEY on the relayer (mint is onlyIssuer)"
-        ))
-    })?;
-    let cd_hex = req.calldata.strip_prefix("0x").unwrap_or(&req.calldata);
-    let calldata =
-        hex::decode(cd_hex).map_err(|e| http_error(anyhow!("bad calldata hex: {e}")))?;
-
-    // mint() is the heaviest op (Groth16 pairing + Poseidon depth-32 Merkle insert + Baby JubJub
-    // Schnorr verify), so the shield/transfer budgets out-of-gas. But a fixed large limit gets
-    // rejected by some providers (e.g. Sepolia/Infura: "gas limit too high"). So estimate gas
-    // from the actual calldata and add a 30% margin. An explicit PERC20_MINT_GAS_LIMIT overrides
-    // estimation; if estimation fails (e.g. the pool's frozenRoot isn't set yet) fall back to 8M.
-    let mint_gas_limit: u64 = match std::env::var("PERC20_MINT_GAS_LIMIT")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-    {
-        Some(g) => g,
-        None => {
-            let issuer_addr = match parse_hex_key(issuer_key) {
-                Ok(sk) => format!("0x{}", hex::encode(eth_address_from_signing_key(&sk))),
-                Err(e) => return Err(http_error(anyhow!("bad issuer key: {e}"))),
-            };
-            let est_client = EthRpcClient::new(cfg.rpc_url.clone());
-            let estimated = match est_client.estimate_gas(&issuer_addr, &req.contract, &calldata).await {
-                Ok(est) => est.saturating_mul(13) / 10, // +30% margin
-                Err(e) => {
-                    eprintln!("[mint] eth_estimateGas failed ({e}); using floor");
-                    0
-                }
-            };
-            // Clamp: a pERC20 mint needs ~5M gas. Floor at 8M so a low/flaky estimate — e.g. an
-            // RPC fallback to a chain where the pool has no code returns ~intrinsic — can't yield
-            // an "intrinsic gas too low" tx; cap at 15M to stay under provider per-tx limits
-            // ("gas limit too high"). Set PERC20_MINT_GAS_LIMIT to override entirely.
-            estimated.clamp(8_000_000, 15_000_000)
-        }
-    };
-    eprintln!("[mint] gas limit = {mint_gas_limit}");
-    // Fresh nonce cache: the issuer sender differs from the relayer's normal key, so it must
-    // sync its own nonce from chain rather than reuse the relayer's in-process counter.
-    let nonce_cache = Arc::new(Mutex::new(None));
-    let tx_hash = send_raw_calldata(
-        &cfg.rpc_url,
-        cfg.chain_id,
-        issuer_key,
-        &req.contract,
-        calldata,
-        0,
-        cfg.gas_price_gwei,
-        mint_gas_limit,
-        &nonce_cache,
-    )
-    .await
-    .map_err(http_error)?;
-
-    if let Some(indexer) = cfg.indexer_url.clone() {
-        tokio::spawn(notify_pending_tx(Some(indexer), tx_hash.clone(), req.contract.clone()));
-    }
-    println!("erc mint eth_sendRawTransaction ok: {tx_hash}");
-    Ok(Json(HttpTxResponse { tx_hash }))
-}
 
 async fn http_erc_shield_submit(
     State(cfg): State<Arc<RelayerHttpConfig>>,
@@ -1516,7 +1501,7 @@ fn default_max_amount_b() -> u64 { u64::MAX }
 /// Stale Accepted/Initiated/Joined orders expire after this many seconds.
 const ORDER_TTL_SECS: u64 = 3600;
 
-#[derive(Clone, serde::Serialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct SwapOffer {
     offer_id: String,
     chain_id: u64,
@@ -1534,11 +1519,11 @@ struct SwapOffer {
     expires_at: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum SwapOrderStatus { Accepted, Initiated, Joined, Settled, Failed, Expired }
 
-#[derive(Clone, serde::Serialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct SwapOrder {
     request_id: String,
     offer_id: String,
@@ -1557,7 +1542,6 @@ struct SwapOrder {
     commit_b: String,
     /// User's proved leg-B bundle. Only handed to the LP bot via `/swap/requests`; never
     /// echoed back on `/swap/order` (it is the bot's settle input, not user-facing state).
-    #[serde(skip_serializing)]
     bundle_b: Value,
     status: SwapOrderStatus,
     swap_id: Option<String>,
@@ -1568,7 +1552,7 @@ struct SwapOrder {
     updated_at: u64,
 }
 
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 struct SwapBook {
     offers: HashMap<String, SwapOffer>,
     orders: HashMap<String, SwapOrder>,
@@ -1582,9 +1566,12 @@ impl SwapBook {
     }
 
     /// Drop expired offers and time out stale in-flight orders. Cheap; called on every access.
-    fn prune(&mut self) {
+    fn prune(&mut self) -> bool {
         let now = now_unix();
+        let before_offers = self.offers.len();
+        let before_orders = self.orders.len();
         self.offers.retain(|_, o| o.expires_at > now);
+        let mut changed = self.offers.len() != before_offers;
         for o in self.orders.values_mut() {
             if matches!(
                 o.status,
@@ -1593,6 +1580,7 @@ impl SwapBook {
             {
                 o.status = SwapOrderStatus::Expired;
                 o.updated_at = now;
+                changed = true;
             }
         }
         // Garbage-collect terminal orders an hour after their last update.
@@ -1600,6 +1588,7 @@ impl SwapBook {
             !matches!(o.status, SwapOrderStatus::Settled | SwapOrderStatus::Failed | SwapOrderStatus::Expired)
                 || now.saturating_sub(o.updated_at) <= ORDER_TTL_SECS
         });
+        changed || self.orders.len() != before_orders
     }
 
     fn set_status_by_request(&mut self, request_id: &str, status: SwapOrderStatus, swap_id: Option<String>) {
@@ -1635,6 +1624,78 @@ impl SwapBook {
             o.updated_at = now_unix();
         }
     }
+}
+
+fn swap_book_path_from_env() -> Option<PathBuf> {
+    std::env::var("PRIVACYBTC_SWAP_BOOK_PATH")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+}
+
+fn load_swap_book(path: Option<&Path>) -> Result<SwapBook> {
+    let Some(path) = path else {
+        return Ok(SwapBook::default());
+    };
+    if !path.exists() {
+        return Ok(SwapBook::default());
+    }
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("read swap book snapshot {}", path.display()))?;
+    let mut book: SwapBook = serde_json::from_slice(&bytes)
+        .with_context(|| format!("decode swap book snapshot {}", path.display()))?;
+    book.prune();
+    Ok(book)
+}
+
+fn persist_swap_book_path(path: Option<&Path>, book: &SwapBook) -> Result<()> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create swap book dir {}", parent.display()))?;
+        }
+    }
+    let tmp = path.with_extension("json.tmp");
+    let bytes = serde_json::to_vec_pretty(book).context("encode swap book snapshot")?;
+    std::fs::write(&tmp, bytes)
+        .with_context(|| format!("write swap book snapshot {}", tmp.display()))?;
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("replace swap book snapshot {}", path.display()))?;
+    Ok(())
+}
+
+fn persist_swap_book(cfg: &RelayerHttpConfig, book: &SwapBook) -> Result<()> {
+    persist_swap_book_path(cfg.swap_book_path.as_deref(), book)
+}
+
+fn swap_order_public_json(o: &SwapOrder) -> serde_json::Value {
+    serde_json::json!({
+        "request_id": o.request_id,
+        "offer_id": o.offer_id,
+        "chain_id": o.chain_id,
+        "coordinator": o.coordinator,
+        "pool_a": o.pool_a,
+        "pool_b": o.pool_b,
+        "pool_a_symbol": o.pool_a_symbol,
+        "pool_b_symbol": o.pool_b_symbol,
+        "amount_a": o.amount_a,
+        "amount_b": o.amount_b,
+        "joiner_addr": o.joiner_addr,
+        "rk_bx": o.rk_bx,
+        "rk_by": o.rk_by,
+        "commit_b": o.commit_b,
+        "status": o.status,
+        "swap_id": o.swap_id,
+        "initiate_tx_hash": o.initiate_tx_hash,
+        "join_tx_hash": o.join_tx_hash,
+        "settle_tx_hash": o.settle_tx_hash,
+        "created_at": o.created_at,
+        "updated_at": o.updated_at,
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -1683,6 +1744,7 @@ async fn http_swap_offer_post(
         expires_at: now_unix() + req.ttl_secs.max(1),
     };
     book.offers.insert(offer_id.clone(), offer);
+    persist_swap_book(&cfg, &book).map_err(http_error)?;
     Ok(Json(serde_json::json!({ "offer_id": offer_id })))
 }
 
@@ -1691,7 +1753,9 @@ async fn http_swap_offer_list(
     State(cfg): State<Arc<RelayerHttpConfig>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<HttpErrorResponse>)> {
     let mut book = cfg.swap_book.lock().await;
-    book.prune();
+    if book.prune() {
+        persist_swap_book(&cfg, &book).map_err(http_error)?;
+    }
     let offers: Vec<&SwapOffer> = book.offers.values().collect();
     Ok(Json(serde_json::json!({ "offers": offers })))
 }
@@ -1770,6 +1834,7 @@ async fn http_swap_accept(
         updated_at: now,
     };
     book.orders.insert(request_id.clone(), order);
+    persist_swap_book(&cfg, &book).map_err(http_error)?;
     Ok(Json(serde_json::json!({ "request_id": request_id })))
 }
 
@@ -1778,7 +1843,9 @@ async fn http_swap_requests(
     State(cfg): State<Arc<RelayerHttpConfig>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<HttpErrorResponse>)> {
     let mut book = cfg.swap_book.lock().await;
-    book.prune();
+    if book.prune() {
+        persist_swap_book(&cfg, &book).map_err(http_error)?;
+    }
     let requests: Vec<serde_json::Value> = book
         .orders
         .values()
@@ -1810,18 +1877,20 @@ async fn http_swap_requests(
 async fn http_swap_order(
     State(cfg): State<Arc<RelayerHttpConfig>>,
     Query(params): Query<std::collections::HashMap<String, String>>,
-) -> Result<Json<SwapOrder>, (StatusCode, Json<HttpErrorResponse>)> {
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<HttpErrorResponse>)> {
     let request_id = params
         .get("request_id")
         .ok_or_else(|| http_error(anyhow!("missing query param request_id")))?;
     let mut book = cfg.swap_book.lock().await;
-    book.prune();
+    if book.prune() {
+        persist_swap_book(&cfg, &book).map_err(http_error)?;
+    }
     let order = book
         .orders
         .get(request_id)
         .cloned()
         .ok_or_else(|| http_error(anyhow!("order not found: {request_id}")))?;
-    Ok(Json(order))
+    Ok(Json(swap_order_public_json(&order)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1895,10 +1964,9 @@ async fn http_swap_initiate(
         .await?;
         let swap_id_hex = format!("0x{}", hex::encode(swap_id));
         if let Some(rid) = req.request_id.as_deref() {
-            cfg.swap_book
-                .lock()
-                .await
-                .set_initiated_by_request(rid, swap_id_hex.clone(), tx_hash.clone());
+            let mut book = cfg.swap_book.lock().await;
+            book.set_initiated_by_request(rid, swap_id_hex.clone(), tx_hash.clone());
+            persist_swap_book(&cfg, &book)?;
         }
         println!("[swap/initiate] tx={tx_hash} swap_id={swap_id_hex}");
         Ok::<_, anyhow::Error>(SwapInitiateResponse {
@@ -1966,10 +2034,9 @@ async fn http_swap_join(
         )
         .await?;
         if let Some(rid) = req.request_id.as_deref() {
-            cfg.swap_book
-                .lock()
-                .await
-                .set_joined_by_request(rid, tx_hash.clone());
+            let mut book = cfg.swap_book.lock().await;
+            book.set_joined_by_request(rid, tx_hash.clone());
+            persist_swap_book(&cfg, &book)?;
         }
         println!("[swap/join] tx={tx_hash} swap_id={}", req.swap_id_hex);
         Ok::<_, anyhow::Error>(HttpTxResponse { tx_hash })
@@ -2046,13 +2113,24 @@ async fn http_swap_settle(
     // Settled (status=0x1) or Failed (status=0x0 / timeout) based on the on-chain outcome.
     if let Some(rid) = req.request_id.clone() {
         let swap_book = Arc::clone(&cfg.swap_book);
+        let swap_book_path = cfg.swap_book_path.clone();
         let rpc_url = cfg.rpc_url.clone();
         let tx_hash2 = tx_hash.clone();
-        swap_book.lock().await.set_settle_tx_by_request(&rid, tx_hash.clone());
+        {
+            let mut book = swap_book.lock().await;
+            book.set_settle_tx_by_request(&rid, tx_hash.clone());
+            persist_swap_book_path(swap_book_path.as_deref(), &book).map_err(http_error)?;
+        }
         tokio::spawn(async move {
             let final_status = watch_tx_final_status(&rpc_url, &tx_hash2).await;
             let order_status = settle_order_status(final_status);
-            swap_book.lock().await.set_status_by_request(&rid, order_status, None);
+            {
+                let mut book = swap_book.lock().await;
+                book.set_status_by_request(&rid, order_status, None);
+                if let Err(e) = persist_swap_book_path(swap_book_path.as_deref(), &book) {
+                    eprintln!("[swap/settle] failed to persist order status: {e}");
+                }
+            }
             match final_status {
                 Some(true) => println!("[swap/settle] confirmed settled tx={tx_hash2}"),
                 Some(false) => eprintln!("[swap/settle] REVERTED on-chain tx={tx_hash2} — marked failed"),
@@ -3229,20 +3307,6 @@ impl EthRpcClient {
             .await
     }
 
-    /// `eth_estimateGas` for a call `{from, to, data}` against the latest state. Returns the
-    /// estimated gas units. Used to size mint() (heavy: pairing + Poseidon Merkle + Schnorr)
-    /// without hardcoding a limit that may exceed a provider's per-tx cap.
-    async fn estimate_gas(&self, from: &str, to: &str, data: &[u8]) -> Result<u64> {
-        let hex_data = format!("0x{}", hex::encode(data));
-        let hex_gas: String = self
-            .rpc_call(
-                "eth_estimateGas",
-                serde_json::json!([{ "from": from, "to": to, "data": hex_data }]),
-            )
-            .await?;
-        parse_hex_u64(&hex_gas)
-    }
-
     /// Current `baseFeePerGas` (wei) from the latest block (EIP-1559 chains).
     async fn base_fee_per_gas(&self) -> Result<u64> {
         let block: Value = self
@@ -3568,6 +3632,33 @@ mod tests {
         assert!(book.orders.contains_key("r1"));
     }
 
+    #[test]
+    fn swap_book_snapshot_roundtrips_orders_with_bundle_b() {
+        let path = std::env::temp_dir().join(format!(
+            "privacy-relayer-swap-book-{}-{}.json",
+            std::process::id(),
+            now_unix()
+        ));
+        let mut book = SwapBook::default();
+        book.seq = 7;
+        book.orders.insert("r1".into(), test_order("r1", SwapOrderStatus::Accepted));
+        book.orders
+            .get_mut("r1")
+            .unwrap()
+            .bundle_b = serde_json::json!({ "actions": [{ "cmx": "0x01" }] });
+
+        persist_swap_book_path(Some(&path), &book).unwrap();
+        let loaded = load_swap_book(Some(&path)).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(loaded.seq, 7);
+        assert_eq!(
+            loaded.orders["r1"].bundle_b["actions"][0]["cmx"].as_str(),
+            Some("0x01")
+        );
+        assert!(swap_order_public_json(&loaded.orders["r1"]).get("bundle_b").is_none());
+    }
+
     // ── End-to-end HTTP integration of the LP order-book matching layer ──────
     //
     // Drives the real axum router in-process (no chain): offer → list → accept → requests →
@@ -3583,7 +3674,6 @@ mod tests {
             rpc_url: "http://127.0.0.1:0".into(),
             chain_id: 1,
             private_key: "00".repeat(32),
-            issuer_private_key: None,
             contract: "0x".into(),
             gas_price_gwei: 1.0,
             gas_limit_shield: 0,
@@ -3599,6 +3689,8 @@ mod tests {
             nonce_cache: Arc::new(Mutex::new(None)),
             screening: Arc::new(screening::ScreeningConfig::from_env()),
             swap_book: Arc::new(Mutex::new(SwapBook::default())),
+            swap_book_path: None,
+            submit_raw_allowlist: SubmitRawAllowlist::default(),
         })
     }
 
@@ -3692,6 +3784,28 @@ mod tests {
         // Unknown order id returns an error, not a panic.
         let (st, _) = call(&app, "GET", "/swap/order?request_id=nope", None).await;
         assert_ne!(st, Sc::OK);
+    }
+
+    #[test]
+    fn submit_raw_allowlist_requires_target_and_selector_match() {
+        let target = "0x1111111111111111111111111111111111111111";
+        let selector = [0x12, 0x34, 0x56, 0x78];
+        let allowlist = SubmitRawAllowlist::new(&[target], &[selector]).unwrap();
+
+        assert!(allowlist.validate(target, &[0x12, 0x34, 0x56, 0x78, 0xaa]).is_ok());
+        assert!(allowlist
+            .validate("0x2222222222222222222222222222222222222222", &[0x12, 0x34, 0x56, 0x78])
+            .is_err());
+        assert!(allowlist.validate(target, &[0xde, 0xad, 0xbe, 0xef]).is_err());
+        assert!(allowlist.validate(target, &[0x12, 0x34, 0x56]).is_err());
+    }
+
+    #[test]
+    fn submit_raw_allowlist_is_disabled_when_unconfigured() {
+        let allowlist = SubmitRawAllowlist::default();
+        assert!(allowlist
+            .validate("0x1111111111111111111111111111111111111111", &[0x12, 0x34, 0x56, 0x78])
+            .is_err());
     }
 
     // ── Settle receipt verification ─────────────────────────────────────────
