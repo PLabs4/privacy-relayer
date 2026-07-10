@@ -7,7 +7,7 @@
 mod screening;
 
 use anyhow::{anyhow, Context, Result};
-use axum::{extract::{Query, State}, http::StatusCode, routing::get, routing::post, Json, Router};
+use axum::{extract::{Query, State}, http::{HeaderMap, StatusCode}, routing::get, routing::post, Json, Router};
 use clap::{Parser, Subcommand};
 use k256::ecdsa::{RecoveryId, SigningKey};
 use privacy_core::intent::{build_shield_intent_v1, bundle_content_sha256, BtcDepositConfigV1, ShieldIntentV1};
@@ -167,6 +167,10 @@ enum Command {
         /// Payout fee rate in sat/vB (default 5).
         #[arg(long, env = "PRIVACYBTC_BTC_PAYOUT_FEE_SAT_VB", default_value_t = 5)]
         btc_payout_fee_sat_vb: u64,
+        /// EVM block confirmations required before an irreversible BTC payout. A payout
+        /// also requires every configured EVM RPC to report the identical transaction.
+        #[arg(long, env = "PRIVACYBTC_BTC_PAYOUT_EVM_CONFIRMATIONS", default_value_t = 12)]
+        btc_payout_evm_confirmations: u64,
         /// Base URL of the privacybtc-indexer to notify of broadcast transactions.
         /// e.g. http://127.0.0.1:8787
         #[arg(long, env = "PRIVACYBTC_INDEXER_URL")]
@@ -267,6 +271,7 @@ async fn main() -> Result<()> {
             min_conf,
             btc_payout_wif,
             btc_payout_fee_sat_vb,
+            btc_payout_evm_confirmations,
             indexer_url,
         } => {
             run_http_server(
@@ -288,6 +293,7 @@ async fn main() -> Result<()> {
                 min_conf,
                 btc_payout_wif.as_deref(),
                 btc_payout_fee_sat_vb,
+                btc_payout_evm_confirmations,
                 indexer_url,
             )
             .await?;
@@ -344,6 +350,8 @@ struct RelayerHttpConfig {
     btc_payout_wif: Option<String>,
     /// Fee rate in sat/vB for payout transactions (default 5).
     btc_payout_fee_sat_vb: u64,
+    /// Finality depth for irreversible BTC payouts.
+    btc_payout_evm_confirmations: u64,
     /// Base URL of the privacybtc-indexer (e.g. "http://127.0.0.1:8787").
     /// When set, the relayer notifies the indexer of every broadcast tx hash.
     indexer_url: Option<String>,
@@ -358,6 +366,8 @@ struct RelayerHttpConfig {
     swap_book_path: Option<PathBuf>,
     /// Production guard for /submit_raw. Calls are limited to these target addresses and selectors.
     submit_raw_allowlist: SubmitRawAllowlist,
+    /// Shared secret required to create or refresh LP offers. User accepts remain public.
+    lp_offer_token: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -635,6 +645,7 @@ async fn run_http_server(
     min_conf: u32,
     btc_payout_wif: Option<&str>,
     btc_payout_fee_sat_vb: u64,
+    btc_payout_evm_confirmations: u64,
     indexer_url: Option<String>,
 ) -> Result<()> {
     let auto_shield = match (btc_rpc_url, deposit_address, intent_dir) {
@@ -651,6 +662,21 @@ async fn run_http_server(
         seen_bundle_paths: Arc::new(Mutex::new(std::collections::HashSet::new())),
     });
     let submit_raw_allowlist = SubmitRawAllowlist::from_env()?;
+    if btc_payout_wif.is_some() {
+        if btc_payout_evm_confirmations == 0 {
+            return Err(anyhow!("PRIVACYBTC_BTC_PAYOUT_EVM_CONFIRMATIONS must be > 0 when BTC payout is enabled"));
+        }
+        if std::env::var("PRIVACYBTC_ETH_RPC_FALLBACK_URLS")
+            .ok()
+            .map(|v| v.split(',').any(|url| !url.trim().is_empty()))
+            != Some(true)
+        {
+            return Err(anyhow!("BTC payout requires an independent PRIVACYBTC_ETH_RPC_FALLBACK_URLS endpoint"));
+        }
+    }
+    let lp_offer_token = std::env::var("PRIVACYBTC_LP_OFFER_TOKEN")
+        .ok()
+        .filter(|token| !token.trim().is_empty());
     let swap_book_path = swap_book_path_from_env();
     let swap_book = load_swap_book(swap_book_path.as_deref())?;
     let state = Arc::new(RelayerHttpConfig {
@@ -668,12 +694,14 @@ async fn run_http_server(
         auto_transfer,
         btc_payout_wif: btc_payout_wif.map(|s| s.to_string()),
         btc_payout_fee_sat_vb,
+        btc_payout_evm_confirmations,
         indexer_url,
         nonce_cache: Arc::new(Mutex::new(None)),
         screening: Arc::new(screening::ScreeningConfig::from_env()),
         swap_book: Arc::new(Mutex::new(swap_book)),
         swap_book_path,
         submit_raw_allowlist,
+        lp_offer_token,
     });
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind(bind)
@@ -1120,7 +1148,7 @@ async fn http_unshield_submit(
     }
 
 
-    let tx_hash = submit_unshield_bundle(
+    let submitted = submit_unshield_bundle(
         &cfg.rpc_url,
         cfg.chain_id,
         &cfg.private_key,
@@ -1136,6 +1164,7 @@ async fn http_unshield_submit(
     .await
     .map_err(http_error)?;
 
+    let tx_hash = submitted.tx_hash;
     tokio::spawn(notify_pending_tx(cfg.indexer_url.clone(), tx_hash.clone(), req.contract.clone()));
 
     // Spawn background BTC payout (only when btc payout is configured and address provided).
@@ -1143,14 +1172,17 @@ async fn http_unshield_submit(
         (req.recipient_btc_address, cfg.btc_payout_wif.clone())
     {
         let eth_rpc     = cfg.rpc_url.clone();
+        let contract    = req.contract.clone();
         let tx          = tx_hash.clone();
+        let calldata_hash = submitted.calldata_hash;
         let amount_sats = req.amount_sats;
         let fee_sat_vb  = cfg.btc_payout_fee_sat_vb;
+        let confirmations = cfg.btc_payout_evm_confirmations;
         let esplora_url = cfg.auto_shield.as_ref()
             .map(|s| esplora_base_url(&s.btc_rpc_url))
             .unwrap_or_else(|| "https://blockstream.info/api".to_string());
         tokio::spawn(async move {
-            match wait_and_payout_btc(&eth_rpc, &tx, &esplora_url, &wif, &btc_addr, amount_sats, fee_sat_vb).await {
+            match wait_and_payout_btc(&eth_rpc, &tx, &contract, &calldata_hash, confirmations, &esplora_url, &wif, &btc_addr, amount_sats, fee_sat_vb).await {
                 Ok(btc_txid) => println!(
                     "[unshield] BTC payout sent: txid={btc_txid} amount={amount_sats}sat → {btc_addr}"
                 ),
@@ -1275,15 +1307,6 @@ fn bundle_to_action_args(bundle: &OrchardStoredBundle) -> Result<Vec<BundleActio
         let raw_pi: [[u8; 32]; 8] = a.pub_fields_bn254.as_ref()
             .and_then(|v| v.clone().try_into().ok())
             .ok_or_else(|| anyhow!("action missing pub_fields_bn254 (expected 8 elements)"))?;
-        let spend_auth: [[u8; 32]; 3] = if a.spend_auth_sig.len() == 96 {
-            [
-                a.spend_auth_sig[0..32].try_into().unwrap(),
-                a.spend_auth_sig[32..64].try_into().unwrap(),
-                a.spend_auth_sig[64..96].try_into().unwrap(),
-            ]
-        } else {
-            [[0u8; 32]; 3]
-        };
         out.push(BundleActionArgs {
             cmx:            a.cmx,
             enc_ciphertext: a.enc_ciphertext.clone(),
@@ -1293,7 +1316,6 @@ fn bundle_to_action_args(bundle: &OrchardStoredBundle) -> Result<Vec<BundleActio
             anchor:         bundle.anchor_orchard,
             proof,
             pub_fields:     raw_pi,
-            spend_auth_sig: spend_auth,
         });
     }
     Ok(out)
@@ -1500,6 +1522,22 @@ fn default_offer_ttl() -> u64 { 120 }
 fn default_max_amount_b() -> u64 { u64::MAX }
 /// Stale Accepted/Initiated/Joined orders expire after this many seconds.
 const ORDER_TTL_SECS: u64 = 3600;
+/// Bound untrusted order-book storage and the amount of proved bundle data retained in memory.
+const MAX_SWAP_ORDERS: usize = 1_000;
+const MAX_SWAP_BUNDLE_BYTES: usize = 256 * 1024;
+
+fn require_lp_token(cfg: &RelayerHttpConfig, headers: &HeaderMap) -> Result<(), (StatusCode, Json<HttpErrorResponse>)> {
+    let expected = cfg.lp_offer_token.as_deref().ok_or_else(|| http_error(anyhow!(
+        "LP operations disabled: configure PRIVACYBTC_LP_OFFER_TOKEN"
+    )))?;
+    let supplied = headers.get("x-lp-offer-token").and_then(|value| value.to_str().ok());
+    if supplied != Some(expected) {
+        return Err((StatusCode::UNAUTHORIZED, Json(HttpErrorResponse {
+            error: "invalid LP offer token".to_owned(), code: None,
+        })));
+    }
+    Ok(())
+}
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct SwapOffer {
@@ -1724,8 +1762,19 @@ struct PostOfferReq {
 /// LP bot publishes / refreshes a standing offer.
 async fn http_swap_offer_post(
     State(cfg): State<Arc<RelayerHttpConfig>>,
+    headers: HeaderMap,
     Json(req): Json<PostOfferReq>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<HttpErrorResponse>)> {
+    require_lp_token(&cfg, &headers)?;
+    if req.pool_a.eq_ignore_ascii_case(&req.pool_b) {
+        return Err(http_error(anyhow!("LP offer pools must differ")));
+    }
+    if req.chain_id != cfg.chain_id || cfg.swap_coordinator.as_deref() != Some(req.coordinator.as_str()) {
+        return Err(http_error(anyhow!("LP offer chain or coordinator does not match relayer configuration")));
+    }
+    if !req.rate.is_finite() || req.rate <= 0.0 || req.min_amount_b == 0 || req.min_amount_b > req.max_amount_b {
+        return Err(http_error(anyhow!("invalid LP offer rate or amount range")));
+    }
     let mut book = cfg.swap_book.lock().await;
     book.prune();
     let offer_id = req.offer_id.clone().unwrap_or_else(|| book.next_id("offer"));
@@ -1788,6 +1837,15 @@ async fn http_swap_accept(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<HttpErrorResponse>)> {
     let mut book = cfg.swap_book.lock().await;
     book.prune();
+    if book.orders.len() >= MAX_SWAP_ORDERS {
+        return Err(http_error(anyhow!("swap order book is at capacity; retry later")));
+    }
+    if serde_json::to_vec(&req.bundle_b)
+        .map_err(|e| http_error(anyhow!(e)))?
+        .len() > MAX_SWAP_BUNDLE_BYTES
+    {
+        return Err(http_error(anyhow!("bundle_b exceeds maximum accepted size")));
+    }
     let offer = book
         .offers
         .get(&req.offer_id)
@@ -1795,8 +1853,10 @@ async fn http_swap_accept(
         .ok_or_else(|| http_error(anyhow!("offer not found or expired: {}", req.offer_id)))?;
     if offer.pool_a.to_lowercase() != req.pool_a.to_lowercase()
         || offer.pool_b.to_lowercase() != req.pool_b.to_lowercase()
+        || offer.chain_id != req.chain_id
+        || offer.coordinator != req.coordinator
     {
-        return Err(http_error(anyhow!("accept pools do not match offer")));
+        return Err(http_error(anyhow!("accept fields do not match offer")));
     }
     if req.amount_b < offer.min_amount_b || req.amount_b > offer.max_amount_b {
         return Err(http_error(anyhow!(
@@ -1841,7 +1901,9 @@ async fn http_swap_accept(
 /// LP bot pulls pending accepts (status = Accepted), including `bundle_b` to settle with later.
 async fn http_swap_requests(
     State(cfg): State<Arc<RelayerHttpConfig>>,
+    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<HttpErrorResponse>)> {
+    require_lp_token(&cfg, &headers)?;
     let mut book = cfg.swap_book.lock().await;
     if book.prune() {
         persist_swap_book(&cfg, &book).map_err(http_error)?;
@@ -1933,10 +1995,25 @@ struct SwapInitiateResponse {
 /// so the caller can drive `joinSwap`/`settle` without parsing the receipt.
 async fn http_swap_initiate(
     State(cfg): State<Arc<RelayerHttpConfig>>,
+    headers: HeaderMap,
     Json(req): Json<SwapInitiateRequest>,
 ) -> Result<Json<SwapInitiateResponse>, (StatusCode, Json<HttpErrorResponse>)> {
     async {
+        require_lp_token(&cfg, &headers).map_err(|(_, body)| anyhow!(body.0.error))?;
+        let rid = req.request_id.as_deref().ok_or_else(|| anyhow!("LP initiate requires request_id"))?;
         let coordinator = resolve_coordinator(&cfg, &req.coordinator)?;
+        let existing = {
+            let mut book = cfg.swap_book.lock().await;
+            if book.prune() { persist_swap_book(&cfg, &book)?; }
+            book.orders.get(rid).cloned().ok_or_else(|| anyhow!("order not found: {rid}"))?
+        };
+        if existing.status != SwapOrderStatus::Accepted
+            || !existing.coordinator.eq_ignore_ascii_case(&coordinator)
+            || !existing.pool_a.eq_ignore_ascii_case(&req.pool_a)
+            || !existing.pool_b.eq_ignore_ascii_case(&req.pool_b)
+        {
+            return Err(anyhow!("initiate request does not match an accepted LP order"));
+        }
         let pool_a = parse_evm_address_hex(&req.pool_a).map_err(|e| anyhow!("bad pool_a: {e}"))?;
         let pool_b = parse_evm_address_hex(&req.pool_b).map_err(|e| anyhow!("bad pool_b: {e}"))?;
         let htlc_hash = parse_hex32(&req.htlc_hash_hex).context("htlc_hash_hex")?;
@@ -1963,11 +2040,9 @@ async fn http_swap_initiate(
         )
         .await?;
         let swap_id_hex = format!("0x{}", hex::encode(swap_id));
-        if let Some(rid) = req.request_id.as_deref() {
-            let mut book = cfg.swap_book.lock().await;
-            book.set_initiated_by_request(rid, swap_id_hex.clone(), tx_hash.clone());
-            persist_swap_book(&cfg, &book)?;
-        }
+        let mut book = cfg.swap_book.lock().await;
+        book.set_initiated_by_request(rid, swap_id_hex.clone(), tx_hash.clone());
+        persist_swap_book(&cfg, &book)?;
         println!("[swap/initiate] tx={tx_hash} swap_id={swap_id_hex}");
         Ok::<_, anyhow::Error>(SwapInitiateResponse {
             tx_hash,
@@ -2020,6 +2095,17 @@ async fn http_swap_join(
         let (call_b, _commit_b) = leg_call_and_commit("bundle_b", &req.bundle_b, &req.commit_b_hex)?;
         let _ = (&req.rk_bx_hex, &req.rk_by_hex); // rkB is read from storage on-chain (audit A-1)
         let joiner_sig = parse_sig96_hex(&req.joiner_sig_hex)?;
+        if let Some(rid) = req.request_id.as_deref() {
+            let mut book = cfg.swap_book.lock().await;
+            if book.prune() { persist_swap_book(&cfg, &book)?; }
+            let order = book.orders.get(rid).ok_or_else(|| anyhow!("order not found: {rid}"))?;
+            if order.status != SwapOrderStatus::Initiated
+                || order.swap_id.as_deref() != Some(req.swap_id_hex.as_str())
+                || serde_json::to_value(req.bundle_b.as_ref())? != order.bundle_b
+            {
+                return Err(anyhow!("join request does not match initiated LP order"));
+            }
+        }
         let calldata = encode_swap_join_calldata(&swap_id, &call_b, &joiner_sig);
         let tx_hash = send_raw_calldata(
             &cfg.rpc_url,
@@ -2069,9 +2155,25 @@ struct SwapSettleRequest {
 /// `settle(swapId, secret, callA, callB)` — relayer-signed; atomically executes both legs.
 async fn http_swap_settle(
     State(cfg): State<Arc<RelayerHttpConfig>>,
+    headers: HeaderMap,
     Json(req): Json<SwapSettleRequest>,
 ) -> Result<Json<HttpTxResponse>, (StatusCode, Json<HttpErrorResponse>)> {
+    require_lp_token(&cfg, &headers)?;
+    let rid = req.request_id.as_deref().ok_or_else(|| http_error(anyhow!("LP settle requires request_id")))?;
     let coordinator = resolve_coordinator(&cfg, &req.coordinator).map_err(http_error)?;
+    {
+        let mut book = cfg.swap_book.lock().await;
+        if book.prune() { persist_swap_book(&cfg, &book).map_err(http_error)?; }
+        let order = book.orders.get(rid).ok_or_else(|| http_error(anyhow!("order not found: {rid}")))?;
+        if order.status != SwapOrderStatus::Joined
+            || order.swap_id.as_deref() != Some(req.swap_id_hex.as_str())
+            || !order.coordinator.eq_ignore_ascii_case(&coordinator)
+            || req.pool_a.as_deref() != Some(order.pool_a.as_str())
+            || req.pool_b.as_deref() != Some(order.pool_b.as_str())
+        {
+            return Err(http_error(anyhow!("settle request does not match joined LP order")));
+        }
+    }
     let swap_id = parse_hex32(&req.swap_id_hex)
         .map_err(|e| http_error(anyhow!("swap_id_hex: {e}")))?;
     let secret = parse_hex32(&req.secret_hex)
@@ -2111,7 +2213,8 @@ async fn http_swap_settle(
     // prematurely reporting "settled" makes the LP bot finalize a phantom change note and shows
     // the user a false success. Instead, watch the receipt in the background and transition to
     // Settled (status=0x1) or Failed (status=0x0 / timeout) based on the on-chain outcome.
-    if let Some(rid) = req.request_id.clone() {
+    {
+        let rid = rid.to_owned();
         let swap_book = Arc::clone(&cfg.swap_book);
         let swap_book_path = cfg.swap_book_path.clone();
         let rpc_url = cfg.rpc_url.clone();
@@ -2278,6 +2381,9 @@ async fn send_raw_calldata(
 async fn wait_and_payout_btc(
     eth_rpc: &str,
     tx_hash: &str,
+    expected_contract: &str,
+    expected_calldata_hash: &[u8; 32],
+    min_confirmations: u64,
     esplora_url: &str,
     wif: &str,
     btc_addr: &str,
@@ -2285,25 +2391,16 @@ async fn wait_and_payout_btc(
     fee_sat_vb: u64,
 ) -> Result<String> {
     let client = Client::new();
+    let evm = EthRpcClient::new(eth_rpc.to_string());
     for attempt in 0..60 {
         tokio::time::sleep(Duration::from_secs(5)).await;
-        let resp: serde_json::Value = client
-            .post(eth_rpc)
-            .json(&serde_json::json!({
-                "jsonrpc": "2.0", "id": 1,
-                "method": "eth_getTransactionReceipt",
-                "params": [tx_hash]
-            }))
-            .send().await?.json().await?;
-        if let Some(receipt) = resp["result"].as_object() {
-            match receipt.get("status").and_then(|s| s.as_str()) {
-                Some("0x1") => {
-                    println!("[unshield] L2 confirmed (attempt {}), signing BTC payout…", attempt + 1);
-                    return btc_payout_local(&client, esplora_url, wif, btc_addr, amount_sats, fee_sat_vb).await;
-                }
-                Some("0x0") => return Err(anyhow!("L2 unshield tx reverted — BTC payout skipped")),
-                _ => {}
+        match evm.verify_finalized_transaction(tx_hash, expected_contract, expected_calldata_hash, min_confirmations).await {
+            Ok(true) => {
+                println!("[unshield] L2 finalized on all RPCs (attempt {}), signing BTC payout…", attempt + 1);
+                return btc_payout_local(&client, esplora_url, wif, btc_addr, amount_sats, fee_sat_vb).await;
             }
+            Ok(false) => continue,
+            Err(e) => return Err(anyhow!("L2 payout verification failed: {e}")),
         }
     }
     Err(anyhow!("L2 tx not confirmed within 5 minutes"))
@@ -2632,15 +2729,6 @@ async fn submit_shield_bundle(
         let raw_pi: [[u8; 32]; 8] = a.pub_fields_bn254.as_ref()
             .and_then(|v| <Vec<[u8;32]> as Clone>::clone(v).try_into().ok())
             .ok_or_else(|| anyhow!("action missing pub_fields_bn254 (expected 8 elements)"))?;
-        let spend_auth: [[u8; 32]; 3] = if a.spend_auth_sig.len() == 96 {
-            [
-                a.spend_auth_sig[0..32].try_into().unwrap(),
-                a.spend_auth_sig[32..64].try_into().unwrap(),
-                a.spend_auth_sig[64..96].try_into().unwrap(),
-            ]
-        } else {
-            [[0u8; 32]; 3]
-        };
         bundle_actions.push(BundleActionArgs {
             cmx:             a.cmx,
             enc_ciphertext:  a.enc_ciphertext.clone(),
@@ -2650,7 +2738,6 @@ async fn submit_shield_bundle(
             anchor:          bundle.anchor_orchard,
             proof,
             pub_fields:      raw_pi,
-            spend_auth_sig:  spend_auth,
         });
     }
 
@@ -2704,15 +2791,6 @@ async fn submit_transfer_bundle(
         let raw_pi: [[u8; 32]; 8] = a.pub_fields_bn254.as_ref()
             .and_then(|v| <Vec<[u8;32]> as Clone>::clone(v).try_into().ok())
             .ok_or_else(|| anyhow!("action missing pub_fields_bn254 (expected 8 elements)"))?;
-        let spend_auth: [[u8; 32]; 3] = if a.spend_auth_sig.len() == 96 {
-            [
-                a.spend_auth_sig[0..32].try_into().unwrap(),
-                a.spend_auth_sig[32..64].try_into().unwrap(),
-                a.spend_auth_sig[64..96].try_into().unwrap(),
-            ]
-        } else {
-            [[0u8; 32]; 3]
-        };
         bundle_actions.push(BundleActionArgs {
             cmx:             a.cmx,
             enc_ciphertext:  a.enc_ciphertext.clone(),
@@ -2722,7 +2800,6 @@ async fn submit_transfer_bundle(
             anchor:          bundle.anchor_orchard,
             proof,
             pub_fields:      raw_pi,
-            spend_auth_sig:  spend_auth,
         });
     }
     let calldata = encode_bundle_calldata(&BundleCalldataArgs {
@@ -2753,6 +2830,11 @@ async fn submit_transfer_bundle(
 /// The bundle must contain `proof_bn254`, `pub_fields_bn254`, and `binding_sig_bn254`.
 /// This calls the trustless `unshield(nfOld, anchor, proof, pubInputs, amount, recipientMeta, bindingSig)`
 /// function — no federation trust required on the EVM side.
+struct SubmittedUnshield {
+    tx_hash: String,
+    calldata_hash: [u8; 32],
+}
+
 async fn submit_unshield_bundle(
     rpc_url: &str,
     chain_id: u64,
@@ -2765,7 +2847,7 @@ async fn submit_unshield_bundle(
     gas_limit: u64,
     nonce_cache: &Arc<Mutex<Option<u64>>>,
     indexer_url: Option<&str>,
-) -> Result<String> {
+) -> Result<SubmittedUnshield> {
     enforce_frozen_compliance(indexer_url, contract, bundle).await?;
 
     let binding_sig = bundle
@@ -2785,15 +2867,6 @@ async fn submit_unshield_bundle(
         let raw_pi: [[u8; 32]; 8] = a.pub_fields_bn254.as_ref()
             .and_then(|v| <Vec<[u8;32]> as Clone>::clone(v).try_into().ok())
             .ok_or_else(|| anyhow!("action missing pub_fields_bn254 (expected 8 elements)"))?;
-        let spend_auth: [[u8; 32]; 3] = if a.spend_auth_sig.len() == 96 {
-            [
-                a.spend_auth_sig[0..32].try_into().unwrap(),
-                a.spend_auth_sig[32..64].try_into().unwrap(),
-                a.spend_auth_sig[64..96].try_into().unwrap(),
-            ]
-        } else {
-            [[0u8; 32]; 3]
-        };
         bundle_actions.push(BundleActionArgs {
             cmx:             a.cmx,
             enc_ciphertext:  a.enc_ciphertext.clone(),
@@ -2803,7 +2876,6 @@ async fn submit_unshield_bundle(
             anchor:          bundle.anchor_orchard,
             proof,
             pub_fields:      raw_pi,
-            spend_auth_sig:  spend_auth,
         });
     }
 
@@ -2824,12 +2896,14 @@ async fn submit_unshield_bundle(
     let (max_priority_fee, max_fee) = client.suggest_eip1559_fees(gas_price_gwei).await;
     let sender_hex = format!("0x{}", hex::encode(addr));
     let contract = contract.to_string();
-    send_raw_with_nonce_retry(&client, &sender_hex, nonce_cache, |nonce| {
+    let calldata_hash: [u8; 32] = Keccak256::digest(&calldata).into();
+    let tx_hash = send_raw_with_nonce_retry(&client, &sender_hex, nonce_cache, |nonce| {
         build_and_sign_eip1559_tx(
             nonce, max_priority_fee, max_fee, gas_limit, &contract, 0, &calldata, chain_id, &signing_key,
         )
     })
-    .await
+    .await?;
+    Ok(SubmittedUnshield { tx_hash, calldata_hash })
 }
 
 async fn unshield_finalize_submit(
@@ -3351,6 +3425,61 @@ impl EthRpcClient {
         Ok(result.map(|r| r.status == "0x1"))
     }
 
+    /// Fail closed before an irreversible BTC payout: every configured RPC must agree
+    /// on a successful, sufficiently deep transaction whose target and calldata are exactly
+    /// those produced by this relayer for the unshield request.
+    async fn verify_finalized_transaction(
+        &self,
+        tx_hash: &str,
+        expected_contract: &str,
+        expected_calldata_hash: &[u8; 32],
+        min_confirmations: u64,
+    ) -> Result<bool> {
+        if self.urls.len() < 2 {
+            return Err(anyhow!("BTC payout requires at least two EVM RPC endpoints"));
+        }
+        let expected_contract = normalize_evm_address(expected_contract)?;
+        let mut agreed_block_hash: Option<String> = None;
+        for url in &self.urls {
+            let receipt: Option<Value> = self.rpc_call_url(url, "eth_getTransactionReceipt", serde_json::json!([tx_hash])).await?;
+            let Some(receipt) = receipt else { return Ok(false); };
+            if receipt["status"].as_str() != Some("0x1")
+                || receipt["transactionHash"].as_str() != Some(tx_hash)
+                || receipt["to"].as_str().map(normalize_evm_address).transpose()? != Some(expected_contract.clone())
+            {
+                return Err(anyhow!("RPC {url} returned an unexpected receipt"));
+            }
+            let block_hash = receipt["blockHash"].as_str().ok_or_else(|| anyhow!("receipt missing blockHash"))?.to_owned();
+            if let Some(previous) = &agreed_block_hash {
+                if previous != &block_hash { return Err(anyhow!("RPCs disagree on receipt block hash")); }
+            } else {
+                agreed_block_hash = Some(block_hash);
+            }
+            let block = parse_hex_u64(receipt["blockNumber"].as_str().ok_or_else(|| anyhow!("receipt missing blockNumber"))?)?;
+            let head: String = self.rpc_call_url(url, "eth_blockNumber", serde_json::json!([])).await?;
+            if parse_hex_u64(&head)?.saturating_sub(block).saturating_add(1) < min_confirmations { return Ok(false); }
+            let tx: Option<Value> = self.rpc_call_url(url, "eth_getTransactionByHash", serde_json::json!([tx_hash])).await?;
+            let input = tx.and_then(|t| t["input"].as_str().map(str::to_owned)).ok_or_else(|| anyhow!("RPC {url} missing transaction input"))?;
+            if Keccak256::digest(hex::decode(strip_0x(&input)).context("invalid transaction input hex")?).as_slice() != expected_calldata_hash {
+                return Err(anyhow!("RPC {url} transaction calldata does not match submitted unshield"));
+            }
+        }
+        Ok(true)
+    }
+
+    async fn rpc_call_url<T: DeserializeOwned>(&self, url: &str, method: &str, params: Value) -> Result<T> {
+        let req = serde_json::json!({ "jsonrpc": "2.0", "id": 1u64, "method": method, "params": params });
+        let response = self.http.post(url).json(&req).send().await
+            .with_context(|| format!("RPC request to {url}"))?
+            .json::<JsonRpcResponse<T>>().await
+            .with_context(|| format!("RPC decode from {url}"))?;
+        match (response.result, response.error) {
+            (Some(value), None) => Ok(value),
+            (None, Some(error)) => Err(anyhow!("rpc error {} from {url}: {}", error.code, error.message)),
+            _ => Err(anyhow!("malformed RPC response from {url}")),
+        }
+    }
+
     /// 依次尝试每个 RPC URL，任意一个成功即返回；全部失败才报错。
     async fn rpc_call<T: DeserializeOwned>(&self, method: &str, params: Value) -> Result<T> {
         let req = serde_json::json!({
@@ -3679,23 +3808,34 @@ mod tests {
             gas_limit_shield: 0,
             gas_limit_unshield: 0,
             gas_limit_transfer: 0,
-            swap_coordinator: Some("0xcoordinator".into()),
+            swap_coordinator: Some("0xc".into()),
             gas_limit_swap: 0,
             auto_shield: None,
             auto_transfer: None,
             btc_payout_wif: None,
             btc_payout_fee_sat_vb: 1,
+            btc_payout_evm_confirmations: 12,
             indexer_url: None,
             nonce_cache: Arc::new(Mutex::new(None)),
             screening: Arc::new(screening::ScreeningConfig::from_env()),
             swap_book: Arc::new(Mutex::new(SwapBook::default())),
             swap_book_path: None,
             submit_raw_allowlist: SubmitRawAllowlist::default(),
+            lp_offer_token: Some("test-lp-token".into()),
         })
     }
 
-    async fn call(app: &Router, method: &str, uri: &str, body: Option<Value>) -> (Sc, Value) {
-        let req = Request::builder().method(method).uri(uri);
+    async fn call_with_token(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        body: Option<Value>,
+        token: Option<&str>,
+    ) -> (Sc, Value) {
+        let mut req = Request::builder().method(method).uri(uri);
+        if let Some(token) = token {
+            req = req.header("x-lp-offer-token", token);
+        }
         let req = match body {
             Some(b) => req.header("content-type", "application/json")
                 .body(Body::from(serde_json::to_vec(&b).unwrap())).unwrap(),
@@ -3706,6 +3846,31 @@ mod tests {
         let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
         let json = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
         (status, json)
+    }
+
+    async fn call(app: &Router, method: &str, uri: &str, body: Option<Value>) -> (Sc, Value) {
+        call_with_token(app, method, uri, body, Some("test-lp-token")).await
+    }
+
+    #[tokio::test]
+    async fn orderbook_http_offer_requires_lp_token_and_distinct_pools() {
+        let app = build_router(test_state());
+        let offer = serde_json::json!({
+            "chain_id": 1, "coordinator": "0xc", "pool_a": "0xaaa", "pool_b": "0xbbb",
+            "initiator_addr": "lp", "rate": 1.0, "min_amount_b": 1, "max_amount_b": 100,
+            "ttl_secs": 60,
+        });
+
+        let (st, _) = call_with_token(&app, "POST", "/swap/offers", Some(offer.clone()), None).await;
+        assert_eq!(st, Sc::UNAUTHORIZED, "unauthenticated offer publication is rejected");
+
+        let mut same_pool = offer;
+        same_pool["pool_b"] = Value::String("0xaaa".into());
+        let (st, _) = call(&app, "POST", "/swap/offers", Some(same_pool)).await;
+        assert_ne!(st, Sc::OK, "same-pool offers are rejected");
+
+        let (st, _) = call_with_token(&app, "GET", "/swap/requests", None, None).await;
+        assert_eq!(st, Sc::UNAUTHORIZED, "proved order bundles are LP-only");
     }
 
     #[tokio::test]
