@@ -531,6 +531,13 @@ struct HttpErrorResponse {
 /// if the WebSocket drops while the tx is in-flight.
 async fn notify_pending_tx(indexer_url: Option<String>, tx_hash: String, contract_address: String) {
     let Some(base_url) = indexer_url else { return };
+    let Some(token) = std::env::var("PRIVACYBTC_INDEXER_RELAYER_TOKEN")
+        .ok()
+        .filter(|token| !token.trim().is_empty())
+    else {
+        eprintln!("[relayer] indexer notify disabled: set PRIVACYBTC_INDEXER_RELAYER_TOKEN");
+        return;
+    };
     let url = format!(
         "{}/notify_tx?pool={}",
         base_url.trim_end_matches('/'),
@@ -542,7 +549,7 @@ async fn notify_pending_tx(indexer_url: Option<String>, tx_hash: String, contrac
         .no_proxy()
         .build()
         .unwrap_or_default();
-    match client.post(&url).json(&body).send().await {
+    match client.post(&url).bearer_auth(token).json(&body).send().await {
         Ok(resp) if resp.status().is_success() => {
             println!("[relayer] notified indexer of tx {tx_hash}");
         }
