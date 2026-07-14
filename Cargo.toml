@@ -10,7 +10,7 @@ name = "privacy-relayer"
 path = "src/main.rs"
 
 [dependencies]
-privacy-core = { path = "../privacy-core" }
+privacy-core = { git = "https://github.com/PLabs4/privacy-core.git", rev = "5b08e98bec1dd1093bb04753de80ab2cc3e3543f" }
 anyhow = "1"
 axum = "0.7"
 clap = { version = "4", features = ["derive", "env"] }

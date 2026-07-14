@@ -8,8 +8,10 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends pkg-config libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Cache dependencies first: copy manifests, build a stub, then the real source.
+# Cache dependencies first: copy manifests and the pinned Git fetch policy,
+# build a stub, then the real source.
 COPY Cargo.toml Cargo.lock ./
+COPY .cargo ./.cargo
 RUN mkdir -p src && echo 'fn main() {}' > src/main.rs \
     && cargo build --release --locked \
     && rm -rf src
