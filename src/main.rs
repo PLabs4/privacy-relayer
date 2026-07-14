@@ -4047,6 +4047,19 @@ mod tests {
     }
 
     #[test]
+    fn current_bundle_without_legacy_spend_auth_decodes_and_encodes() {
+        let mut value = serde_json::to_value(test_bundle()).unwrap();
+        value["actions"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("spend_auth_sig");
+
+        let bundle: OrchardStoredBundle = serde_json::from_value(value).unwrap();
+        assert!(bundle.actions[0].spend_auth_sig.is_empty());
+        assert_eq!(bundle_to_action_args(&bundle).unwrap().len(), 1);
+    }
+
+    #[test]
     fn leg_call_and_commit_requires_bundle() {
         let err = leg_call_and_commit("bundle_a", &None, &None).unwrap_err();
         assert!(err.to_string().contains("bundle_a is required"), "{err}");
