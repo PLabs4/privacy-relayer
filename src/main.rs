@@ -1889,7 +1889,14 @@ async fn http_swap_offer_post(
     if req.pool_a.eq_ignore_ascii_case(&req.pool_b) {
         return Err(http_error(anyhow!("LP offer pools must differ")));
     }
-    if req.chain_id != cfg.chain_id || cfg.swap_coordinator.as_deref() != Some(req.coordinator.as_str()) {
+    let configured_coordinator = cfg.swap_coordinator.as_deref().ok_or_else(|| {
+        http_error(anyhow!(
+            "LP offer chain or coordinator does not match relayer configuration"
+        ))
+    })?;
+    if req.chain_id != cfg.chain_id
+        || !configured_coordinator.eq_ignore_ascii_case(&req.coordinator)
+    {
         return Err(http_error(anyhow!("LP offer chain or coordinator does not match relayer configuration")));
     }
     if !req.rate.is_finite() || req.rate <= 0.0 || req.min_amount_b == 0 || req.min_amount_b > req.max_amount_b {
@@ -1901,7 +1908,7 @@ async fn http_swap_offer_post(
     let offer = SwapOffer {
         offer_id: offer_id.clone(),
         chain_id: req.chain_id,
-        coordinator: req.coordinator,
+        coordinator: configured_coordinator.to_string(),
         pool_a: req.pool_a,
         pool_b: req.pool_b,
         pool_a_symbol: req.pool_a_symbol,
@@ -1974,7 +1981,7 @@ async fn http_swap_accept(
     if offer.pool_a.to_lowercase() != req.pool_a.to_lowercase()
         || offer.pool_b.to_lowercase() != req.pool_b.to_lowercase()
         || offer.chain_id != req.chain_id
-        || offer.coordinator != req.coordinator
+        || !offer.coordinator.eq_ignore_ascii_case(&req.coordinator)
     {
         return Err(http_error(anyhow!("accept fields do not match offer")));
     }
@@ -4313,6 +4320,39 @@ mod tests {
         assert_eq!(body["status"].as_str().unwrap(), "accepted");
         // bundle_b must NOT be echoed to the user-facing order view.
         assert!(body.get("bundle_b").is_none());
+    }
+
+    #[tokio::test]
+    async fn orderbook_http_coordinator_matching_is_case_insensitive() {
+        let canonical_coordinator = "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd";
+        let checksum_coordinator = "0xAbCdEfAbCdEfAbCdEfAbCdEfAbCdEfAbCdEfAbCd";
+        let mut state = (*test_state()).clone();
+        state.swap_coordinator = Some(canonical_coordinator.into());
+        let app = build_router(Arc::new(state));
+
+        let (st, body) = call(&app, "POST", "/swap/offers", Some(serde_json::json!({
+            "chain_id": 1, "coordinator": checksum_coordinator,
+            "pool_a": "0xaaa", "pool_b": "0xbbb",
+            "pool_a_symbol": "A", "pool_b_symbol": "B",
+            "initiator_addr": "lpaddr", "rate": 1.0,
+            "min_amount_b": 1, "max_amount_b": 100, "ttl_secs": 60,
+        }))).await;
+        assert_eq!(st, Sc::OK, "{body}");
+        let offer_id = body["offer_id"].as_str().unwrap().to_string();
+
+        let (st, body) = call(&app, "GET", "/swap/offers", None).await;
+        assert_eq!(st, Sc::OK, "{body}");
+        assert_eq!(body["offers"][0]["coordinator"], canonical_coordinator);
+
+        let (st, body) = call(&app, "POST", "/swap/accept", Some(serde_json::json!({
+            "offer_id": offer_id, "chain_id": 1,
+            "coordinator": checksum_coordinator.to_uppercase().replacen("0X", "0x", 1),
+            "pool_a": "0xaaa", "pool_b": "0xbbb",
+            "amount_a": 10, "amount_b": 10, "joiner_addr": "useraddr",
+            "rk_bx": "0x01", "rk_by": "0x02", "commit_b": "0x03",
+            "bundle_b": { "actions": [] },
+        }))).await;
+        assert_eq!(st, Sc::OK, "{body}");
     }
 
     #[tokio::test]
