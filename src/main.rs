@@ -13,10 +13,9 @@ use k256::ecdsa::{RecoveryId, SigningKey};
 use privacy_core::intent::{build_shield_intent_v1, bundle_content_sha256, BtcDepositConfigV1, ShieldIntentV1};
 use privacy_core::types::OrchardStoredBundle;
 use privacy_core::ethereum::{
-    encode_bundle_calldata, encode_erc_shield_calldata, encode_finalize_withdraw_calldata,
+    encode_bundle_calldata, encode_finalize_withdraw_calldata,
     bundle_value_balance_be, evm_address_to_recipient_meta, parse_evm_address_hex,
-    BundleActionArgs, BundleCalldataArgs, ErcShieldCalldataArgs,
-    FinalizeWithdrawCalldataArgs,
+    BundleActionArgs, BundleCalldataArgs, FinalizeWithdrawCalldataArgs,
     // WS-6: WrappedPERC20 + SwapCoordinator calldata (privacy-core 0.1.2).
     compute_swap_id, encode_swap_initiate_calldata, encode_swap_join_calldata,
     encode_swap_settle_calldata, encode_wrapped_shield_calldata, encode_wrapped_unshield_calldata,
@@ -36,6 +35,10 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
 use url::Url;
+
+const GAS_BPS_DENOMINATOR: u64 = 10_000;
+const DEFAULT_GAS_MARGIN_BPS: u64 = 200;
+const MAX_GAS_MARGIN_BPS: u64 = 1_000;
 
 #[derive(Parser)]
 #[command(name = "privacybtc-relayer", version, about = "Federation shield relay + BTC watch (V1)")]
@@ -72,7 +75,7 @@ enum Command {
         intent_json: Option<PathBuf>,
         #[arg(long, default_value_t = 1.0)]
         gas_price_gwei: f64,
-        /// Headroom for `shield()` + Groth16 verify per action (~300–500k each).
+        /// Maximum signed gas limit for `shield()`; the exact transaction is estimated first.
         #[arg(long, default_value_t = 3_000_000)]
         gas_limit: u64,
     },
@@ -133,20 +136,31 @@ enum Command {
         contract: String,
         #[arg(long, env = "PRIVACYBTC_GAS_PRICE_GWEI", default_value_t = 1.0)]
         gas_price_gwei: f64,
-        /// Groth16 verify per action; tune after profiling on target RPC.
-        #[arg(long, env = "PRIVACYBTC_GAS_LIMIT_SHIELD", default_value_t = 3_000_000)]
+        /// Maximum signed gas limit for shield. The relayer estimates each exact transaction,
+        /// adds `gas_limit_margin_bps`, and fails closed if the result exceeds this cap.
+        #[arg(long, env = "PRIVACYBTC_GAS_LIMIT_SHIELD", default_value_t = 6_000_000)]
         gas_limit_shield: u64,
-        #[arg(long, env = "PRIVACYBTC_GAS_LIMIT_UNSHIELD", default_value_t = 3_000_000)]
+        /// Maximum signed gas limit for unshield.
+        #[arg(long, env = "PRIVACYBTC_GAS_LIMIT_UNSHIELD", default_value_t = 6_000_000)]
         gas_limit_unshield: u64,
+        /// Maximum signed gas limit for transfer and allowed `/submit_raw` calls.
         #[arg(long, env = "PRIVACYBTC_GAS_LIMIT_TRANSFER", default_value_t = 5_000_000)]
         gas_limit_transfer: u64,
+        /// Safety margin added to `eth_estimateGas`, in basis points. The padded value must
+        /// still fit the operation-specific cap; there is no large fixed-limit fallback.
+        #[arg(
+            long,
+            env = "PRIVACYBTC_GAS_LIMIT_MARGIN_BPS",
+            default_value_t = DEFAULT_GAS_MARGIN_BPS
+        )]
+        gas_limit_margin_bps: u64,
         /// Address of the `SwapCoordinator` for 3-tx atomic swaps. Required for /swap/* routes;
         /// each request may also override it per-call.
         #[arg(long, env = "PRIVACYBTC_SWAP_COORDINATOR_ADDRESS")]
         swap_coordinator: Option<String>,
-        /// Gas limit for `settle` (two Groth16 verifies + two transfers — the heaviest call).
-        /// `initiateSwap`/`joinSwap` use a small fixed limit.
-        #[arg(long, env = "PRIVACYBTC_GAS_LIMIT_SWAP", default_value_t = 9_000_000)]
+        /// Gas cap for `settle` (two Groth16 verifies + two transfers — the heaviest call).
+        /// `initiateSwap`/`joinSwap` use a smaller cap and are also dynamically estimated.
+        #[arg(long, env = "PRIVACYBTC_GAS_LIMIT_SWAP", default_value_t = 12_000_000)]
         gas_limit_swap: u64,
         /// Optional: enable automatic shield submit from Bitcoin deposits.
         #[arg(long, env = "PRIVACYBTC_BTC_RPC_URL")]
@@ -229,6 +243,7 @@ async fn main() -> Result<()> {
                 &recipient_meta_hex,
                 gas_price_gwei,
                 gas_limit,
+                DEFAULT_GAS_MARGIN_BPS,
                 &cli_nonce_cache,
             )
             .await?;
@@ -262,6 +277,7 @@ async fn main() -> Result<()> {
             gas_limit_shield,
             gas_limit_unshield,
             gas_limit_transfer,
+            gas_limit_margin_bps,
             swap_coordinator,
             gas_limit_swap,
             btc_rpc_url,
@@ -284,6 +300,7 @@ async fn main() -> Result<()> {
                 gas_limit_shield,
                 gas_limit_unshield,
                 gas_limit_transfer,
+                gas_limit_margin_bps,
                 swap_coordinator.as_deref(),
                 gas_limit_swap,
                 btc_rpc_url.as_deref(),
@@ -329,6 +346,50 @@ fn eth_address_from_signing_key(signing_key: &SigningKey) -> [u8; 20] {
     hash[12..].try_into().expect("20 bytes")
 }
 
+fn validate_gas_policy_config(margin_bps: u64, caps: &[(&str, u64)]) -> Result<()> {
+    if margin_bps > MAX_GAS_MARGIN_BPS {
+        return Err(anyhow!(
+            "PRIVACYBTC_GAS_LIMIT_MARGIN_BPS must be <= {MAX_GAS_MARGIN_BPS} (got {margin_bps})"
+        ));
+    }
+    for (operation, cap) in caps {
+        if *cap == 0 {
+            return Err(anyhow!("gas cap for {operation} must be greater than zero"));
+        }
+    }
+    Ok(())
+}
+
+fn gas_limit_with_margin(estimated: u64, margin_bps: u64, cap: u64) -> Result<u64> {
+    if estimated == 0 {
+        return Err(anyhow!("eth_estimateGas returned zero"));
+    }
+    if margin_bps > MAX_GAS_MARGIN_BPS {
+        return Err(anyhow!(
+            "gas margin must be <= {MAX_GAS_MARGIN_BPS} bps (got {margin_bps})"
+        ));
+    }
+    if cap == 0 {
+        return Err(anyhow!("gas cap must be greater than zero"));
+    }
+    let multiplier = GAS_BPS_DENOMINATOR
+        .checked_add(margin_bps)
+        .ok_or_else(|| anyhow!("gas margin overflow"))?;
+    let numerator = estimated
+        .checked_mul(multiplier)
+        .ok_or_else(|| anyhow!("gas estimate overflow"))?;
+    let padded = numerator
+        .checked_add(GAS_BPS_DENOMINATOR - 1)
+        .ok_or_else(|| anyhow!("gas estimate rounding overflow"))?
+        / GAS_BPS_DENOMINATOR;
+    if padded > cap {
+        return Err(anyhow!(
+            "estimated gas {estimated} with {margin_bps} bps margin requires {padded}, above configured cap {cap}"
+        ));
+    }
+    Ok(padded)
+}
+
 #[derive(Clone)]
 struct RelayerHttpConfig {
     rpc_url: String,
@@ -339,6 +400,7 @@ struct RelayerHttpConfig {
     gas_limit_shield: u64,
     gas_limit_unshield: u64,
     gas_limit_transfer: u64,
+    gas_limit_margin_bps: u64,
     /// Default `SwapCoordinator` address for /swap/* routes (per-request override allowed).
     swap_coordinator: Option<String>,
     /// Gas limit for `settle` (heaviest swap call).
@@ -368,6 +430,80 @@ struct RelayerHttpConfig {
     submit_raw_allowlist: SubmitRawAllowlist,
     /// Shared secret required to create or refresh LP offers. User accepts remain public.
     lp_offer_token: Option<String>,
+    /// Every v3 pool this process may target. All entries are checked on-chain at startup.
+    protocol_pools: HashSet<String>,
+    expected_protocol_version: u64,
+    expected_verifier_set_id: [u8; 32],
+}
+
+impl RelayerHttpConfig {
+    fn ensure_protocol_pool(&self, pool: &str) -> Result<String> {
+        let normalized = normalize_evm_address(pool)?;
+        if !self.protocol_pools.contains(&normalized) {
+            return Err(anyhow!(
+                "pool {normalized} is not in PRIVACYBTC_RELAYER_PROTOCOL_POOLS"
+            ));
+        }
+        Ok(normalized)
+    }
+}
+
+const CURRENT_PROTOCOL_VERSION: u64 = 3;
+
+struct ProtocolExpectation {
+    version: u64,
+    verifier_set_id: [u8; 32],
+    pools: HashSet<String>,
+}
+
+fn required_env(name: &str) -> Result<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("{name} is required"))
+}
+
+fn protocol_expectation_from_env(default_pool: &str) -> Result<ProtocolExpectation> {
+    let version: u64 = required_env("PRIVACYBTC_RELAYER_EXPECTED_PROTOCOL_VERSION")?
+        .parse()
+        .context("PRIVACYBTC_RELAYER_EXPECTED_PROTOCOL_VERSION must be u64")?;
+    if version != CURRENT_PROTOCOL_VERSION {
+        return Err(anyhow!(
+            "relayer binary supports protocol version {CURRENT_PROTOCOL_VERSION}, configured {version}"
+        ));
+    }
+    let verifier_set_id = parse_fixed_hex_32(&required_env(
+        "PRIVACYBTC_RELAYER_EXPECTED_VERIFIER_SET_ID",
+    )?)
+    .context("PRIVACYBTC_RELAYER_EXPECTED_VERIFIER_SET_ID must be bytes32")?;
+    let pools = parse_protocol_pools(&required_env("PRIVACYBTC_RELAYER_PROTOCOL_POOLS")?)?;
+    let default_pool = normalize_evm_address(default_pool)?;
+    if !pools.contains(&default_pool) {
+        return Err(anyhow!(
+            "PRIVACYBTC_CONTRACT_ADDRESS {default_pool} is missing from PRIVACYBTC_RELAYER_PROTOCOL_POOLS"
+        ));
+    }
+    Ok(ProtocolExpectation {
+        version,
+        verifier_set_id,
+        pools,
+    })
+}
+
+fn parse_protocol_pools(raw: &str) -> Result<HashSet<String>> {
+    let pools: HashSet<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(normalize_evm_address)
+        .collect::<Result<_>>()?;
+    if pools.is_empty() {
+        return Err(anyhow!(
+            "PRIVACYBTC_RELAYER_PROTOCOL_POOLS must contain at least one pool"
+        ));
+    }
+    Ok(pools)
 }
 
 #[derive(Clone, Default)]
@@ -643,6 +779,7 @@ async fn run_http_server(
     gas_limit_shield: u64,
     gas_limit_unshield: u64,
     gas_limit_transfer: u64,
+    gas_limit_margin_bps: u64,
     swap_coordinator: Option<&str>,
     gas_limit_swap: u64,
     btc_rpc_url: Option<&str>,
@@ -655,6 +792,30 @@ async fn run_http_server(
     btc_payout_evm_confirmations: u64,
     indexer_url: Option<String>,
 ) -> Result<()> {
+    validate_gas_policy_config(
+        gas_limit_margin_bps,
+        &[
+            ("shield", gas_limit_shield),
+            ("unshield", gas_limit_unshield),
+            ("transfer", gas_limit_transfer),
+            ("swap", gas_limit_swap),
+        ],
+    )?;
+    let protocol = protocol_expectation_from_env(contract)?;
+    let rpc = EthRpcClient::new(rpc_url.to_string());
+    for pool in &protocol.pools {
+        rpc.verify_pool_protocol(pool, protocol.version, &protocol.verifier_set_id)
+            .await
+            .with_context(|| format!("protocol gate for pool {pool}"))?;
+    }
+    let swap_coordinator = swap_coordinator
+        .map(normalize_evm_address)
+        .transpose()?;
+    if let Some(coordinator) = swap_coordinator.as_deref() {
+        rpc.verify_protocol_version(coordinator, protocol.version)
+            .await
+            .with_context(|| format!("protocol gate for SwapCoordinator {coordinator}"))?;
+    }
     let auto_shield = match (btc_rpc_url, deposit_address, intent_dir) {
         (Some(btc_rpc_url), Some(deposit_address), Some(intent_dir)) => Some(AutoShieldConfig {
             btc_rpc_url: btc_rpc_url.to_string(),
@@ -690,12 +851,13 @@ async fn run_http_server(
         rpc_url: rpc_url.to_string(),
         chain_id,
         private_key: private_key.to_string(),
-        contract: contract.to_string(),
+        contract: normalize_evm_address(contract)?,
         gas_price_gwei,
         gas_limit_shield,
         gas_limit_unshield,
         gas_limit_transfer,
-        swap_coordinator: swap_coordinator.map(|s| s.to_string()),
+        gas_limit_margin_bps,
+        swap_coordinator,
         gas_limit_swap,
         auto_shield,
         auto_transfer,
@@ -709,6 +871,9 @@ async fn run_http_server(
         swap_book_path,
         submit_raw_allowlist,
         lp_offer_token,
+        protocol_pools: protocol.pools,
+        expected_protocol_version: protocol.version,
+        expected_verifier_set_id: protocol.verifier_set_id,
     });
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind(bind)
@@ -723,7 +888,7 @@ async fn run_http_server(
 /// so integration tests can drive the HTTP surface (notably the LP order book) in-process.
 fn build_router(state: Arc<RelayerHttpConfig>) -> Router {
     Router::new()
-        .route("/healthz", get(|| async { "ok" }))
+        .route("/healthz", get(http_health))
         .route("/tx/status", get(http_tx_status))
         .route("/shield/address", get(http_shield_address))
         .route("/shield/check", get(http_shield_check))
@@ -734,7 +899,6 @@ fn build_router(state: Arc<RelayerHttpConfig>) -> Router {
         .route("/transfer/submit", post(http_transfer_submit))
         .route("/unshield/submit", post(http_unshield_submit))
         .route("/unshield/finalize", post(http_unshield_finalize))  // legacy, kept for compat
-        .route("/erc/shield/submit", post(http_erc_shield_submit))
         .route("/submit_raw", post(http_submit_raw))
         // ── WS-6: WrappedPERC20 shield/unshield + 3-tx atomic swap ──
         .route("/wrapped/shield/calldata", post(http_wrapped_shield_calldata))
@@ -749,6 +913,17 @@ fn build_router(state: Arc<RelayerHttpConfig>) -> Router {
         .route("/swap/order", get(http_swap_order))
         .layer(build_cors_layer())
         .with_state(state)
+}
+
+async fn http_health(
+    State(cfg): State<Arc<RelayerHttpConfig>>,
+) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "ok": true,
+        "protocol_version": cfg.expected_protocol_version,
+        "verifier_set_id": format!("0x{}", hex::encode(cfg.expected_verifier_set_id)),
+        "protocol_pool_count": cfg.protocol_pools.len(),
+    }))
 }
 
 /// Return the configured BTC deposit address so the frontend can send BTC before proving.
@@ -889,6 +1064,7 @@ async fn http_shield_auto(
             intent.amount_sats,
             cfg.gas_price_gwei,
             cfg.gas_limit_shield,
+            cfg.gas_limit_margin_bps,
             &cfg.nonce_cache,
             cfg.indexer_url.as_deref(),
         )
@@ -938,6 +1114,7 @@ async fn http_shield_submit(
         req.amount_sats,
         cfg.gas_price_gwei,
         cfg.gas_limit_shield,
+        cfg.gas_limit_margin_bps,
         &cfg.nonce_cache,
         cfg.indexer_url.as_deref(),
     )
@@ -972,6 +1149,7 @@ async fn http_transfer_auto(
             &bundle,
             cfg.gas_price_gwei,
             cfg.gas_limit_transfer,
+            cfg.gas_limit_margin_bps,
             &cfg.nonce_cache,
             cfg.indexer_url.as_deref(),
         )
@@ -1027,20 +1205,22 @@ async fn http_transfer_submit(
     State(cfg): State<Arc<RelayerHttpConfig>>,
     Json(req): Json<HttpTransferSubmitRequest>,
 ) -> Result<Json<HttpTxResponse>, (StatusCode, Json<HttpErrorResponse>)> {
+    let contract = cfg.ensure_protocol_pool(&req.contract).map_err(http_error)?;
     let tx_hash = submit_transfer_bundle(
         &cfg.rpc_url,
         cfg.chain_id,
         &cfg.private_key,
-        &req.contract,
+        &contract,
         &req.bundle,
         cfg.gas_price_gwei,
         cfg.gas_limit_transfer,
+        cfg.gas_limit_margin_bps,
         &cfg.nonce_cache,
         cfg.indexer_url.as_deref(),
     )
     .await
     .map_err(http_error)?;
-    tokio::spawn(notify_pending_tx(cfg.indexer_url.clone(), tx_hash.clone(), req.contract.clone()));
+    tokio::spawn(notify_pending_tx(cfg.indexer_url.clone(), tx_hash.clone(), contract));
     Ok(Json(HttpTxResponse { tx_hash }))
 }
 
@@ -1055,7 +1235,11 @@ struct HttpSubmitRawRequest {
     to: String,
     /// Fully-encoded calldata (0x-prefixed hex), including the 4-byte selector.
     data: String,
-    /// Optional gas limit override (defaults to the transfer gas limit).
+    /// Optional chain assertion supplied by clients. It must match this relayer.
+    #[serde(default)]
+    chain_id: Option<u64>,
+    /// Deprecated client hint. It is accepted only for rolling-upgrade compatibility and is
+    /// always ignored; the relayer estimates the exact transaction and applies server policy.
     #[serde(default)]
     gas_limit: Option<u64>,
     /// Optional wei value to attach (defaults to 0).
@@ -1067,6 +1251,19 @@ async fn http_submit_raw(
     State(cfg): State<Arc<RelayerHttpConfig>>,
     Json(req): Json<HttpSubmitRawRequest>,
 ) -> Result<Json<HttpTxResponse>, (StatusCode, Json<HttpErrorResponse>)> {
+    if let Some(chain_id) = req.chain_id {
+        if chain_id != cfg.chain_id {
+            return Err(http_error(anyhow!(
+                "chain_id mismatch: relayer is configured for {}, request asked for {chain_id}",
+                cfg.chain_id
+            )));
+        }
+    }
+    if let Some(ignored) = req.gas_limit {
+        eprintln!(
+            "[relayer] ignoring deprecated client gas_limit={ignored}; using server-side estimation"
+        );
+    }
     let calldata = hex::decode(req.data.trim_start_matches("0x"))
         .map_err(|e| http_error(anyhow!("data is not valid hex: {e}")))?;
     cfg.submit_raw_allowlist
@@ -1080,7 +1277,8 @@ async fn http_submit_raw(
         calldata,
         req.value.unwrap_or(0),
         cfg.gas_price_gwei,
-        req.gas_limit.unwrap_or(cfg.gas_limit_transfer),
+        cfg.gas_limit_transfer,
+        cfg.gas_limit_margin_bps,
         &cfg.nonce_cache,
     )
     .await
@@ -1121,6 +1319,7 @@ async fn http_unshield_submit(
     State(cfg): State<Arc<RelayerHttpConfig>>,
     Json(req): Json<HttpUnshieldSubmitRequest>,
 ) -> Result<Json<HttpTxResponse>, (StatusCode, Json<HttpErrorResponse>)> {
+    let contract = cfg.ensure_protocol_pool(&req.contract).map_err(http_error)?;
     // Resolve recipient_meta_hex from whichever field the caller supplied.
     let recipient_meta_hex: String = match (&req.recipient_meta_hex, &req.recipient_evm) {
         (Some(meta), None) => meta.clone(),
@@ -1159,12 +1358,13 @@ async fn http_unshield_submit(
         &cfg.rpc_url,
         cfg.chain_id,
         &cfg.private_key,
-        &req.contract,
+        &contract,
         &req.bundle,
         req.amount_sats,
         &recipient_meta_hex,
         cfg.gas_price_gwei,
         cfg.gas_limit_unshield,
+        cfg.gas_limit_margin_bps,
         &cfg.nonce_cache,
         cfg.indexer_url.as_deref(),
     )
@@ -1172,14 +1372,14 @@ async fn http_unshield_submit(
     .map_err(http_error)?;
 
     let tx_hash = submitted.tx_hash;
-    tokio::spawn(notify_pending_tx(cfg.indexer_url.clone(), tx_hash.clone(), req.contract.clone()));
+    tokio::spawn(notify_pending_tx(cfg.indexer_url.clone(), tx_hash.clone(), contract.clone()));
 
     // Spawn background BTC payout (only when btc payout is configured and address provided).
     if let (Some(btc_addr), Some(wif)) =
         (req.recipient_btc_address, cfg.btc_payout_wif.clone())
     {
         let eth_rpc     = cfg.rpc_url.clone();
-        let contract    = req.contract.clone();
+        let contract    = contract.clone();
         let tx          = tx_hash.clone();
         let calldata_hash = submitted.calldata_hash;
         let amount_sats = req.amount_sats;
@@ -1198,102 +1398,6 @@ async fn http_unshield_submit(
         });
     }
 
-    Ok(Json(HttpTxResponse { tx_hash }))
-}
-
-// ── ERC shield / unshield handlers ───────────────────────────────────────────
-
-/// Request body for `POST /erc/shield/submit`.
-///
-/// The relayer calls `PrivacyERC.shield()` with EIP-2612 permit params.
-/// For native-ETH pools, pass `permit_*` as zero/null — the contract ignores them.
-#[derive(Debug, Deserialize)]
-struct HttpErcShieldSubmitRequest {
-    /// PrivacyERC contract address (0x-prefixed 20 bytes).
-    contract: String,
-    /// ZK-proved bundle (must contain proof_bn254 + pub_fields_bn254 + binding_sig_bn254).
-    bundle: OrchardStoredBundle,
-    /// Token amount in smallest unit (wei for ETH, 6-decimal for USDC …).
-    amount: u64,
-    /// EIP-2612 permit: token owner EVM address (0x-prefixed).
-    #[serde(default)]
-    owner: Option<String>,
-    /// EIP-2612 permit: expiry unix timestamp.
-    #[serde(default)]
-    deadline: Option<u64>,
-    /// EIP-2612 permit signature v (1–28).
-    #[serde(default)]
-    permit_v: Option<u8>,
-    /// EIP-2612 permit signature r (0x-prefixed 32 bytes).
-    #[serde(default)]
-    permit_r: Option<String>,
-    /// EIP-2612 permit signature s (0x-prefixed 32 bytes).
-    #[serde(default)]
-    permit_s: Option<String>,
-}
-
-// /erc/unshield/submit removed — use /unshield/submit with recipient_evm instead.
-
-async fn http_erc_shield_submit(
-    State(cfg): State<Arc<RelayerHttpConfig>>,
-    Json(req): Json<HttpErcShieldSubmitRequest>,
-) -> Result<Json<HttpTxResponse>, (StatusCode, Json<HttpErrorResponse>)> {
-    // Parse permit fields (default to zero if not provided — native ETH pools ignore them)
-    let owner_bytes: [u8; 20] = if let Some(ref addr) = req.owner {
-        parse_evm_address_hex(addr).map_err(|e| http_error(anyhow!("bad owner address: {e}")))?
-    } else {
-        [0u8; 20]
-    };
-    let deadline = req.deadline.unwrap_or(0);
-    let permit_v = req.permit_v.unwrap_or(0);
-    let permit_r = if let Some(ref r) = req.permit_r {
-        parse_hex32(r).map_err(|e| http_error(anyhow!("bad permit_r: {e}")))?
-    } else {
-        [0u8; 32]
-    };
-    let permit_s = if let Some(ref s) = req.permit_s {
-        parse_hex32(s).map_err(|e| http_error(anyhow!("bad permit_s: {e}")))?
-    } else {
-        [0u8; 32]
-    };
-
-
-    enforce_frozen_compliance(cfg.indexer_url.as_deref(), &cfg.contract, &req.bundle)
-        .await
-        .map_err(http_error)?;
-
-    let actions     = bundle_to_action_args(&req.bundle).map_err(|e| http_error(anyhow!("bundle decode: {e}")))?;
-    let binding_sig = bundle_binding_sig(&req.bundle).map_err(|e| http_error(anyhow!("binding_sig: {e}")))?;
-
-    let erc_args = ErcShieldCalldataArgs {
-        actions,
-        amount: req.amount as u128,
-        owner: owner_bytes,
-        deadline,
-        permit_v,
-        permit_r,
-        permit_s,
-        binding_sig,
-    };
-    let calldata = encode_erc_shield_calldata(&erc_args)
-        .map_err(|e| http_error(anyhow!("calldata encode: {e}")))?;
-
-    let tx_hash = send_raw_calldata(
-        &cfg.rpc_url,
-        cfg.chain_id,
-        &cfg.private_key,
-        &req.contract,
-        calldata,
-        0,               // value = 0 for ERC-20 (ETH pools: frontend sends msg.value separately)
-        cfg.gas_price_gwei,
-        cfg.gas_limit_shield,
-        &cfg.nonce_cache,
-    )
-    .await
-    .map_err(http_error)?;
-
-    tokio::spawn(notify_pending_tx(cfg.indexer_url.clone(), tx_hash.clone(), req.contract.clone()));
-    println!("[erc/shield] submitted: tx={tx_hash} amount={}", req.amount);
     Ok(Json(HttpTxResponse { tx_hash }))
 }
 
@@ -1328,10 +1432,9 @@ fn bundle_to_action_args(bundle: &OrchardStoredBundle) -> Result<Vec<BundleActio
     Ok(out)
 }
 
-/// Extract the binding signature `[[u8;32];3]` from a proved `OrchardStoredBundle`.
-fn bundle_binding_sig(bundle: &OrchardStoredBundle) -> Result<[[u8; 32]; 3]> {
-    bundle.binding_sig_bn254
-        .ok_or_else(|| anyhow!("bundle.binding_sig_bn254 is missing"))
+fn bundle_binding_proof(bundle: &OrchardStoredBundle) -> Result<[[u8; 32]; 8]> {
+    bundle.binding_proof_bn254
+        .ok_or_else(|| anyhow!("bundle.binding_proof_bn254 is missing"))
 }
 
 // ── WS-6: WrappedPERC20 + SwapCoordinator submit/orchestration ────────────────
@@ -1340,29 +1443,36 @@ fn bundle_binding_sig(bundle: &OrchardStoredBundle) -> Result<[[u8; 32]; 3]> {
 // ERC20. `shield` (which pulls funds from `msg.sender`) is returned as calldata for the
 // depositor to sign and send (or push via /submit_raw). `unshield`/`swap` are value-neutral
 // or recipient-bound at the contract layer, so the relayer can sign them as the orchestrator
-// without custody risk. The relayer only forwards already-proved, already-signed bundles
-// (v2 sighash, executor bound by the prover); it never re-signs the Schnorr layer.
+// without custody risk. The relayer only forwards already-proved bundles
+// (v3 sighash, executor bound by the Binding proof).
 
 /// `initiateSwap`/`joinSwap` only store state (+ verify the joiner's Schnorr); keep them well
 /// under the heavy `settle` budget.
-const SWAP_INIT_JOIN_GAS: u64 = 1_500_000;
+const SWAP_INIT_JOIN_GAS_CAP: u64 = 1_500_000;
 
-/// Build a `PrivacyCall` (actions + bindingSig) from a proved bundle.
+/// Build a `PrivacyCall` (actions + Binding proof) from a proved bundle.
 fn bundle_to_privacy_call(bundle: &OrchardStoredBundle) -> Result<PrivacyCallArgs> {
     Ok(PrivacyCallArgs {
         actions: bundle_to_action_args(bundle)?,
-        binding_sig: bundle_binding_sig(bundle)?,
+        binding_proof: bundle_binding_proof(bundle)?,
     })
 }
 
-/// Resolve the coordinator address: per-request override, else the configured default.
+/// Resolve the coordinator address. A request may repeat the configured address but cannot
+/// redirect a protocol-v3 relayer to an unverified coordinator.
 fn resolve_coordinator(cfg: &RelayerHttpConfig, override_: &Option<String>) -> Result<String> {
-    override_
-        .clone()
-        .or_else(|| cfg.swap_coordinator.clone())
-        .ok_or_else(|| {
-            anyhow!("no SwapCoordinator configured (set PRIVACYBTC_SWAP_COORDINATOR_ADDRESS or pass `coordinator`)")
-        })
+    let configured = cfg.swap_coordinator.as_ref().ok_or_else(|| {
+        anyhow!("no verified SwapCoordinator configured (set PRIVACYBTC_SWAP_COORDINATOR_ADDRESS)")
+    })?;
+    if let Some(requested) = override_ {
+        let requested = normalize_evm_address(requested)?;
+        if requested != *configured {
+            return Err(anyhow!(
+                "requested SwapCoordinator {requested} does not match configured {configured}"
+            ));
+        }
+    }
+    Ok(configured.clone())
 }
 
 /// 20-byte EVM address of the relayer EOA (derived from its signing key).
@@ -1439,18 +1549,19 @@ async fn http_wrapped_shield_calldata(
     State(cfg): State<Arc<RelayerHttpConfig>>,
     Json(req): Json<WrappedShieldCalldataRequest>,
 ) -> Result<Json<CalldataResponse>, (StatusCode, Json<HttpErrorResponse>)> {
+    let contract = cfg.ensure_protocol_pool(&req.contract).map_err(http_error)?;
     // Layer 1: screen the depositor before building any shield calldata.
     cfg.screening
         .screen_required(req.depositor_evm.as_deref(), "shield_depositor")
         .await
         .map_err(http_rejection)?;
-    enforce_frozen_compliance(cfg.indexer_url.as_deref(), &req.contract, &req.bundle)
+    enforce_frozen_compliance(cfg.indexer_url.as_deref(), &contract, &req.bundle)
         .await
         .map_err(http_error)?;
     let call = bundle_to_privacy_call(&req.bundle).map_err(http_error)?;
     let calldata = encode_wrapped_shield_calldata(req.amount_units, &call);
     Ok(Json(CalldataResponse {
-        to: req.contract,
+        to: contract,
         data: format!("0x{}", hex::encode(calldata)),
         value: "0x0".to_string(),
     }))
@@ -1464,7 +1575,7 @@ struct WrappedUnshieldSubmitRequest {
     /// Withdraw amount in NOTE UNITS.
     amount_units: u64,
     /// EVM recipient of the released underlying. MUST match the `recipientMeta` bound in the
-    /// proved binding signature, or the contract reverts.
+    /// proved Binding public hash, or the contract reverts.
     recipient_evm: String,
 }
 
@@ -1474,13 +1585,14 @@ async fn http_wrapped_unshield_submit(
     State(cfg): State<Arc<RelayerHttpConfig>>,
     Json(req): Json<WrappedUnshieldSubmitRequest>,
 ) -> Result<Json<HttpTxResponse>, (StatusCode, Json<HttpErrorResponse>)> {
+    let contract = cfg.ensure_protocol_pool(&req.contract).map_err(http_error)?;
     // Layer 1: screen the declared recipient (the payout target, not the relayer)
     // before broadcasting. Recipient binding makes this the address that matters.
     cfg.screening
         .screen_required(Some(&req.recipient_evm), "unshield_recipient")
         .await
         .map_err(http_rejection)?;
-    enforce_frozen_compliance(cfg.indexer_url.as_deref(), &req.contract, &req.bundle)
+    enforce_frozen_compliance(cfg.indexer_url.as_deref(), &contract, &req.bundle)
         .await
         .map_err(http_error)?;
     let recipient = parse_evm_address_hex(&req.recipient_evm)
@@ -1491,16 +1603,17 @@ async fn http_wrapped_unshield_submit(
         &cfg.rpc_url,
         cfg.chain_id,
         &cfg.private_key,
-        &req.contract,
+        &contract,
         calldata,
         0,
         cfg.gas_price_gwei,
         cfg.gas_limit_unshield,
+        cfg.gas_limit_margin_bps,
         &cfg.nonce_cache,
     )
     .await
     .map_err(http_error)?;
-    tokio::spawn(notify_pending_tx(cfg.indexer_url.clone(), tx_hash.clone(), req.contract.clone()));
+    tokio::spawn(notify_pending_tx(cfg.indexer_url.clone(), tx_hash.clone(), contract));
     println!("[wrapped/unshield] submitted: tx={tx_hash} amount_units={}", req.amount_units);
     Ok(Json(HttpTxResponse { tx_hash }))
 }
@@ -2021,6 +2134,8 @@ async fn http_swap_initiate(
         {
             return Err(anyhow!("initiate request does not match an accepted LP order"));
         }
+        cfg.ensure_protocol_pool(&req.pool_a)?;
+        cfg.ensure_protocol_pool(&req.pool_b)?;
         let pool_a = parse_evm_address_hex(&req.pool_a).map_err(|e| anyhow!("bad pool_a: {e}"))?;
         let pool_b = parse_evm_address_hex(&req.pool_b).map_err(|e| anyhow!("bad pool_b: {e}"))?;
         let htlc_hash = parse_hex32(&req.htlc_hash_hex).context("htlc_hash_hex")?;
@@ -2042,7 +2157,8 @@ async fn http_swap_initiate(
             calldata,
             0,
             cfg.gas_price_gwei,
-            SWAP_INIT_JOIN_GAS,
+            SWAP_INIT_JOIN_GAS_CAP,
+            cfg.gas_limit_margin_bps,
             &cfg.nonce_cache,
         )
         .await?;
@@ -2122,7 +2238,8 @@ async fn http_swap_join(
             calldata,
             0,
             cfg.gas_price_gwei,
-            SWAP_INIT_JOIN_GAS,
+            SWAP_INIT_JOIN_GAS_CAP,
+            cfg.gas_limit_margin_bps,
             &cfg.nonce_cache,
         )
         .await?;
@@ -2187,11 +2304,13 @@ async fn http_swap_settle(
         .map_err(|e| http_error(anyhow!("secret_hex: {e}")))?;
     // Frozen-compliance preflight on both legs (the on-chain settle would otherwise revert late).
     if let Some(pool) = req.pool_a.as_deref() {
+        cfg.ensure_protocol_pool(pool).map_err(http_error)?;
         enforce_frozen_compliance(cfg.indexer_url.as_deref(), pool, &req.bundle_a)
             .await
             .map_err(http_error)?;
     }
     if let Some(pool) = req.pool_b.as_deref() {
+        cfg.ensure_protocol_pool(pool).map_err(http_error)?;
         enforce_frozen_compliance(cfg.indexer_url.as_deref(), pool, &req.bundle_b)
             .await
             .map_err(http_error)?;
@@ -2208,6 +2327,7 @@ async fn http_swap_settle(
         0,
         cfg.gas_price_gwei,
         cfg.gas_limit_swap,
+        cfg.gas_limit_margin_bps,
         &cfg.nonce_cache,
     )
     .await
@@ -2357,17 +2477,28 @@ async fn send_raw_calldata(
     calldata: Vec<u8>,
     value: u64,
     gas_price_gwei: f64,
-    gas_limit: u64,
+    gas_limit_cap: u64,
+    gas_limit_margin_bps: u64,
     nonce_cache: &Arc<Mutex<Option<u64>>>,
 ) -> Result<String> {
     let signing_key = parse_hex_key(private_key)?;
     let addr = eth_address_from_signing_key(&signing_key);
     let client = EthRpcClient::new(rpc_url.to_string());
-    // Dynamic EIP-1559 (type-2) fees: pay ~baseFee+tip, cap maxFee at baseFee*2+tip.
-    let (max_priority_fee, max_fee) = client.suggest_eip1559_fees(gas_price_gwei).await;
-
     let sender_hex = format!("0x{}", hex::encode(addr));
     let contract = contract.to_string();
+    let estimated = client
+        .estimate_gas(&sender_hex, &contract, &calldata, value)
+        .await?;
+    let gas_limit = gas_limit_with_margin(estimated, gas_limit_margin_bps, gas_limit_cap)?;
+    let selector = calldata
+        .get(..4)
+        .map(hex::encode)
+        .unwrap_or_else(|| "short".to_string());
+    eprintln!(
+        "[relayer] gas policy selector=0x{selector} estimate={estimated} margin_bps={gas_limit_margin_bps} signed_limit={gas_limit} cap={gas_limit_cap}"
+    );
+    // Dynamic EIP-1559 (type-2) fees: pay ~baseFee+tip, cap maxFee at baseFee*2+tip.
+    let (max_priority_fee, max_fee) = client.suggest_eip1559_fees(gas_price_gwei).await;
     send_raw_with_nonce_retry(&client, &sender_hex, nonce_cache, |nonce| {
         build_and_sign_eip1559_tx(
             nonce,
@@ -2587,6 +2718,7 @@ async fn http_unshield_finalize(
         &req.recipient_meta_hex,
         cfg.gas_price_gwei,
         cfg.gas_limit_unshield,
+        cfg.gas_limit_margin_bps,
         &cfg.nonce_cache,
     )
     .await
@@ -2699,6 +2831,7 @@ async fn shield_submit(
         amount_sats,
         gas_price_gwei,
         gas_limit,
+        DEFAULT_GAS_MARGIN_BPS,
         &cli_nonce_cache,
         None,
     )
@@ -2719,15 +2852,14 @@ async fn submit_shield_bundle(
     bundle: &OrchardStoredBundle,
     amount_sats: u64,
     gas_price_gwei: f64,
-    gas_limit: u64,
+    gas_limit_cap: u64,
+    gas_limit_margin_bps: u64,
     nonce_cache: &Arc<Mutex<Option<u64>>>,
     indexer_url: Option<&str>,
 ) -> Result<String> {
     enforce_frozen_compliance(indexer_url, contract, bundle).await?;
 
-    let binding_sig = bundle
-        .binding_sig_bn254
-        .ok_or_else(|| anyhow!("bundle.binding_sig_bn254 is missing"))?;
+    let binding_proof = bundle_binding_proof(bundle)?;
 
     let mut bundle_actions: Vec<BundleActionArgs> = Vec::with_capacity(bundle.actions.len());
     for a in &bundle.actions {
@@ -2755,21 +2887,23 @@ async fn submit_shield_bundle(
         value_balance,
         amount: amount_sats,
         recipient_meta: [0u8; 32],
-        binding_sig,
+        binding_proof: Some(binding_proof),
+        legacy_binding_sig: None,
     })
     .map_err(|e| anyhow!("{e}"))?;
 
-    let signing_key = parse_hex_key(private_key)?;
-    let addr = eth_address_from_signing_key(&signing_key);
-    let client = EthRpcClient::new(rpc_url.to_string());
-    let (max_priority_fee, max_fee) = client.suggest_eip1559_fees(gas_price_gwei).await;
-    let sender_hex = format!("0x{}", hex::encode(addr));
-    let contract = contract.to_string();
-    send_raw_with_nonce_retry(&client, &sender_hex, nonce_cache, |nonce| {
-        build_and_sign_eip1559_tx(
-            nonce, max_priority_fee, max_fee, gas_limit, &contract, 0, &calldata, chain_id, &signing_key,
-        )
-    })
+    send_raw_calldata(
+        rpc_url,
+        chain_id,
+        private_key,
+        contract,
+        calldata,
+        0,
+        gas_price_gwei,
+        gas_limit_cap,
+        gas_limit_margin_bps,
+        nonce_cache,
+    )
     .await
 }
 
@@ -2780,15 +2914,14 @@ async fn submit_transfer_bundle(
     contract: &str,
     bundle: &OrchardStoredBundle,
     gas_price_gwei: f64,
-    gas_limit: u64,
+    gas_limit_cap: u64,
+    gas_limit_margin_bps: u64,
     nonce_cache: &Arc<Mutex<Option<u64>>>,
     indexer_url: Option<&str>,
 ) -> Result<String> {
     enforce_frozen_compliance(indexer_url, contract, bundle).await?;
 
-    let binding_sig = bundle
-        .binding_sig_bn254
-        .ok_or_else(|| anyhow!("bundle.binding_sig_bn254 is missing"))?;
+    let binding_proof = bundle_binding_proof(bundle)?;
 
     // All actions (single or multi) go through bundle().
     let mut bundle_actions: Vec<BundleActionArgs> = Vec::with_capacity(bundle.actions.len());
@@ -2814,28 +2947,30 @@ async fn submit_transfer_bundle(
         value_balance:  [0u8; 32], // pure transfer → valueBalance=0
         amount:         0,
         recipient_meta: [0u8; 32],
-        binding_sig,
+        binding_proof: Some(binding_proof),
+        legacy_binding_sig: None,
     })
     .map_err(|e| anyhow!("{e}"))?;
 
-    let signing_key = parse_hex_key(private_key)?;
-    let addr = eth_address_from_signing_key(&signing_key);
-    let client = EthRpcClient::new(rpc_url.to_string());
-    let (max_priority_fee, max_fee) = client.suggest_eip1559_fees(gas_price_gwei).await;
-    let sender_hex = format!("0x{}", hex::encode(addr));
-    let contract = contract.to_string();
-    send_raw_with_nonce_retry(&client, &sender_hex, nonce_cache, |nonce| {
-        build_and_sign_eip1559_tx(
-            nonce, max_priority_fee, max_fee, gas_limit, &contract, 0, &calldata, chain_id, &signing_key,
-        )
-    })
+    send_raw_calldata(
+        rpc_url,
+        chain_id,
+        private_key,
+        contract,
+        calldata,
+        0,
+        gas_price_gwei,
+        gas_limit_cap,
+        gas_limit_margin_bps,
+        nonce_cache,
+    )
     .await
 }
 
 /// Submit `unshield()` on-chain using a pre-proven `OrchardStoredBundle`.
 ///
-/// The bundle must contain `proof_bn254`, `pub_fields_bn254`, and `binding_sig_bn254`.
-/// This calls the trustless `unshield(nfOld, anchor, proof, pubInputs, amount, recipientMeta, bindingSig)`
+/// The bundle must contain per-action proofs/publics and `binding_proof_bn254`.
+/// This calls the trustless bundle path with the independent Binding proof.
 /// function — no federation trust required on the EVM side.
 struct SubmittedUnshield {
     tx_hash: String,
@@ -2851,17 +2986,15 @@ async fn submit_unshield_bundle(
     amount_sats: u64,
     recipient_meta_hex: &str,
     gas_price_gwei: f64,
-    gas_limit: u64,
+    gas_limit_cap: u64,
+    gas_limit_margin_bps: u64,
     nonce_cache: &Arc<Mutex<Option<u64>>>,
     indexer_url: Option<&str>,
 ) -> Result<SubmittedUnshield> {
     enforce_frozen_compliance(indexer_url, contract, bundle).await?;
 
-    let binding_sig = bundle
-        .binding_sig_bn254
-        .ok_or_else(|| anyhow!(
-            "bundle.binding_sig_bn254 is missing — generate binding signature via prover /prove endpoint before submitting"
-        ))?;
+    let binding_proof = bundle_binding_proof(bundle)
+        .map_err(|_| anyhow!("bundle.binding_proof_bn254 is missing — generate it via the prover before submitting"))?;
 
     let recipient_meta = parse_fixed_hex_32(recipient_meta_hex)
         .with_context(|| format!("invalid recipient_meta_hex: {recipient_meta_hex}"))?;
@@ -2893,22 +3026,24 @@ async fn submit_unshield_bundle(
         value_balance,
         amount: amount_sats,
         recipient_meta,
-        binding_sig,
+        binding_proof: Some(binding_proof),
+        legacy_binding_sig: None,
     })
     .map_err(|e| anyhow!("{e}"))?;
 
-    let signing_key = parse_hex_key(private_key)?;
-    let addr = eth_address_from_signing_key(&signing_key);
-    let client = EthRpcClient::new(rpc_url.to_string());
-    let (max_priority_fee, max_fee) = client.suggest_eip1559_fees(gas_price_gwei).await;
-    let sender_hex = format!("0x{}", hex::encode(addr));
-    let contract = contract.to_string();
     let calldata_hash: [u8; 32] = Keccak256::digest(&calldata).into();
-    let tx_hash = send_raw_with_nonce_retry(&client, &sender_hex, nonce_cache, |nonce| {
-        build_and_sign_eip1559_tx(
-            nonce, max_priority_fee, max_fee, gas_limit, &contract, 0, &calldata, chain_id, &signing_key,
-        )
-    })
+    let tx_hash = send_raw_calldata(
+        rpc_url,
+        chain_id,
+        private_key,
+        contract,
+        calldata,
+        0,
+        gas_price_gwei,
+        gas_limit_cap,
+        gas_limit_margin_bps,
+        nonce_cache,
+    )
     .await?;
     Ok(SubmittedUnshield { tx_hash, calldata_hash })
 }
@@ -2922,7 +3057,8 @@ async fn unshield_finalize_submit(
     amount_sats: u64,
     recipient_meta_hex: &str,
     gas_price_gwei: f64,
-    gas_limit: u64,
+    gas_limit_cap: u64,
+    gas_limit_margin_bps: u64,
     nonce_cache: &Arc<Mutex<Option<u64>>>,
 ) -> Result<String> {
     let nf = parse_fixed_hex_32(nf_hex)?;
@@ -2933,17 +3069,18 @@ async fn unshield_finalize_submit(
         recipient_meta,
     });
 
-    let signing_key = parse_hex_key(private_key)?;
-    let addr = eth_address_from_signing_key(&signing_key);
-    let client = EthRpcClient::new(rpc_url.to_string());
-    let (max_priority_fee, max_fee) = client.suggest_eip1559_fees(gas_price_gwei).await;
-    let sender_hex = format!("0x{}", hex::encode(addr));
-    let contract = contract.to_string();
-    send_raw_with_nonce_retry(&client, &sender_hex, nonce_cache, |nonce| {
-        build_and_sign_eip1559_tx(
-            nonce, max_priority_fee, max_fee, gas_limit, &contract, 0, &calldata, chain_id, &signing_key,
-        )
-    })
+    send_raw_calldata(
+        rpc_url,
+        chain_id,
+        private_key,
+        contract,
+        calldata,
+        0,
+        gas_price_gwei,
+        gas_limit_cap,
+        gas_limit_margin_bps,
+        nonce_cache,
+    )
     .await
 }
 
@@ -3365,6 +3502,44 @@ impl EthRpcClient {
         Self { http, urls }
     }
 
+    async fn eth_call(&self, to: &str, data: &str) -> Result<String> {
+        self.rpc_call(
+            "eth_call",
+            serde_json::json!([{"to": to, "data": data}, "latest"]),
+        )
+        .await
+    }
+
+    async fn verify_protocol_version(&self, contract: &str, expected: u64) -> Result<()> {
+        let raw = self.eth_call(contract, "0x2ae9c600").await?;
+        let actual = parse_abi_u64(&raw).context("decode protocolVersion()")?;
+        if actual != expected {
+            return Err(anyhow!(
+                "protocolVersion mismatch: expected {expected}, got {actual}"
+            ));
+        }
+        Ok(())
+    }
+
+    async fn verify_pool_protocol(
+        &self,
+        pool: &str,
+        expected_version: u64,
+        expected_verifier_set_id: &[u8; 32],
+    ) -> Result<()> {
+        self.verify_protocol_version(pool, expected_version).await?;
+        let raw = self.eth_call(pool, "0x64182ad9").await?;
+        let actual = parse_fixed_hex_32(&raw).context("decode verifierSetId()")?;
+        if &actual != expected_verifier_set_id {
+            return Err(anyhow!(
+                "verifierSetId mismatch: expected 0x{}, got 0x{}",
+                hex::encode(expected_verifier_set_id),
+                hex::encode(actual)
+            ));
+        }
+        Ok(())
+    }
+
     async fn block_number(&self) -> Result<u64> {
         let hex_num: String = self
             .rpc_call("eth_blockNumber", serde_json::json!([]))
@@ -3380,6 +3555,28 @@ impl EthRpcClient {
             )
             .await?;
         parse_hex_u64(&hex_num)
+    }
+
+    async fn estimate_gas(
+        &self,
+        from: &str,
+        to: &str,
+        calldata: &[u8],
+        value: u64,
+    ) -> Result<u64> {
+        let estimate: String = self
+            .rpc_call(
+                "eth_estimateGas",
+                serde_json::json!([{
+                    "from": from,
+                    "to": to,
+                    "data": format!("0x{}", hex::encode(calldata)),
+                    "value": format!("0x{value:x}")
+                }, "pending"]),
+            )
+            .await
+            .context("eth_estimateGas failed; refusing fixed-limit fallback")?;
+        parse_hex_u64(&estimate).context("decode eth_estimateGas result")
     }
 
     async fn send_raw_transaction(&self, raw_tx: &[u8]) -> Result<String> {
@@ -3523,6 +3720,16 @@ impl EthRpcClient {
 fn parse_hex_u64(hex: &str) -> Result<u64> {
     let s = strip_0x(hex);
     u64::from_str_radix(s, 16).context("hex u64")
+}
+
+fn parse_abi_u64(value: &str) -> Result<u64> {
+    let word = parse_fixed_hex_32(value).context("expected exact 32-byte ABI word")?;
+    if word[..24].iter().any(|byte| *byte != 0) {
+        return Err(anyhow!("ABI uint256 exceeds u64"));
+    }
+    Ok(u64::from_be_bytes(
+        word[24..].try_into().expect("eight-byte suffix"),
+    ))
 }
 
 // ─── EIP-155 legacy RLP (same shape as privacybtc-indexer) ─────────────────
@@ -3809,14 +4016,15 @@ mod tests {
         Arc::new(RelayerHttpConfig {
             rpc_url: "http://127.0.0.1:0".into(),
             chain_id: 1,
-            private_key: "00".repeat(32),
-            contract: "0x".into(),
+            private_key: format!("{:064x}", 1u8),
+            contract: "0x1111111111111111111111111111111111111111".into(),
             gas_price_gwei: 1.0,
-            gas_limit_shield: 0,
-            gas_limit_unshield: 0,
-            gas_limit_transfer: 0,
+            gas_limit_shield: 6_000_000,
+            gas_limit_unshield: 6_000_000,
+            gas_limit_transfer: 5_000_000,
+            gas_limit_margin_bps: DEFAULT_GAS_MARGIN_BPS,
             swap_coordinator: Some("0xc".into()),
-            gas_limit_swap: 0,
+            gas_limit_swap: 12_000_000,
             auto_shield: None,
             auto_transfer: None,
             btc_payout_wif: None,
@@ -3829,7 +4037,41 @@ mod tests {
             swap_book_path: None,
             submit_raw_allowlist: SubmitRawAllowlist::default(),
             lp_offer_token: Some("test-lp-token".into()),
+            protocol_pools: [
+                "0x1111111111111111111111111111111111111111".to_string(),
+                "0x2222222222222222222222222222222222222222".to_string(),
+            ]
+            .into_iter()
+            .collect(),
+            expected_protocol_version: 3,
+            expected_verifier_set_id: [0xabu8; 32],
         })
+    }
+
+    #[test]
+    fn dynamic_gas_policy_rounds_up_and_enforces_cap() {
+        assert_eq!(
+            gas_limit_with_margin(4_000_000, DEFAULT_GAS_MARGIN_BPS, 5_000_000).unwrap(),
+            4_080_000
+        );
+        assert_eq!(gas_limit_with_margin(1, 1, 2).unwrap(), 2);
+        assert!(gas_limit_with_margin(4_000_000, DEFAULT_GAS_MARGIN_BPS, 4_079_999).is_err());
+        assert!(gas_limit_with_margin(0, DEFAULT_GAS_MARGIN_BPS, 5_000_000).is_err());
+        assert!(gas_limit_with_margin(1, MAX_GAS_MARGIN_BPS + 1, 2).is_err());
+    }
+
+    #[test]
+    fn dynamic_gas_config_rejects_zero_caps_and_excessive_margin() {
+        assert!(validate_gas_policy_config(
+            DEFAULT_GAS_MARGIN_BPS,
+            &[("shield", 6_000_000), ("transfer", 5_000_000)]
+        )
+        .is_ok());
+        assert!(validate_gas_policy_config(DEFAULT_GAS_MARGIN_BPS, &[("transfer", 0)]).is_err());
+        assert!(
+            validate_gas_policy_config(MAX_GAS_MARGIN_BPS + 1, &[("transfer", 5_000_000)])
+                .is_err()
+        );
     }
 
     async fn call_with_token(
@@ -3857,6 +4099,152 @@ mod tests {
 
     async fn call(app: &Router, method: &str, uri: &str, body: Option<Value>) -> (Sc, Value) {
         call_with_token(app, method, uri, body, Some("test-lp-token")).await
+    }
+
+    #[derive(Clone)]
+    struct MockEthRpcState {
+        calls: Arc<Mutex<Vec<Value>>>,
+        estimate_hex: String,
+    }
+
+    async fn mock_eth_rpc(
+        State(state): State<MockEthRpcState>,
+        Json(request): Json<Value>,
+    ) -> Json<Value> {
+        state.calls.lock().await.push(request.clone());
+        let result = match request["method"].as_str().unwrap_or_default() {
+            "eth_estimateGas" => Value::String(state.estimate_hex),
+            "eth_getBlockByNumber" => serde_json::json!({ "baseFeePerGas": "0x3b9aca00" }),
+            "eth_getTransactionCount" => Value::String("0x0".into()),
+            "eth_sendRawTransaction" => {
+                Value::String(format!("0x{}", "ab".repeat(32)))
+            }
+            method => panic!("unexpected mock RPC method: {method}"),
+        };
+        Json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request["id"].clone(),
+            "result": result
+        }))
+    }
+
+    async fn start_mock_eth_rpc(
+        estimate_hex: &str,
+    ) -> (String, Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let state = MockEthRpcState {
+            calls: calls.clone(),
+            estimate_hex: estimate_hex.to_string(),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/", post(mock_eth_rpc)).with_state(state),
+            )
+            .await
+            .unwrap();
+        });
+        (format!("http://{address}"), calls, server)
+    }
+
+    fn submit_raw_test_state(rpc_url: String, transfer_cap: u64) -> Arc<RelayerHttpConfig> {
+        let target = "0x1111111111111111111111111111111111111111";
+        let mut cfg = (*test_state()).clone();
+        cfg.rpc_url = rpc_url;
+        cfg.chain_id = 143;
+        cfg.gas_limit_transfer = transfer_cap;
+        cfg.submit_raw_allowlist =
+            SubmitRawAllowlist::new(&[target], &[[0x12, 0x34, 0x56, 0x78]]).unwrap();
+        Arc::new(cfg)
+    }
+
+    #[tokio::test]
+    async fn submit_raw_ignores_legacy_limit_estimates_exact_tx_and_signs_padded_limit() {
+        let (rpc_url, calls, server) = start_mock_eth_rpc("0x3d0900").await; // 4,000,000
+        let app = build_router(submit_raw_test_state(rpc_url, 5_000_000));
+        let target = "0x1111111111111111111111111111111111111111";
+
+        let (status, body) = call_with_token(
+            &app,
+            "POST",
+            "/submit_raw",
+            Some(serde_json::json!({
+                "chain_id": 143,
+                "to": target,
+                "data": "0x12345678aa",
+                "gas_limit": 20_000_000
+            })),
+            None,
+        )
+        .await;
+        assert_eq!(status, Sc::OK, "{body}");
+        assert_eq!(body["tx_hash"], format!("0x{}", "ab".repeat(32)));
+
+        let calls = calls.lock().await.clone();
+        let methods: Vec<&str> = calls
+            .iter()
+            .map(|call| call["method"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            methods,
+            vec![
+                "eth_estimateGas",
+                "eth_getBlockByNumber",
+                "eth_getTransactionCount",
+                "eth_sendRawTransaction"
+            ]
+        );
+
+        let estimate = &calls[0]["params"];
+        assert_eq!(estimate[0]["to"], target);
+        assert_eq!(estimate[0]["data"], "0x12345678aa");
+        assert_eq!(estimate[0]["value"], "0x0");
+        assert_eq!(estimate[1], "pending");
+        assert!(estimate[0]["from"].as_str().unwrap().starts_with("0x"));
+
+        let raw_hex = calls[3]["params"][0].as_str().unwrap();
+        let raw = hex::decode(strip_0x(raw_hex)).unwrap();
+        assert_eq!(raw[0], 0x02, "must sign an EIP-1559 transaction");
+        // RLP integer 4,080,000 (0x3e4180) is encoded as 0x83 || 3e4180.
+        assert!(
+            raw.windows(4).any(|window| window == [0x83, 0x3e, 0x41, 0x80]),
+            "signed transaction must carry estimate + 2% as its gas limit"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn submit_raw_rejects_estimate_above_cap_without_broadcast() {
+        let (rpc_url, calls, server) = start_mock_eth_rpc("0x3d0900").await; // 4,000,000
+        let app = build_router(submit_raw_test_state(rpc_url, 4_000_000));
+        let target = "0x1111111111111111111111111111111111111111";
+
+        let (status, body) = call_with_token(
+            &app,
+            "POST",
+            "/submit_raw",
+            Some(serde_json::json!({
+                "chain_id": 143,
+                "to": target,
+                "data": "0x12345678aa"
+            })),
+            None,
+        )
+        .await;
+        assert_eq!(status, Sc::BAD_REQUEST);
+        assert!(body["error"].as_str().unwrap().contains("above configured cap"));
+        let methods: Vec<String> = calls
+            .lock()
+            .await
+            .iter()
+            .map(|call| call["method"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(methods, vec!["eth_estimateGas"]);
+        server.abort();
     }
 
     #[tokio::test]
@@ -3980,6 +4368,29 @@ mod tests {
             .is_err());
     }
 
+    #[test]
+    fn protocol_pool_parser_is_exact_and_deduplicated() {
+        let pools = parse_protocol_pools(
+            "0x1111111111111111111111111111111111111111,\
+             0x1111111111111111111111111111111111111111,\
+             0x2222222222222222222222222222222222222222",
+        )
+        .unwrap();
+        assert_eq!(pools.len(), 2);
+        assert!(parse_protocol_pools("").is_err());
+        assert!(parse_protocol_pools("0x1234").is_err());
+    }
+
+    #[test]
+    fn protocol_gate_abi_uint_parser_rejects_noncanonical_words() {
+        assert_eq!(
+            parse_abi_u64(&format!("0x{}03", "00".repeat(31))).unwrap(),
+            3
+        );
+        assert!(parse_abi_u64("0x03").is_err());
+        assert!(parse_abi_u64(&format!("0x01{}", "00".repeat(31))).is_err());
+    }
+
     // ── Settle receipt verification ─────────────────────────────────────────
     //
     // Regression for the "relayer marks settle done before the tx is mined" bug: the order
@@ -4041,7 +4452,8 @@ mod tests {
             binding_sig_orchard: vec![],
             proof_bn254: None,
             pub_fields_bn254: None,
-            binding_sig_bn254: Some([[8u8; 32]; 3]),
+            binding_proof_bn254: Some([[8u8; 32]; 8]),
+            binding_sig_bn254: None,
             value_balance_bn254: 0,
         }
     }
