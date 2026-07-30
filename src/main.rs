@@ -698,51 +698,50 @@ async fn notify_pending_tx(indexer_url: Option<String>, tx_hash: String, contrac
     }
 }
 
-#[derive(Deserialize)]
-struct FrozenRootResp {
-    /// `rt_frozen` as 0x-prefixed little-endian 32-byte hex (indexer convention).
-    root_hex: String,
-}
-
-/// `GET {indexer}/frozen_root?pool={contract}` → `rt_frozen` as **big-endian** 32 bytes.
+/// `eth_call cmxFrozenRoot()` on the pool → `rt_frozen` as **big-endian** 32 bytes.
 ///
-/// The indexer publishes the root little-endian (its on-the-wire convention, matching
-/// `/merkle_path` siblings); `pubFields` are big-endian `uint256` words, so we flip it
-/// here to compare in the same order.
-async fn fetch_frozen_root_be(indexer_base: &str, contract: &str) -> Result<[u8; 32]> {
-    let url = format!("{}/frozen_root?pool={}", indexer_base.trim_end_matches('/'), contract);
+/// frozen-tree-execution-plan PR2: the authoritative compliance root is the pool's on-chain
+/// `cmxFrozenRoot()` (selector `0x461d2056`), NOT the indexer. Its return is a `uint256` word
+/// (already big-endian, matching `pubFields[7]`), so no reversal is needed.
+async fn fetch_frozen_root_be(rpc_url: &str, contract: &str) -> Result<[u8; 32]> {
     let client = reqwest::Client::builder().no_proxy().build().unwrap_or_default();
-    let resp: FrozenRootResp = client
-        .get(&url)
+    let req = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1u64,
+        "method": "eth_call",
+        "params": [{"to": contract, "data": "0x461d2056"}, "latest"],
+    });
+    let resp: serde_json::Value = client
+        .post(rpc_url)
+        .json(&req)
         .send()
         .await?
         .error_for_status()?
         .json()
         .await?;
-    let mut bytes = parse_hex32(&resp.root_hex)?; // little-endian
-    bytes.reverse(); // → big-endian, matching pubFields[7]
-    Ok(bytes)
+    let raw = resp
+        .get("result")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("eth_call cmxFrozenRoot() returned no result: {resp}"))?;
+    parse_hex32(raw) // big-endian uint256 word == pubFields[7]
 }
 
-/// Pre-broadcast compliance gate. Every action's `pubFields[7]` (rt_frozen) must equal
-/// the indexer's current `/frozen_root`; otherwise the proof was built against a stale
-/// blacklist and the on-chain `_verifyAction` would revert with `BadFrozenRoot`. Catching
-/// it here turns a wasted, reverting broadcast into a clear, actionable error.
+/// Pre-broadcast compliance gate. Every action's `pubFields[7]` (rt_frozen) must equal the
+/// pool's on-chain `cmxFrozenRoot()`; otherwise the proof was built against a stale blacklist
+/// and the on-chain `_verifyAction` would revert with `BadFrozenRoot`. Catching it here turns a
+/// wasted, reverting broadcast into a clear, actionable error.
 ///
-/// Best-effort on availability: if no `indexer_url` is configured, or the indexer is
-/// unreachable, this logs and proceeds (the on-chain check stays the ultimate gate). A
-/// *reachable* indexer reporting a mismatch is a hard error.
+/// Best-effort on availability: if the RPC is unreachable, this logs and proceeds (the on-chain
+/// check stays the ultimate gate). A *reachable* RPC reporting a mismatch is a hard error.
 async fn enforce_frozen_compliance(
-    indexer_url: Option<&str>,
+    rpc_url: &str,
     contract: &str,
     bundle: &OrchardStoredBundle,
 ) -> Result<()> {
-    let Some(base) = indexer_url else { return Ok(()) };
-    let expected_be = match fetch_frozen_root_be(base, contract).await {
+    let expected_be = match fetch_frozen_root_be(rpc_url, contract).await {
         Ok(r) => r,
         Err(e) => {
             eprintln!(
-                "[relayer] frozen-root preflight skipped (indexer unreachable: {e:#}); \
+                "[relayer] frozen-root preflight skipped (RPC unreachable: {e:#}); \
                  relying on the on-chain BadFrozenRoot guard"
             );
             return Ok(());
@@ -758,9 +757,10 @@ async fn enforce_frozen_compliance(
             .ok_or_else(|| anyhow!("action {i} pub_fields_bn254 has fewer than 8 entries"))?;
         if got.as_slice() != expected_be {
             return Err(anyhow!(
-                "action {i} pubFields[7] (rt_frozen) does not match the indexer's /frozen_root: \
-                 the proof was built against a stale compliance root. Re-prove against the current \
-                 frozen set (GET /frozen_witness). expected 0x{} got 0x{}",
+                "action {i} pubFields[7] (rt_frozen) does not match the pool's on-chain \
+                 cmxFrozenRoot(): the proof was built against a stale compliance root. Re-prove \
+                 against the current frozen set (pull GET {{indexer}}/frozen_updates and replay). \
+                 expected 0x{} got 0x{}",
                 hex::encode(expected_be),
                 hex::encode(got)
             ));
@@ -1555,7 +1555,7 @@ async fn http_wrapped_shield_calldata(
         .screen_required(req.depositor_evm.as_deref(), "shield_depositor")
         .await
         .map_err(http_rejection)?;
-    enforce_frozen_compliance(cfg.indexer_url.as_deref(), &contract, &req.bundle)
+    enforce_frozen_compliance(&cfg.rpc_url, &contract, &req.bundle)
         .await
         .map_err(http_error)?;
     let call = bundle_to_privacy_call(&req.bundle).map_err(http_error)?;
@@ -1592,7 +1592,7 @@ async fn http_wrapped_unshield_submit(
         .screen_required(Some(&req.recipient_evm), "unshield_recipient")
         .await
         .map_err(http_rejection)?;
-    enforce_frozen_compliance(cfg.indexer_url.as_deref(), &contract, &req.bundle)
+    enforce_frozen_compliance(&cfg.rpc_url, &contract, &req.bundle)
         .await
         .map_err(http_error)?;
     let recipient = parse_evm_address_hex(&req.recipient_evm)
@@ -2312,13 +2312,13 @@ async fn http_swap_settle(
     // Frozen-compliance preflight on both legs (the on-chain settle would otherwise revert late).
     if let Some(pool) = req.pool_a.as_deref() {
         cfg.ensure_protocol_pool(pool).map_err(http_error)?;
-        enforce_frozen_compliance(cfg.indexer_url.as_deref(), pool, &req.bundle_a)
+        enforce_frozen_compliance(&cfg.rpc_url, pool, &req.bundle_a)
             .await
             .map_err(http_error)?;
     }
     if let Some(pool) = req.pool_b.as_deref() {
         cfg.ensure_protocol_pool(pool).map_err(http_error)?;
-        enforce_frozen_compliance(cfg.indexer_url.as_deref(), pool, &req.bundle_b)
+        enforce_frozen_compliance(&cfg.rpc_url, pool, &req.bundle_b)
             .await
             .map_err(http_error)?;
     }
@@ -2862,9 +2862,9 @@ async fn submit_shield_bundle(
     gas_limit_cap: u64,
     gas_limit_margin_bps: u64,
     nonce_cache: &Arc<Mutex<Option<u64>>>,
-    indexer_url: Option<&str>,
+    _indexer_url: Option<&str>,
 ) -> Result<String> {
-    enforce_frozen_compliance(indexer_url, contract, bundle).await?;
+    enforce_frozen_compliance(rpc_url, contract, bundle).await?;
 
     let binding_proof = bundle_binding_proof(bundle)?;
 
@@ -2924,9 +2924,9 @@ async fn submit_transfer_bundle(
     gas_limit_cap: u64,
     gas_limit_margin_bps: u64,
     nonce_cache: &Arc<Mutex<Option<u64>>>,
-    indexer_url: Option<&str>,
+    _indexer_url: Option<&str>,
 ) -> Result<String> {
-    enforce_frozen_compliance(indexer_url, contract, bundle).await?;
+    enforce_frozen_compliance(rpc_url, contract, bundle).await?;
 
     let binding_proof = bundle_binding_proof(bundle)?;
 
@@ -2996,9 +2996,9 @@ async fn submit_unshield_bundle(
     gas_limit_cap: u64,
     gas_limit_margin_bps: u64,
     nonce_cache: &Arc<Mutex<Option<u64>>>,
-    indexer_url: Option<&str>,
+    _indexer_url: Option<&str>,
 ) -> Result<SubmittedUnshield> {
-    enforce_frozen_compliance(indexer_url, contract, bundle).await?;
+    enforce_frozen_compliance(rpc_url, contract, bundle).await?;
 
     let binding_proof = bundle_binding_proof(bundle)
         .map_err(|_| anyhow!("bundle.binding_proof_bn254 is missing — generate it via the prover before submitting"))?;
