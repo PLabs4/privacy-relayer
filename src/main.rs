@@ -7,7 +7,13 @@
 mod screening;
 
 use anyhow::{anyhow, Context, Result};
-use axum::{extract::{Query, State}, http::{HeaderMap, StatusCode}, routing::get, routing::post, Json, Router};
+use axum::{
+    extract::{ConnectInfo, Query, State},
+    http::{HeaderMap, StatusCode},
+    routing::get,
+    routing::post,
+    Json, Router,
+};
 use clap::{Parser, Subcommand};
 use k256::ecdsa::{RecoveryId, SigningKey};
 use privacy_core::intent::{build_shield_intent_v1, bundle_content_sha256, BtcDepositConfigV1, ShieldIntentV1};
@@ -27,11 +33,12 @@ use serde::Deserialize;
 use serde_json::Value;
 use sha2::Sha256;
 use sha3::{Digest, Keccak256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
 use url::Url;
@@ -426,8 +433,16 @@ struct RelayerHttpConfig {
     swap_book: Arc<Mutex<SwapBook>>,
     /// Optional JSON snapshot path for the swap order book.
     swap_book_path: Option<PathBuf>,
-    /// Production guard for /submit_raw. Calls are limited to these target addresses and selectors.
+    /// Production guard for /submit_raw. Every allowed (target, selector) pair
+    /// carries its own value and gas ceilings; an empty policy disables the route.
     submit_raw_allowlist: SubmitRawAllowlist,
+    /// Conservative rolling abuse budget for `/submit_raw`. A request reserves
+    /// its policy's maximum gas before any RPC work, so failed estimates and
+    /// broadcasts cannot be used to bypass the request/gas limits.
+    submit_raw_limiter: Arc<Mutex<SubmitRawLimiter>>,
+    /// Only peers in this exact IP allowlist may supply the proxy-derived client
+    /// identity. An empty set means proxy headers are ignored.
+    submit_raw_trusted_proxy_ips: HashSet<IpAddr>,
     /// Shared secret required to create or refresh LP offers. User accepts remain public.
     lp_offer_token: Option<String>,
     /// Every v3 pool this process may target. All entries are checked on-chain at startup.
@@ -506,71 +521,331 @@ fn parse_protocol_pools(raw: &str) -> Result<HashSet<String>> {
     Ok(pools)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SubmitRawPolicy {
+    max_value: u64,
+    max_gas: u64,
+}
+
 #[derive(Clone, Default)]
 struct SubmitRawAllowlist {
-    targets: HashSet<String>,
-    selectors: HashSet<[u8; 4]>,
+    policies: HashMap<(String, [u8; 4]), SubmitRawPolicy>,
 }
 
 impl SubmitRawAllowlist {
-    fn from_env() -> Result<Self> {
-        let targets = parse_allowed_targets(
-            std::env::var("PRIVACYBTC_SUBMIT_RAW_ALLOWED_TARGETS").unwrap_or_default().as_str(),
-        )?;
-        let selectors = parse_allowed_selectors(
-            std::env::var("PRIVACYBTC_SUBMIT_RAW_ALLOWED_SELECTORS").unwrap_or_default().as_str(),
-        )?;
-        Ok(Self { targets, selectors })
+    fn from_env(global_gas_cap: u64) -> Result<Self> {
+        let legacy_targets =
+            std::env::var("PRIVACYBTC_SUBMIT_RAW_ALLOWED_TARGETS").unwrap_or_default();
+        let legacy_selectors =
+            std::env::var("PRIVACYBTC_SUBMIT_RAW_ALLOWED_SELECTORS").unwrap_or_default();
+        let raw = std::env::var("PRIVACYBTC_SUBMIT_RAW_POLICIES").unwrap_or_default();
+        Self::from_config(
+            &legacy_targets,
+            &legacy_selectors,
+            &raw,
+            global_gas_cap,
+        )
+    }
+
+    fn from_config(
+        legacy_targets: &str,
+        legacy_selectors: &str,
+        raw: &str,
+        global_gas_cap: u64,
+    ) -> Result<Self> {
+        if !legacy_targets.trim().is_empty() || !legacy_selectors.trim().is_empty() {
+            return Err(anyhow!(
+                "legacy independent submit_raw allowlists are rejected because they create a target/selector cross-product; \
+                 migrate to PRIVACYBTC_SUBMIT_RAW_POLICIES"
+            ));
+        }
+        Self::parse(raw, global_gas_cap)
     }
 
     #[cfg(test)]
-    fn new(targets: &[&str], selectors: &[[u8; 4]]) -> Result<Self> {
-        Ok(Self {
-            targets: parse_allowed_targets(&targets.join(","))?,
-            selectors: selectors.iter().copied().collect(),
-        })
+    fn new(entries: &[(&str, [u8; 4], u64, u64)], global_gas_cap: u64) -> Result<Self> {
+        let raw = entries
+            .iter()
+            .map(|(target, selector, max_value, max_gas)| {
+                format!(
+                    "{target}@0x{}@{max_value}@{max_gas}",
+                    hex::encode(selector)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(";");
+        Self::parse(&raw, global_gas_cap)
     }
 
-    fn validate(&self, to: &str, calldata: &[u8]) -> Result<()> {
-        if self.targets.is_empty() || self.selectors.is_empty() {
+    /// Parse `target@selector@max_value_wei@max_gas` entries separated by `;`.
+    ///
+    /// `max_value` is deliberately retained in the policy schema so the
+    /// authorization decision is complete and auditable. This binary currently
+    /// requires it to be zero as an additional route-wide invariant.
+    fn parse(raw: &str, global_gas_cap: u64) -> Result<Self> {
+        let mut policies = HashMap::new();
+        for entry in raw.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+            let fields: Vec<&str> = entry.split('@').map(str::trim).collect();
+            if fields.len() != 4 {
+                return Err(anyhow!(
+                    "bad submit_raw policy {entry:?}; expected target@selector@max_value_wei@max_gas"
+                ));
+            }
+            let target = normalize_evm_address(fields[0])?;
+            let selector = parse_selector(fields[1])?;
+            let max_value = fields[2]
+                .parse::<u64>()
+                .with_context(|| format!("bad max_value in submit_raw policy {entry:?}"))?;
+            let max_gas = fields[3]
+                .parse::<u64>()
+                .with_context(|| format!("bad max_gas in submit_raw policy {entry:?}"))?;
+            if max_value != 0 {
+                return Err(anyhow!(
+                    "submit_raw policy {entry:?} has max_value={max_value}; only zero-value calls are supported"
+                ));
+            }
+            if max_gas == 0 || max_gas > global_gas_cap {
+                return Err(anyhow!(
+                    "submit_raw policy {entry:?} max_gas must be in 1..={global_gas_cap}"
+                ));
+            }
+            if policies
+                .insert(
+                    (target.clone(), selector),
+                    SubmitRawPolicy {
+                        max_value,
+                        max_gas,
+                    },
+                )
+                .is_some()
+            {
+                return Err(anyhow!(
+                    "duplicate submit_raw policy for {target}@0x{}",
+                    hex::encode(selector)
+                ));
+            }
+        }
+        Ok(Self { policies })
+    }
+
+    fn validate(&self, to: &str, calldata: &[u8], value: u64) -> Result<SubmitRawPolicy> {
+        if self.policies.is_empty() {
             return Err(anyhow!(
-                "submit_raw disabled: configure PRIVACYBTC_SUBMIT_RAW_ALLOWED_TARGETS and PRIVACYBTC_SUBMIT_RAW_ALLOWED_SELECTORS"
+                "submit_raw disabled: configure PRIVACYBTC_SUBMIT_RAW_POLICIES"
             ));
         }
         let target = normalize_evm_address(to)?;
-        if !self.targets.contains(&target) {
-            return Err(anyhow!("submit_raw target {target} is not allow-listed"));
-        }
         let selector: [u8; 4] = calldata
             .get(0..4)
             .ok_or_else(|| anyhow!("submit_raw calldata must include a 4-byte selector"))?
             .try_into()
             .expect("slice length checked");
-        if !self.selectors.contains(&selector) {
+        let policy = self
+            .policies
+            .get(&(target.clone(), selector))
+            .copied()
+            .ok_or_else(|| {
+                anyhow!(
+                    "submit_raw pair {target}@0x{} is not allow-listed",
+                    hex::encode(selector)
+                )
+            })?;
+        if value > policy.max_value {
             return Err(anyhow!(
-                "submit_raw selector 0x{} is not allow-listed",
-                hex::encode(selector)
+                "submit_raw value {value} exceeds pair policy max_value {}",
+                policy.max_value
             ));
         }
-        Ok(())
+        Ok(policy)
     }
 }
 
-fn parse_allowed_targets(raw: &str) -> Result<HashSet<String>> {
-    raw.split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(normalize_evm_address)
-        .collect()
+fn parse_selector(raw: &str) -> Result<[u8; 4]> {
+    let bytes = hex::decode(strip_0x(raw)).with_context(|| format!("bad selector {raw}"))?;
+    bytes
+        .try_into()
+        .map_err(|_| anyhow!("selector {raw} must be exactly 4 bytes"))
 }
 
-fn parse_allowed_selectors(raw: &str) -> Result<HashSet<[u8; 4]>> {
+#[derive(Clone, Debug)]
+struct SubmitRawLimitConfig {
+    window_secs: u64,
+    global_max_requests: u64,
+    client_max_requests: u64,
+    global_max_gas: u64,
+    client_max_gas: u64,
+}
+
+impl SubmitRawLimitConfig {
+    fn from_env() -> Result<Self> {
+        fn positive_env(name: &str, default: u64) -> Result<u64> {
+            let value = std::env::var(name)
+                .ok()
+                .filter(|raw| !raw.trim().is_empty())
+                .map(|raw| {
+                    raw.parse::<u64>()
+                        .with_context(|| format!("{name} must be a positive u64"))
+                })
+                .transpose()?
+                .unwrap_or(default);
+            if value == 0 {
+                return Err(anyhow!("{name} must be > 0"));
+            }
+            Ok(value)
+        }
+
+        let cfg = Self {
+            window_secs: positive_env("PRIVACYBTC_SUBMIT_RAW_WINDOW_SECS", 3_600)?,
+            global_max_requests: positive_env(
+                "PRIVACYBTC_SUBMIT_RAW_GLOBAL_REQUESTS_PER_WINDOW",
+                60,
+            )?,
+            client_max_requests: positive_env(
+                "PRIVACYBTC_SUBMIT_RAW_CLIENT_REQUESTS_PER_WINDOW",
+                6,
+            )?,
+            global_max_gas: positive_env(
+                "PRIVACYBTC_SUBMIT_RAW_GLOBAL_GAS_PER_WINDOW",
+                100_000_000,
+            )?,
+            client_max_gas: positive_env(
+                "PRIVACYBTC_SUBMIT_RAW_CLIENT_GAS_PER_WINDOW",
+                10_000_000,
+            )?,
+        };
+        if cfg.client_max_requests > cfg.global_max_requests {
+            return Err(anyhow!(
+                "PRIVACYBTC_SUBMIT_RAW_CLIENT_REQUESTS_PER_WINDOW cannot exceed global limit"
+            ));
+        }
+        if cfg.client_max_gas > cfg.global_max_gas {
+            return Err(anyhow!(
+                "PRIVACYBTC_SUBMIT_RAW_CLIENT_GAS_PER_WINDOW cannot exceed global limit"
+            ));
+        }
+        Ok(cfg)
+    }
+}
+
+#[derive(Default)]
+struct SubmitRawUsage {
+    entries: VecDeque<(u64, u64)>,
+    gas: u64,
+}
+
+impl SubmitRawUsage {
+    fn prune(&mut self, now: u64, window_secs: u64) {
+        let cutoff = now.saturating_sub(window_secs);
+        while self
+            .entries
+            .front()
+            .is_some_and(|(timestamp, _)| *timestamp <= cutoff)
+        {
+            if let Some((_, gas)) = self.entries.pop_front() {
+                self.gas = self.gas.saturating_sub(gas);
+            }
+        }
+    }
+}
+
+struct SubmitRawLimiter {
+    cfg: SubmitRawLimitConfig,
+    global: SubmitRawUsage,
+    clients: HashMap<String, SubmitRawUsage>,
+}
+
+impl SubmitRawLimiter {
+    fn new(cfg: SubmitRawLimitConfig) -> Self {
+        Self {
+            cfg,
+            global: SubmitRawUsage::default(),
+            clients: HashMap::new(),
+        }
+    }
+
+    fn reserve_at(&mut self, client_id: &str, reserved_gas: u64, now: u64) -> Result<()> {
+        self.global.prune(now, self.cfg.window_secs);
+        for usage in self.clients.values_mut() {
+            usage.prune(now, self.cfg.window_secs);
+        }
+        self.clients.retain(|_, usage| !usage.entries.is_empty());
+        let client = self.clients.entry(client_id.to_string()).or_default();
+
+        if self.global.entries.len() as u64 >= self.cfg.global_max_requests
+            || self.global.gas.saturating_add(reserved_gas) > self.cfg.global_max_gas
+        {
+            return Err(anyhow!("submit_raw global rolling budget exhausted"));
+        }
+        if client.entries.len() as u64 >= self.cfg.client_max_requests
+            || client.gas.saturating_add(reserved_gas) > self.cfg.client_max_gas
+        {
+            return Err(anyhow!("submit_raw client rolling budget exhausted"));
+        }
+        self.global.entries.push_back((now, reserved_gas));
+        self.global.gas = self.global.gas.saturating_add(reserved_gas);
+        client.entries.push_back((now, reserved_gas));
+        client.gas = client.gas.saturating_add(reserved_gas);
+        Ok(())
+    }
+
+    fn reserve_now(&mut self, client_id: &str, reserved_gas: u64) -> Result<()> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.reserve_at(client_id, reserved_gas, now)
+    }
+}
+
+fn parse_bool_env(name: &str, default: bool) -> Result<bool> {
+    let Some(raw) = std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(default);
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(anyhow!("{name} must be true or false")),
+    }
+}
+
+fn submit_raw_client_id(
+    headers: &HeaderMap,
+    peer: Option<SocketAddr>,
+    trusted_proxy_ips: &HashSet<IpAddr>,
+) -> String {
+    if peer
+        .as_ref()
+        .is_some_and(|addr| trusted_proxy_ips.contains(&addr.ip()))
+    {
+        if let Some(client_ip) = headers
+            .get("x-forwarded-for")
+            .and_then(|value| value.to_str().ok())
+            // The exact trusted reverse proxy appends the connection peer. Use
+            // the right-most hop so a client-supplied left-most value cannot
+            // manufacture fresh rate-limit identities.
+            .and_then(|value| value.split(',').next_back())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .and_then(|value| value.parse::<IpAddr>().ok())
+        {
+            return format!("proxy:{client_ip}");
+        }
+    }
+    peer.map(|addr| format!("peer:{}", addr.ip()))
+        .unwrap_or_else(|| "peer:unknown".to_string())
+}
+
+fn parse_trusted_proxy_ips(raw: &str) -> Result<HashSet<IpAddr>> {
     raw.split(',')
         .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| {
-            let bytes = hex::decode(strip_0x(s)).with_context(|| format!("bad selector {s}"))?;
-            bytes.try_into().map_err(|_| anyhow!("selector {s} must be exactly 4 bytes"))
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .parse::<IpAddr>()
+                .with_context(|| format!("bad trusted proxy IP {value:?}"))
         })
         .collect()
 }
@@ -829,7 +1104,24 @@ async fn run_http_server(
         transfer_dir: transfer_dir.to_path_buf(),
         seen_bundle_paths: Arc::new(Mutex::new(std::collections::HashSet::new())),
     });
-    let submit_raw_allowlist = SubmitRawAllowlist::from_env()?;
+    let submit_raw_allowlist = SubmitRawAllowlist::from_env(gas_limit_transfer)?;
+    let submit_raw_limit_cfg = SubmitRawLimitConfig::from_env()?;
+    let submit_raw_trust_proxy_headers =
+        parse_bool_env("PRIVACYBTC_SUBMIT_RAW_TRUST_PROXY_HEADERS", false)?;
+    let submit_raw_trusted_proxy_ips = parse_trusted_proxy_ips(
+        &std::env::var("PRIVACYBTC_SUBMIT_RAW_TRUSTED_PROXY_IPS").unwrap_or_default(),
+    )?;
+    if submit_raw_trust_proxy_headers && submit_raw_trusted_proxy_ips.is_empty() {
+        return Err(anyhow!(
+            "PRIVACYBTC_SUBMIT_RAW_TRUST_PROXY_HEADERS=true requires \
+             PRIVACYBTC_SUBMIT_RAW_TRUSTED_PROXY_IPS"
+        ));
+    }
+    let submit_raw_trusted_proxy_ips = if submit_raw_trust_proxy_headers {
+        submit_raw_trusted_proxy_ips
+    } else {
+        HashSet::new()
+    };
     if btc_payout_wif.is_some() {
         if btc_payout_evm_confirmations == 0 {
             return Err(anyhow!("PRIVACYBTC_BTC_PAYOUT_EVM_CONFIRMATIONS must be > 0 when BTC payout is enabled"));
@@ -870,6 +1162,10 @@ async fn run_http_server(
         swap_book: Arc::new(Mutex::new(swap_book)),
         swap_book_path,
         submit_raw_allowlist,
+        submit_raw_limiter: Arc::new(Mutex::new(SubmitRawLimiter::new(
+            submit_raw_limit_cfg,
+        ))),
+        submit_raw_trusted_proxy_ips,
         lp_offer_token,
         protocol_pools: protocol.pools,
         expected_protocol_version: protocol.version,
@@ -880,7 +1176,11 @@ async fn run_http_server(
         .await
         .with_context(|| format!("bind {bind}"))?;
     println!("relayer http listening on {bind}");
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -1249,6 +1549,8 @@ struct HttpSubmitRawRequest {
 
 async fn http_submit_raw(
     State(cfg): State<Arc<RelayerHttpConfig>>,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
     Json(req): Json<HttpSubmitRawRequest>,
 ) -> Result<Json<HttpTxResponse>, (StatusCode, Json<HttpErrorResponse>)> {
     if let Some(chain_id) = req.chain_id {
@@ -1264,20 +1566,37 @@ async fn http_submit_raw(
             "[relayer] ignoring deprecated client gas_limit={ignored}; using server-side estimation"
         );
     }
+    let value = req.value.unwrap_or(0);
+    if value != 0 {
+        return Err(http_error(anyhow!(
+            "submit_raw only permits zero-value calls"
+        )));
+    }
     let calldata = hex::decode(req.data.trim_start_matches("0x"))
         .map_err(|e| http_error(anyhow!("data is not valid hex: {e}")))?;
-    cfg.submit_raw_allowlist
-        .validate(&req.to, &calldata)
+    let policy = cfg
+        .submit_raw_allowlist
+        .validate(&req.to, &calldata, value)
         .map_err(http_error)?;
+    let client_id = submit_raw_client_id(
+        &headers,
+        peer.map(|ConnectInfo(addr)| addr),
+        &cfg.submit_raw_trusted_proxy_ips,
+    );
+    cfg.submit_raw_limiter
+        .lock()
+        .await
+        .reserve_now(&client_id, policy.max_gas)
+        .map_err(http_rate_limited)?;
     let tx_hash = send_raw_calldata(
         &cfg.rpc_url,
         cfg.chain_id,
         &cfg.private_key,
         &req.to,
         calldata,
-        req.value.unwrap_or(0),
+        value,
         cfg.gas_price_gwei,
-        cfg.gas_limit_transfer,
+        policy.max_gas,
         cfg.gas_limit_margin_bps,
         &cfg.nonce_cache,
     )
@@ -2764,6 +3083,16 @@ fn http_error(err: anyhow::Error) -> (StatusCode, Json<HttpErrorResponse>) {
     )
 }
 
+fn http_rate_limited(err: anyhow::Error) -> (StatusCode, Json<HttpErrorResponse>) {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(HttpErrorResponse {
+            error: format!("{err:#}"),
+            code: Some("SUBMIT_RAW_RATE_LIMITED".to_string()),
+        }),
+    )
+}
+
 /// Map a Layer 1 screening rejection to an HTTP response with a stable error code.
 fn http_rejection(r: screening::ScreenRejection) -> (StatusCode, Json<HttpErrorResponse>) {
     let status = StatusCode::from_u16(r.http_status).unwrap_or(StatusCode::FORBIDDEN);
@@ -4043,6 +4372,16 @@ mod tests {
             swap_book: Arc::new(Mutex::new(SwapBook::default())),
             swap_book_path: None,
             submit_raw_allowlist: SubmitRawAllowlist::default(),
+            submit_raw_limiter: Arc::new(Mutex::new(SubmitRawLimiter::new(
+                SubmitRawLimitConfig {
+                    window_secs: 3_600,
+                    global_max_requests: 100,
+                    client_max_requests: 10,
+                    global_max_gas: 500_000_000,
+                    client_max_gas: 50_000_000,
+                },
+            ))),
+            submit_raw_trusted_proxy_ips: HashSet::new(),
             lp_offer_token: Some("test-lp-token".into()),
             protocol_pools: [
                 "0x1111111111111111111111111111111111111111".to_string(),
@@ -4164,8 +4503,11 @@ mod tests {
         cfg.rpc_url = rpc_url;
         cfg.chain_id = 143;
         cfg.gas_limit_transfer = transfer_cap;
-        cfg.submit_raw_allowlist =
-            SubmitRawAllowlist::new(&[target], &[[0x12, 0x34, 0x56, 0x78]]).unwrap();
+        cfg.submit_raw_allowlist = SubmitRawAllowlist::new(
+            &[(target, [0x12, 0x34, 0x56, 0x78], 0, transfer_cap)],
+            transfer_cap,
+        )
+        .unwrap();
         Arc::new(cfg)
     }
 
@@ -4390,22 +4732,138 @@ mod tests {
     fn submit_raw_allowlist_requires_target_and_selector_match() {
         let target = "0x1111111111111111111111111111111111111111";
         let selector = [0x12, 0x34, 0x56, 0x78];
-        let allowlist = SubmitRawAllowlist::new(&[target], &[selector]).unwrap();
+        let allowlist =
+            SubmitRawAllowlist::new(&[(target, selector, 0, 5_000_000)], 5_000_000).unwrap();
 
-        assert!(allowlist.validate(target, &[0x12, 0x34, 0x56, 0x78, 0xaa]).is_ok());
         assert!(allowlist
-            .validate("0x2222222222222222222222222222222222222222", &[0x12, 0x34, 0x56, 0x78])
+            .validate(target, &[0x12, 0x34, 0x56, 0x78, 0xaa], 0)
+            .is_ok());
+        assert!(allowlist
+            .validate(
+                "0x2222222222222222222222222222222222222222",
+                &[0x12, 0x34, 0x56, 0x78],
+                0
+            )
             .is_err());
-        assert!(allowlist.validate(target, &[0xde, 0xad, 0xbe, 0xef]).is_err());
-        assert!(allowlist.validate(target, &[0x12, 0x34, 0x56]).is_err());
+        assert!(allowlist
+            .validate(target, &[0xde, 0xad, 0xbe, 0xef], 0)
+            .is_err());
+        assert!(allowlist
+            .validate(target, &[0x12, 0x34, 0x56], 0)
+            .is_err());
+        assert!(allowlist
+            .validate(target, &[0x12, 0x34, 0x56, 0x78], 1)
+            .is_err());
     }
 
     #[test]
     fn submit_raw_allowlist_is_disabled_when_unconfigured() {
         let allowlist = SubmitRawAllowlist::default();
         assert!(allowlist
-            .validate("0x1111111111111111111111111111111111111111", &[0x12, 0x34, 0x56, 0x78])
+            .validate(
+                "0x1111111111111111111111111111111111111111",
+                &[0x12, 0x34, 0x56, 0x78],
+                0
+            )
             .is_err());
+    }
+
+    #[test]
+    fn submit_raw_policy_is_paired_and_rejects_nonzero_or_excessive_caps() {
+        let a = "0x1111111111111111111111111111111111111111";
+        let b = "0x2222222222222222222222222222222222222222";
+        let policies = SubmitRawAllowlist::parse(
+            &format!(
+                "{a}@0x12345678@0@1000000;{b}@0xdeadbeef@0@2000000"
+            ),
+            2_000_000,
+        )
+        .unwrap();
+        assert!(policies.validate(a, &[0x12, 0x34, 0x56, 0x78], 0).is_ok());
+        assert!(
+            policies
+                .validate(a, &[0xde, 0xad, 0xbe, 0xef], 0)
+                .is_err(),
+            "independent target/selector cross-products must be rejected"
+        );
+        assert!(SubmitRawAllowlist::parse(
+            &format!("{a}@0x12345678@1@1000000"),
+            2_000_000
+        )
+        .is_err());
+        assert!(SubmitRawAllowlist::parse(
+            &format!("{a}@0x12345678@0@2000001"),
+            2_000_000
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn submit_raw_legacy_cartesian_allowlists_are_always_rejected() {
+        let paired =
+            "0x1111111111111111111111111111111111111111@0x12345678@0@5000000";
+        assert!(SubmitRawAllowlist::from_config(
+            "0x1111111111111111111111111111111111111111",
+            "",
+            paired,
+            5_000_000
+        )
+        .is_err());
+        assert!(SubmitRawAllowlist::from_config(
+            "",
+            "0x12345678",
+            paired,
+            5_000_000
+        )
+        .is_err());
+        assert!(SubmitRawAllowlist::from_config("", "", paired, 5_000_000).is_ok());
+    }
+
+    #[test]
+    fn submit_raw_limiter_enforces_client_and_global_rolling_gas_budgets() {
+        let mut limiter = SubmitRawLimiter::new(SubmitRawLimitConfig {
+            window_secs: 100,
+            global_max_requests: 3,
+            client_max_requests: 2,
+            global_max_gas: 12,
+            client_max_gas: 8,
+        });
+        assert!(limiter.reserve_at("alice", 4, 1_000).is_ok());
+        assert!(limiter.reserve_at("alice", 4, 1_001).is_ok());
+        assert!(limiter.reserve_at("alice", 1, 1_002).is_err());
+        assert!(limiter.reserve_at("bob", 4, 1_002).is_ok());
+        assert!(limiter.reserve_at("carol", 1, 1_003).is_err());
+        assert!(limiter.reserve_at("alice", 4, 1_101).is_ok());
+    }
+
+    #[test]
+    fn submit_raw_client_identity_only_trusts_exact_proxy_and_rightmost_hop() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            "203.0.113.99, 198.51.100.7".parse().unwrap(),
+        );
+        let trusted_peer: SocketAddr = "127.0.0.1:4567".parse().unwrap();
+        let trusted = [trusted_peer.ip()].into_iter().collect();
+        assert_eq!(
+            submit_raw_client_id(&headers, Some(trusted_peer), &trusted),
+            "proxy:198.51.100.7"
+        );
+
+        let untrusted_peer: SocketAddr = "192.0.2.10:4567".parse().unwrap();
+        assert_eq!(
+            submit_raw_client_id(&headers, Some(untrusted_peer), &trusted),
+            "peer:192.0.2.10"
+        );
+
+        headers.insert(
+            "x-forwarded-for",
+            "attacker-controlled-not-an-ip".parse().unwrap(),
+        );
+        assert_eq!(
+            submit_raw_client_id(&headers, Some(trusted_peer), &trusted),
+            "peer:127.0.0.1"
+        );
     }
 
     #[test]
