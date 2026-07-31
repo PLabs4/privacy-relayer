@@ -1538,10 +1538,6 @@ struct HttpSubmitRawRequest {
     /// Optional chain assertion supplied by clients. It must match this relayer.
     #[serde(default)]
     chain_id: Option<u64>,
-    /// Deprecated client hint. It is accepted only for rolling-upgrade compatibility and is
-    /// always ignored; the relayer estimates the exact transaction and applies server policy.
-    #[serde(default)]
-    gas_limit: Option<u64>,
     /// Optional wei value to attach (defaults to 0).
     #[serde(default)]
     value: Option<u64>,
@@ -1560,11 +1556,6 @@ async fn http_submit_raw(
                 cfg.chain_id
             )));
         }
-    }
-    if let Some(ignored) = req.gas_limit {
-        eprintln!(
-            "[relayer] ignoring deprecated client gas_limit={ignored}; using server-side estimation"
-        );
     }
     let value = req.value.unwrap_or(0);
     if value != 0 {
@@ -3015,7 +3006,10 @@ async fn btc_payout_local(
         }).collect()
     };
     for (i, sh) in sighashes.into_iter().enumerate() {
-        let sig = secp.sign_schnorr(&BtcMessage::from_digest(sh.to_byte_array()), &tweaked_kp.to_inner());
+        let sig = secp.sign_schnorr(
+            &BtcMessage::from_digest(sh.to_byte_array()),
+            &tweaked_kp.to_keypair(),
+        );
         tx.input[i].witness = Witness::from_slice(&[&sig.serialize()]);
     }
 
@@ -3876,13 +3870,6 @@ impl EthRpcClient {
         Ok(())
     }
 
-    async fn block_number(&self) -> Result<u64> {
-        let hex_num: String = self
-            .rpc_call("eth_blockNumber", serde_json::json!([]))
-            .await?;
-        parse_hex_u64(&hex_num)
-    }
-
     async fn get_transaction_count(&self, address: &str) -> Result<u64> {
         let hex_num: String = self
             .rpc_call(
@@ -4000,7 +3987,11 @@ impl EthRpcClient {
             if parse_hex_u64(&head)?.saturating_sub(block).saturating_add(1) < min_confirmations { return Ok(false); }
             let tx: Option<Value> = self.rpc_call_url(url, "eth_getTransactionByHash", serde_json::json!([tx_hash])).await?;
             let input = tx.and_then(|t| t["input"].as_str().map(str::to_owned)).ok_or_else(|| anyhow!("RPC {url} missing transaction input"))?;
-            if Keccak256::digest(hex::decode(strip_0x(&input)).context("invalid transaction input hex")?).as_slice() != expected_calldata_hash {
+            let actual_calldata_hash: [u8; 32] = Keccak256::digest(
+                hex::decode(strip_0x(&input)).context("invalid transaction input hex")?,
+            )
+            .into();
+            if &actual_calldata_hash != expected_calldata_hash {
                 return Err(anyhow!("RPC {url} transaction calldata does not match submitted unshield"));
             }
         }
@@ -4512,7 +4503,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn submit_raw_ignores_legacy_limit_estimates_exact_tx_and_signs_padded_limit() {
+    async fn submit_raw_ignores_unknown_legacy_hint_and_signs_estimated_padded_limit() {
         let (rpc_url, calls, server) = start_mock_eth_rpc("0x3d0900").await; // 4,000,000
         let app = build_router(submit_raw_test_state(rpc_url, 5_000_000));
         let target = "0x1111111111111111111111111111111111111111";

@@ -266,23 +266,6 @@ impl ScreeningConfig {
         self.screen(addr, boundary).await
     }
 
-    /// Screen an address that is OPTIONAL even when screening is enabled (e.g. an
-    /// issuer-mint beneficiary supplied only under some issuer policies). A missing
-    /// address is allowed; a present one is screened.
-    pub async fn screen_optional(
-        &self,
-        addr: Option<&str>,
-        boundary: &str,
-    ) -> Result<(), ScreenRejection> {
-        if !self.enabled {
-            return Ok(());
-        }
-        match addr {
-            None => Ok(()),
-            Some(a) => self.screen(a, boundary).await,
-        }
-    }
-
     /// Core screen: normalize, cache lookup, parallel provider calls, [`decide`],
     /// audit log, cache store.
     async fn screen(&self, addr: &str, boundary: &str) -> Result<(), ScreenRejection> {
@@ -693,9 +676,6 @@ mod tests {
         // Enabled but no address → 400 MISSING_SCREENING_ADDRESS.
         let missing = cfg.screen_required(None, "shield_depositor").await;
         assert!(matches!(&missing, Err(r) if r.code == MISSING_SCREENING_ADDRESS && r.http_status == 400));
-
-        // Optional screening with no address is a no-op even when enabled.
-        assert!(cfg.screen_optional(None, "mint_beneficiary").await.is_ok());
 
         std::env::remove_var("SCREENING_ENABLED");
         std::env::remove_var("SCREENING_TRM_URL");
