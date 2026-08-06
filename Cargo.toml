@@ -15,6 +15,7 @@ anyhow = "1"
 axum = "0.7"
 clap = { version = "4", features = ["derive", "env"] }
 dotenvy = "0.15"
+ethabi = "18"
 glob = "0.3"
 hex = "0.4"
 k256 = { version = "0.13", features = ["ecdsa"] }

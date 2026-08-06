@@ -4,6 +4,7 @@
 //! **Multisig / policy**: deploy a Gnosis Safe (or similar) as `PrivacyBTC.federation` so the
 //! relay EOA is replaced by multisig execution; this binary stays single-key for local signing.
 
+mod fee_calldata;
 mod screening;
 
 use anyhow::{anyhow, Context, Result};
@@ -24,9 +25,12 @@ use privacy_core::ethereum::{
     BundleActionArgs, BundleCalldataArgs, FinalizeWithdrawCalldataArgs,
     // WS-6: WrappedPERC20 + SwapCoordinator calldata (privacy-core 0.1.2).
     compute_swap_id, encode_swap_initiate_calldata, encode_swap_join_calldata,
-    encode_swap_settle_calldata, encode_wrapped_shield_calldata, encode_wrapped_unshield_calldata,
+    encode_swap_settle_calldata, encode_wrapped_shield_calldata,
     privacy_call_commit, PrivacyCallArgs,
 };
+// The fee release changed `unshield`'s ABI and added the gateway; privacy-core is pinned to a
+// rev that predates both, so those two calls are encoded locally (see `fee_calldata`).
+use fee_calldata::{encode_transfer_with_fee_calldata, encode_unshield_v2_calldata};
 use reqwest::Client;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
@@ -161,6 +165,13 @@ enum Command {
             default_value_t = DEFAULT_GAS_MARGIN_BPS
         )]
         gas_limit_margin_bps: u64,
+        /// `Perc20FeeGateway` address. Relayer-sponsored transfers go through it so the
+        /// protocol fee cannot be skipped; without it `/transfer/submit` is disabled.
+        #[arg(long, env = "PRIVACYBTC_FEE_GATEWAY_ADDRESS")]
+        fee_gateway: Option<String>,
+        /// pUSDC pool backing the transfer fee (diagnostics/preflight only).
+        #[arg(long, env = "PRIVACYBTC_FEE_POOL_ADDRESS")]
+        fee_pool: Option<String>,
         /// Address of the `SwapCoordinator` for 3-tx atomic swaps. Required for /swap/* routes;
         /// each request may also override it per-call.
         #[arg(long, env = "PRIVACYBTC_SWAP_COORDINATOR_ADDRESS")]
@@ -285,6 +296,8 @@ async fn main() -> Result<()> {
             gas_limit_unshield,
             gas_limit_transfer,
             gas_limit_margin_bps,
+            fee_gateway,
+            fee_pool,
             swap_coordinator,
             gas_limit_swap,
             btc_rpc_url,
@@ -308,6 +321,8 @@ async fn main() -> Result<()> {
                 gas_limit_unshield,
                 gas_limit_transfer,
                 gas_limit_margin_bps,
+                fee_gateway.as_deref(),
+                fee_pool.as_deref(),
                 swap_coordinator.as_deref(),
                 gas_limit_swap,
                 btc_rpc_url.as_deref(),
@@ -408,6 +423,10 @@ struct RelayerHttpConfig {
     gas_limit_unshield: u64,
     gas_limit_transfer: u64,
     gas_limit_margin_bps: u64,
+    /// `Perc20FeeGateway` address. Relayer-sponsored transfers are submitted HERE, never
+    /// straight to a pool — that is what makes the protocol fee unavoidable on the sponsored
+    /// path (docs/tx_fee_impl.md §4). Required whenever transfer sponsorship is enabled.
+    fee_gateway: Option<String>,
     /// Default `SwapCoordinator` address for /swap/* routes (per-request override allowed).
     swap_coordinator: Option<String>,
     /// Gas limit for `settle` (heaviest swap call).
@@ -532,7 +551,42 @@ struct SubmitRawAllowlist {
     policies: HashMap<(String, [u8; 4]), SubmitRawPolicy>,
 }
 
+/// `transfer((bytes,uint256[8]))` and `transfer(address,(bytes,uint256[8]))`.
+///
+/// Sponsoring either of these directly on a pool would hand out a free private transfer: the
+/// protocol fee is only collected by `Perc20FeeGateway.transferWithFee`. `/submit_raw` is a
+/// general "relay this calldata" route, so it is the one place that could silently re-open that
+/// path — hence the boot-time refusal below (docs/tx_fee_impl.md R-5, I-9).
+fn pool_transfer_selectors() -> [[u8; 4]; 2] {
+    let one: [u8; 4] = Keccak256::digest(b"transfer((bytes,uint256[8]))")[..4]
+        .try_into()
+        .expect("selector is 4 bytes");
+    let two: [u8; 4] = Keccak256::digest(b"transfer(address,(bytes,uint256[8]))")[..4]
+        .try_into()
+        .expect("selector is 4 bytes");
+    [one, two]
+}
+
 impl SubmitRawAllowlist {
+    /// Reject any policy that would let a caller sponsor a pool `transfer` directly.
+    ///
+    /// This is a hard boot failure rather than a warning: the fee is unenforceable the moment
+    /// such an entry exists, and a warning in a log is not a control.
+    fn reject_fee_free_transfer_policies(&self) -> Result<()> {
+        let banned = pool_transfer_selectors();
+        for (target, selector) in self.policies.keys() {
+            if banned.contains(selector) {
+                return Err(anyhow!(
+                    "submit_raw policy allows pool transfer 0x{} on {target}; sponsored transfers \
+                     MUST go through Perc20FeeGateway.transferWithFee or the protocol fee can be \
+                     bypassed. Remove this entry from PRIVACYBTC_SUBMIT_RAW_POLICIES.",
+                    hex::encode(selector)
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn from_env(global_gas_cap: u64) -> Result<Self> {
         let legacy_targets =
             std::env::var("PRIVACYBTC_SUBMIT_RAW_ALLOWED_TARGETS").unwrap_or_default();
@@ -1055,6 +1109,8 @@ async fn run_http_server(
     gas_limit_unshield: u64,
     gas_limit_transfer: u64,
     gas_limit_margin_bps: u64,
+    fee_gateway: Option<&str>,
+    fee_pool: Option<&str>,
     swap_coordinator: Option<&str>,
     gas_limit_swap: u64,
     btc_rpc_url: Option<&str>,
@@ -1083,6 +1139,29 @@ async fn run_http_server(
             .await
             .with_context(|| format!("protocol gate for pool {pool}"))?;
     }
+    let fee_gateway = fee_gateway.map(normalize_evm_address).transpose()?;
+    let fee_pool = fee_pool.map(normalize_evm_address).transpose()?;
+    match (fee_gateway.as_deref(), fee_pool.as_deref()) {
+        (Some(gw), Some(fp)) => {
+            rpc.verify_fee_gateway(gw, fp)
+                .await
+                .with_context(|| format!("fee gateway config check for {gw}"))?;
+        }
+        (Some(gw), None) => {
+            // Without the expected pool we cannot cross-check; say so instead of pretending.
+            eprintln!(
+                "[relayer] WARNING: fee gateway {gw} configured without --fee-pool; \
+                 skipping the feePool() cross-check."
+            );
+        }
+        (None, _) => {
+            // Fail loudly at boot rather than silently sponsoring fee-free transfers later.
+            eprintln!(
+                "[relayer] WARNING: no --fee-gateway configured; /transfer/submit will reject \
+                 all requests. Set PRIVACYBTC_FEE_GATEWAY_ADDRESS to enable sponsored transfers."
+            );
+        }
+    }
     let swap_coordinator = swap_coordinator
         .map(normalize_evm_address)
         .transpose()?;
@@ -1105,6 +1184,7 @@ async fn run_http_server(
         seen_bundle_paths: Arc::new(Mutex::new(std::collections::HashSet::new())),
     });
     let submit_raw_allowlist = SubmitRawAllowlist::from_env(gas_limit_transfer)?;
+    submit_raw_allowlist.reject_fee_free_transfer_policies()?;
     let submit_raw_limit_cfg = SubmitRawLimitConfig::from_env()?;
     let submit_raw_trust_proxy_headers =
         parse_bool_env("PRIVACYBTC_SUBMIT_RAW_TRUST_PROXY_HEADERS", false)?;
@@ -1149,6 +1229,7 @@ async fn run_http_server(
         gas_limit_unshield,
         gas_limit_transfer,
         gas_limit_margin_bps,
+        fee_gateway,
         swap_coordinator,
         gas_limit_swap,
         auto_shield,
@@ -1475,6 +1556,10 @@ struct HttpTransferSubmitRequest {
     bundle: OrchardStoredBundle,
     /// Pool contract address (0x-prefixed 20 bytes). Required — works for both BTC and ERC pools.
     contract: String,
+    /// pUSDC unshield bundle paying the protocol fee. REQUIRED: sponsoring a transfer costs us
+    /// gas, and this is what pays for it. Its amount/recipient/context are supplied by the
+    /// gateway on-chain, so a wrong bundle fails verification rather than under-paying.
+    fee_bundle: OrchardStoredBundle,
 }
 
 /// GET /tx/status?hash=0x...
@@ -1501,22 +1586,39 @@ async fn http_tx_status(
     }
 }
 
+/// Sponsored private transfer. ALWAYS routed through `Perc20FeeGateway` — never straight to the
+/// pool — because the gateway is what collects the protocol fee.
+///
+/// This handler is one of the two places that make the fee unavoidable on the sponsored path.
+/// The other is the `/submit_raw` policy table, which must NOT contain a (pool, `transfer`)
+/// pair; otherwise a caller could sponsor a fee-free transfer through that route instead
+/// (docs/tx_fee_impl.md §4, R-5).
+///
+/// Users who prefer not to pay simply submit their own transaction with `executor = 0`; that
+/// bundle is valid but consumes none of our gas, which is exactly the intended trade.
 async fn http_transfer_submit(
     State(cfg): State<Arc<RelayerHttpConfig>>,
     Json(req): Json<HttpTransferSubmitRequest>,
 ) -> Result<Json<HttpTxResponse>, (StatusCode, Json<HttpErrorResponse>)> {
     let contract = cfg.ensure_protocol_pool(&req.contract).map_err(http_error)?;
-    let tx_hash = submit_transfer_bundle(
+    let gateway = cfg.fee_gateway.clone().ok_or_else(|| {
+        http_error(anyhow!(
+            "sponsored transfers are disabled: no fee gateway configured \
+             (set PRIVACYBTC_FEE_GATEWAY_ADDRESS)"
+        ))
+    })?;
+    let tx_hash = submit_transfer_with_fee(
         &cfg.rpc_url,
         cfg.chain_id,
         &cfg.private_key,
+        &gateway,
         &contract,
         &req.bundle,
+        &req.fee_bundle,
         cfg.gas_price_gwei,
         cfg.gas_limit_transfer,
         cfg.gas_limit_margin_bps,
         &cfg.nonce_cache,
-        cfg.indexer_url.as_deref(),
     )
     .await
     .map_err(http_error)?;
@@ -1908,7 +2010,11 @@ async fn http_wrapped_unshield_submit(
     let recipient = parse_evm_address_hex(&req.recipient_evm)
         .map_err(|e| http_error(anyhow!("bad recipient_evm: {e}")))?;
     let call = bundle_to_privacy_call(&req.bundle).map_err(http_error)?;
-    let calldata = encode_wrapped_unshield_calldata(req.amount_units, &recipient, &call);
+    // A plain withdrawal binds no application-layer context and no executor. The pool deducts
+    // its own `unshieldFeeUnits` and folds the fee into `recipientMeta`, so a rate change makes
+    // this bundle fail verification rather than paying the user less — nothing to check here.
+    let calldata =
+        encode_unshield_v2_calldata(req.amount_units, &recipient, &[0u8; 32], &[0u8; 20], &call);
     let tx_hash = send_raw_calldata(
         &cfg.rpc_url,
         cfg.chain_id,
@@ -3297,6 +3403,54 @@ async fn submit_transfer_bundle(
     .await
 }
 
+/// Submit `Perc20FeeGateway.transferWithFee(pool, opCall, feeCall)`.
+///
+/// Two independent bundles ride in one transaction: the business transfer on `pool` (proved with
+/// `executor = gateway`, so it can ONLY execute here) and a pUSDC unshield paying the protocol
+/// fee. The gateway derives the binding context from `opCall` itself and supplies the fee amount
+/// and recipient from its own storage, so the relayer has nothing to validate — a mismatched or
+/// borrowed fee bundle fails the on-chain Binding proof.
+///
+/// Gas note: this verifies TWO bundles' Groth16 proofs, so `gas_limit_transfer` must be sized
+/// well above the single-bundle figure used before the fee release.
+#[allow(clippy::too_many_arguments)]
+async fn submit_transfer_with_fee(
+    rpc_url: &str,
+    chain_id: u64,
+    private_key: &str,
+    gateway: &str,
+    pool: &str,
+    op_bundle: &OrchardStoredBundle,
+    fee_bundle: &OrchardStoredBundle,
+    gas_price_gwei: f64,
+    gas_limit_cap: u64,
+    gas_limit_margin_bps: u64,
+    nonce_cache: &Arc<Mutex<Option<u64>>>,
+) -> Result<String> {
+    // Both legs are subject to the frozen-root compliance gate, same as any other bundle.
+    enforce_frozen_compliance(rpc_url, pool, op_bundle).await?;
+
+    let pool_addr = parse_evm_address_hex(pool).map_err(|e| anyhow!("bad pool address: {e}"))?;
+    let op_call = bundle_to_privacy_call(op_bundle)?;
+    let fee_call = bundle_to_privacy_call(fee_bundle)?;
+
+    let calldata = encode_transfer_with_fee_calldata(&pool_addr, &op_call, &fee_call);
+
+    send_raw_calldata(
+        rpc_url,
+        chain_id,
+        private_key,
+        gateway,
+        calldata,
+        0,
+        gas_price_gwei,
+        gas_limit_cap,
+        gas_limit_margin_bps,
+        nonce_cache,
+    )
+    .await
+}
+
 /// Submit `unshield()` on-chain using a pre-proven `OrchardStoredBundle`.
 ///
 /// The bundle must contain per-action proofs/publics and `binding_proof_bn254`.
@@ -3840,6 +3994,27 @@ impl EthRpcClient {
         .await
     }
 
+    /// Boot-time guard: the gateway's own `feePool()` must be the pUSDC pool we were configured
+    /// with. A mismatch means fees would be collected from a different pool than operators
+    /// believe, so refuse to start rather than discover it in production accounting.
+    async fn verify_fee_gateway(&self, gateway: &str, expected_fee_pool: &str) -> Result<()> {
+        // feePool() selector = keccak("feePool()")[..4]
+        let sel = format!("0x{}", hex::encode(&Keccak256::digest(b"feePool()")[..4]));
+        let raw = self.eth_call(gateway, &sel).await?;
+        let word = strip_0x(&raw);
+        if word.len() < 64 {
+            return Err(anyhow!("feePool() returned a short word: {raw}"));
+        }
+        let actual = format!("0x{}", &word[word.len() - 40..]).to_lowercase();
+        let expected = normalize_evm_address(expected_fee_pool)?;
+        if actual != expected {
+            return Err(anyhow!(
+                "fee gateway {gateway} points at feePool {actual}, but --fee-pool is {expected}"
+            ));
+        }
+        Ok(())
+    }
+
     async fn verify_protocol_version(&self, contract: &str, expected: u64) -> Result<()> {
         let raw = self.eth_call(contract, "0x2ae9c600").await?;
         let actual = parse_abi_u64(&raw).context("decode protocolVersion()")?;
@@ -4350,6 +4525,7 @@ mod tests {
             gas_limit_unshield: 6_000_000,
             gas_limit_transfer: 5_000_000,
             gas_limit_margin_bps: DEFAULT_GAS_MARGIN_BPS,
+            fee_gateway: Some("0x00000000000000000000000000000000000000bb".into()),
             swap_coordinator: Some("0xc".into()),
             gas_limit_swap: 12_000_000,
             auto_shield: None,
@@ -4486,6 +4662,38 @@ mod tests {
             .unwrap();
         });
         (format!("http://{address}"), calls, server)
+    }
+
+    /// The protocol fee on the sponsored path is only as strong as this guard: `/submit_raw`
+    /// relays arbitrary calldata, so a (pool, `transfer`) policy would let a caller get a
+    /// sponsored transfer without paying. Boot must fail, not warn.
+    #[test]
+    fn submit_raw_rejects_pool_transfer_policies() {
+        for sig in [
+            "transfer((bytes,uint256[8]))",
+            "transfer(address,(bytes,uint256[8]))",
+        ] {
+            let sel = hex::encode(&Keccak256::digest(sig.as_bytes())[..4]);
+            let raw = format!("0x00000000000000000000000000000000000000aa@0x{sel}@0@1000000");
+            let list = SubmitRawAllowlist::parse(&raw, 12_000_000).expect("policy parses");
+            let err = list
+                .reject_fee_free_transfer_policies()
+                .expect_err("pool transfer policy must be rejected");
+            assert!(
+                err.to_string().contains("Perc20FeeGateway"),
+                "error should point at the gateway, got: {err}"
+            );
+        }
+    }
+
+    /// The gateway's own selector must remain allowed — that is the route we want sponsored.
+    #[test]
+    fn submit_raw_allows_gateway_transfer_with_fee() {
+        let sel = hex::encode(fee_calldata::transfer_with_fee_selector());
+        let raw = format!("0x00000000000000000000000000000000000000bb@0x{sel}@0@1000000");
+        let list = SubmitRawAllowlist::parse(&raw, 12_000_000).expect("policy parses");
+        list.reject_fee_free_transfer_policies()
+            .expect("gateway policy must be allowed");
     }
 
     fn submit_raw_test_state(rpc_url: String, transfer_cap: u64) -> Arc<RelayerHttpConfig> {

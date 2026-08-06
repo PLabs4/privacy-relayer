@@ -1444,6 +1444,7 @@ dependencies = [
  "bitcoin",
  "clap",
  "dotenvy",
+ "ethabi",
  "glob",
  "hex",
  "http-body-util",
