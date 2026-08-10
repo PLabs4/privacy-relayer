@@ -1836,7 +1836,18 @@ fn bundle_to_action_args(bundle: &OrchardStoredBundle) -> Result<Vec<BundleActio
             out_ciphertext: a.out_ciphertext.clone(),
             epk:            a.ephemeral_key,
             nf_old:         a.nullifier,
-            anchor:         bundle.anchor_orchard,
+            // PER-ACTION anchor, not `bundle.anchor_orchard`. `OrchardVerifier._executeBundle`
+            // checks `bytes32(pub[0]) == a.anchor` for EVERY action, and the actions of one
+            // bundle legitimately carry DIFFERENT anchors: a spend of a note whose Merkle path
+            // was frozen at an older root anchors there, while the same bundle's dummy action
+            // anchors at the current tip. Both pass `isValidAnchor` individually. The
+            // bundle-level `anchor_orchard` only mirrors action 0, so copying it onto every
+            // action makes any such bundle revert `BadAnchor()` — and because the JSON-RPC
+            // `data` field is dropped when the error is built, it surfaces as a bare
+            // "execution reverted" from eth_estimateGas. The browser encoder
+            // (apps/web/src/issuance/bundleCodec.ts) already reads `pub_fields_bn254[0]` here,
+            // which is why self-paid submissions of the very same bundle succeed.
+            anchor:         raw_pi[0],
             proof,
             pub_fields:     raw_pi,
         });
@@ -3297,24 +3308,7 @@ async fn submit_shield_bundle(
 
     let binding_proof = bundle_binding_proof(bundle)?;
 
-    let mut bundle_actions: Vec<BundleActionArgs> = Vec::with_capacity(bundle.actions.len());
-    for a in &bundle.actions {
-        let proof = a.proof_bn254.clone()
-            .ok_or_else(|| anyhow!("action missing proof_bn254 — call prover first"))?;
-        let raw_pi: [[u8; 32]; 8] = a.pub_fields_bn254.as_ref()
-            .and_then(|v| <Vec<[u8;32]> as Clone>::clone(v).try_into().ok())
-            .ok_or_else(|| anyhow!("action missing pub_fields_bn254 (expected 8 elements)"))?;
-        bundle_actions.push(BundleActionArgs {
-            cmx:             a.cmx,
-            enc_ciphertext:  a.enc_ciphertext.clone(),
-            out_ciphertext:  a.out_ciphertext.clone(),
-            epk:             a.ephemeral_key,
-            nf_old:          a.nullifier,
-            anchor:          bundle.anchor_orchard,
-            proof,
-            pub_fields:      raw_pi,
-        });
-    }
+    let bundle_actions = bundle_to_action_args(bundle)?;
 
     // Shield: valueBalance = -amount (bit255=1 sign flag, readable satoshis).
     let value_balance = bundle_value_balance_be(amount_sats, true);
@@ -3360,24 +3354,7 @@ async fn submit_transfer_bundle(
     let binding_proof = bundle_binding_proof(bundle)?;
 
     // All actions (single or multi) go through bundle().
-    let mut bundle_actions: Vec<BundleActionArgs> = Vec::with_capacity(bundle.actions.len());
-    for a in &bundle.actions {
-        let proof = a.proof_bn254.clone()
-            .ok_or_else(|| anyhow!("action missing proof_bn254 — call prover first"))?;
-        let raw_pi: [[u8; 32]; 8] = a.pub_fields_bn254.as_ref()
-            .and_then(|v| <Vec<[u8;32]> as Clone>::clone(v).try_into().ok())
-            .ok_or_else(|| anyhow!("action missing pub_fields_bn254 (expected 8 elements)"))?;
-        bundle_actions.push(BundleActionArgs {
-            cmx:             a.cmx,
-            enc_ciphertext:  a.enc_ciphertext.clone(),
-            out_ciphertext:  a.out_ciphertext.clone(),
-            epk:             a.ephemeral_key,
-            nf_old:          a.nullifier,
-            anchor:          bundle.anchor_orchard,
-            proof,
-            pub_fields:      raw_pi,
-        });
-    }
+    let bundle_actions = bundle_to_action_args(bundle)?;
     let calldata = encode_bundle_calldata(&BundleCalldataArgs {
         actions:        bundle_actions,
         value_balance:  [0u8; 32], // pure transfer → valueBalance=0
@@ -3484,24 +3461,7 @@ async fn submit_unshield_bundle(
         .with_context(|| format!("invalid recipient_meta_hex: {recipient_meta_hex}"))?;
 
     // Build bundle actions — unshield and transfer share the same bundle() call.
-    let mut bundle_actions: Vec<BundleActionArgs> = Vec::with_capacity(bundle.actions.len());
-    for a in &bundle.actions {
-        let proof = a.proof_bn254.clone()
-            .ok_or_else(|| anyhow!("action missing proof_bn254 (run local Groth16 prover first)"))?;
-        let raw_pi: [[u8; 32]; 8] = a.pub_fields_bn254.as_ref()
-            .and_then(|v| <Vec<[u8;32]> as Clone>::clone(v).try_into().ok())
-            .ok_or_else(|| anyhow!("action missing pub_fields_bn254 (expected 8 elements)"))?;
-        bundle_actions.push(BundleActionArgs {
-            cmx:             a.cmx,
-            enc_ciphertext:  a.enc_ciphertext.clone(),
-            out_ciphertext:  a.out_ciphertext.clone(),
-            epk:             a.ephemeral_key,
-            nf_old:          a.nullifier,
-            anchor:          bundle.anchor_orchard,
-            proof,
-            pub_fields:      raw_pi,
-        });
-    }
+    let bundle_actions = bundle_to_action_args(bundle)?;
 
     // Unshield: valueBalance = +amount (bit255=0, readable positive satoshis).
     let value_balance = bundle_value_balance_be(amount_sats, false);
@@ -3953,6 +3913,23 @@ struct JsonRpcResponse<T> {
 struct JsonRpcError {
     code: i64,
     message: String,
+    /// Revert payload, when the node returns one. For a reverting `eth_call`/`eth_estimateGas`
+    /// this is the ABI-encoded custom error (e.g. `0x6e84ebb5` = `BadAnchor()`) and is the ONLY
+    /// thing distinguishing it from any other revert — `message` is just "execution reverted".
+    /// Dropping it turned a one-line diagnosis into a multi-round hunt; keep it in the error.
+    #[serde(default)]
+    data: Option<serde_json::Value>,
+}
+
+/// Render a JSON-RPC error without discarding its revert payload.
+fn describe_rpc_error(error: &JsonRpcError) -> String {
+    match error.data.as_ref() {
+        Some(serde_json::Value::Null) | None => format!("rpc error {}: {}", error.code, error.message),
+        Some(serde_json::Value::String(hex)) => {
+            format!("rpc error {}: {} (revert data {hex})", error.code, error.message)
+        }
+        Some(other) => format!("rpc error {}: {} (revert data {other})", error.code, error.message),
+    }
 }
 
 struct EthRpcClient {
@@ -4181,7 +4158,7 @@ impl EthRpcClient {
             .with_context(|| format!("RPC decode from {url}"))?;
         match (response.result, response.error) {
             (Some(value), None) => Ok(value),
-            (None, Some(error)) => Err(anyhow!("rpc error {} from {url}: {}", error.code, error.message)),
+            (None, Some(error)) => Err(anyhow!("{} (from {url})", describe_rpc_error(&error))),
             _ => Err(anyhow!("malformed RPC response from {url}")),
         }
     }
@@ -4201,7 +4178,7 @@ impl EthRpcClient {
                     Ok(r) => match (r.result, r.error) {
                         (Some(v), None) => return Ok(v),
                         (None, Some(e)) => {
-                            last_err = anyhow!("rpc error {}: {}", e.code, e.message);
+                            last_err = anyhow!("{}", describe_rpc_error(&e));
                             // JSON-RPC 应用层错误不换节点，直接返回
                             return Err(last_err);
                         }
@@ -5166,6 +5143,47 @@ mod tests {
         let bundle: OrchardStoredBundle = serde_json::from_value(value).unwrap();
         assert!(bundle.actions[0].spend_auth_sig.is_empty());
         assert_eq!(bundle_to_action_args(&bundle).unwrap().len(), 1);
+    }
+
+    /// Regression: a bundle whose actions carry DIFFERENT anchors must keep each action's own
+    /// anchor. `OrchardVerifier._executeBundle` asserts `bytes32(pub[0]) == a.anchor` per action,
+    /// and this is the normal shape of a frozen-path spend (real action at the frozen historical
+    /// root, dummy action at the current tip). Copying `bundle.anchor_orchard` onto every action
+    /// made the second one revert `BadAnchor()`, which reached the user as an opaque
+    /// "eth_estimateGas failed … execution reverted" on every relayer-sponsored transfer.
+    #[test]
+    fn per_action_anchor_is_taken_from_that_action_not_the_bundle() {
+        let mut bundle = test_bundle();
+        let tip_anchor = [0x5Au8; 32];
+        let mut second = bundle.actions[0].clone();
+        let mut second_pi = vec![[7u8; 32]; 8];
+        second_pi[0] = tip_anchor;
+        second.pub_fields_bn254 = Some(second_pi);
+        bundle.actions.push(second);
+        // The bundle-level anchor mirrors action 0 only.
+        bundle.anchor_orchard = [7u8; 32];
+
+        let args = bundle_to_action_args(&bundle).unwrap();
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0].anchor, [7u8; 32]);
+        assert_eq!(args[1].anchor, tip_anchor, "action 1 must keep its own anchor");
+        for a in &args {
+            assert_eq!(a.anchor, a.pub_fields[0], "contract asserts pub[0] == anchor");
+        }
+    }
+
+    #[test]
+    fn rpc_error_keeps_its_revert_data() {
+        // "execution reverted" alone is unactionable; the custom-error selector lives in `data`.
+        let with_data = JsonRpcError {
+            code: 3,
+            message: "execution reverted".to_string(),
+            data: Some(serde_json::Value::String("0x6e84ebb5".to_string())),
+        };
+        assert!(describe_rpc_error(&with_data).contains("0x6e84ebb5"));
+
+        let without = JsonRpcError { code: -32000, message: "boom".to_string(), data: None };
+        assert_eq!(describe_rpc_error(&without), "rpc error -32000: boom");
     }
 
     #[test]
