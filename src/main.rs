@@ -427,6 +427,10 @@ struct RelayerHttpConfig {
     /// straight to a pool — that is what makes the protocol fee unavoidable on the sponsored
     /// path (docs/tx_fee_impl.md §4). Required whenever transfer sponsorship is enabled.
     fee_gateway: Option<String>,
+    /// Pool whose notes pay the sponsored-transfer fee. Retained after the boot-time gateway
+    /// check so requests targeting this same pool can reject cross-bundle nullifier reuse before
+    /// an RPC simulation reaches `NullifierSpent()`.
+    fee_pool: Option<String>,
     /// Default `SwapCoordinator` address for /swap/* routes (per-request override allowed).
     swap_coordinator: Option<String>,
     /// Gas limit for `settle` (heaviest swap call).
@@ -1230,6 +1234,7 @@ async fn run_http_server(
         gas_limit_transfer,
         gas_limit_margin_bps,
         fee_gateway,
+        fee_pool,
         swap_coordinator,
         gas_limit_swap,
         auto_shield,
@@ -1607,12 +1612,22 @@ async fn http_transfer_submit(
              (set PRIVACYBTC_FEE_GATEWAY_ADDRESS)"
         ))
     })?;
+    if let Some(fee_pool) = cfg.fee_pool.as_deref() {
+        ensure_transfer_fee_nullifiers_disjoint(
+            &contract,
+            fee_pool,
+            &req.bundle,
+            &req.fee_bundle,
+        )
+        .map_err(http_error)?;
+    }
     let tx_hash = submit_transfer_with_fee(
         &cfg.rpc_url,
         cfg.chain_id,
         &cfg.private_key,
         &gateway,
         &contract,
+        cfg.fee_pool.as_deref(),
         &req.bundle,
         &req.fee_bundle,
         cfg.gas_price_gwei,
@@ -3397,6 +3412,7 @@ async fn submit_transfer_with_fee(
     private_key: &str,
     gateway: &str,
     pool: &str,
+    fee_pool: Option<&str>,
     op_bundle: &OrchardStoredBundle,
     fee_bundle: &OrchardStoredBundle,
     gas_price_gwei: f64,
@@ -3406,6 +3422,9 @@ async fn submit_transfer_with_fee(
 ) -> Result<String> {
     // Both legs are subject to the frozen-root compliance gate, same as any other bundle.
     enforce_frozen_compliance(rpc_url, pool, op_bundle).await?;
+    if let Some(fee_pool) = fee_pool {
+        enforce_frozen_compliance(rpc_url, fee_pool, fee_bundle).await?;
+    }
 
     let pool_addr = parse_evm_address_hex(pool).map_err(|e| anyhow!("bad pool address: {e}"))?;
     let op_call = bundle_to_privacy_call(op_bundle)?;
@@ -3426,6 +3445,38 @@ async fn submit_transfer_with_fee(
         nonce_cache,
     )
     .await
+}
+
+/// A Gateway call executes the fee bundle first and the operation bundle second. When the
+/// operation pool is also the fee pool, reusing any nullifier across those independent calls is
+/// a deterministic same-transaction double spend: the fee leg consumes it and the operation leg
+/// reverts `NullifierSpent()`. Reject that client error before proof simulation or nonce work.
+fn ensure_transfer_fee_nullifiers_disjoint(
+    operation_pool: &str,
+    fee_pool: &str,
+    operation_bundle: &OrchardStoredBundle,
+    fee_bundle: &OrchardStoredBundle,
+) -> Result<()> {
+    if operation_pool != fee_pool {
+        return Ok(());
+    }
+
+    let operation_nullifiers: HashSet<[u8; 32]> = operation_bundle
+        .actions
+        .iter()
+        .map(|action| action.nullifier)
+        .collect();
+    if fee_bundle
+        .actions
+        .iter()
+        .any(|action| operation_nullifiers.contains(&action.nullifier))
+    {
+        return Err(anyhow!(
+            "operation and fee bundles reuse a nullifier in the same fee pool; \
+             use a separate confirmed fee note or submit the transfer with self-paid gas"
+        ));
+    }
+    Ok(())
 }
 
 /// Submit `unshield()` on-chain using a pre-proven `OrchardStoredBundle`.
@@ -4503,6 +4554,7 @@ mod tests {
             gas_limit_transfer: 5_000_000,
             gas_limit_margin_bps: DEFAULT_GAS_MARGIN_BPS,
             fee_gateway: Some("0x00000000000000000000000000000000000000bb".into()),
+            fee_pool: Some("0x2222222222222222222222222222222222222222".into()),
             swap_coordinator: Some("0xc".into()),
             gas_limit_swap: 12_000_000,
             auto_shield: None,
@@ -5130,6 +5182,41 @@ mod tests {
             binding_sig_bn254: None,
             value_balance_bn254: 0,
         }
+    }
+
+    #[test]
+    fn same_fee_pool_rejects_cross_bundle_nullifier_reuse() {
+        let operation = test_bundle();
+        let fee = operation.clone();
+        let pool = "0x1111111111111111111111111111111111111111";
+
+        let err = ensure_transfer_fee_nullifiers_disjoint(pool, pool, &operation, &fee)
+            .unwrap_err();
+        assert!(err.to_string().contains("reuse a nullifier"), "{err}");
+    }
+
+    #[test]
+    fn same_fee_pool_accepts_disjoint_bundle_nullifiers() {
+        let operation = test_bundle();
+        let mut fee = test_bundle();
+        fee.actions[0].nullifier = [9u8; 32];
+        let pool = "0x1111111111111111111111111111111111111111";
+
+        ensure_transfer_fee_nullifiers_disjoint(pool, pool, &operation, &fee).unwrap();
+    }
+
+    #[test]
+    fn different_pools_may_use_the_same_nullifier_value() {
+        let operation = test_bundle();
+        let fee = operation.clone();
+
+        ensure_transfer_fee_nullifiers_disjoint(
+            "0x1111111111111111111111111111111111111111",
+            "0x2222222222222222222222222222222222222222",
+            &operation,
+            &fee,
+        )
+        .unwrap();
     }
 
     #[test]
