@@ -430,9 +430,11 @@ struct RelayerHttpConfig {
     /// straight to a pool — that is what makes the protocol fee unavoidable on the sponsored
     /// path (docs/tx_fee_impl.md §4). Required whenever transfer sponsorship is enabled.
     fee_gateway: Option<String>,
-    /// The pool the gateway charges fees from (`Perc20FeeGateway.feePool()`). Needed to decide
-    /// whether a sponsored transfer is SAME-ASSET — a transfer of the fee asset itself pays with
-    /// one combined bundle instead of two, because both legs live in this one pool.
+    /// The pool the gateway charges fees from (`Perc20FeeGateway.feePool()`). Retained after the
+    /// boot-time gateway cross-check because a request targeting THIS pool is special in two ways:
+    ///   * it may pay with ONE combined bundle (same-asset mode — see `http_transfer_submit`);
+    ///   * if it still sends two, they must not reuse a nullifier, which we reject here rather
+    ///     than letting an RPC simulation reach `NullifierSpent()`.
     fee_pool: Option<String>,
     /// Default `SwapCoordinator` address for /swap/* routes (per-request override allowed).
     swap_coordinator: Option<String>,
@@ -1612,12 +1614,16 @@ async fn http_tx_status(
 /// Users who prefer not to pay simply submit their own transaction with `executor = 0`; that
 /// bundle is valid but consumes none of our gas, which is exactly the intended trade.
 ///
-/// Two shapes, decided by the pool — never by the caller's preference:
-///   * `contract != fee_pool` → two bundles, `transferWithFee(pool, opCall, feeCall)`;
-///   * `contract == fee_pool` → ONE combined bundle, `transferWithFee(pool, call, EMPTY)` —
-///     same entrypoint, empty fee call, which is the gateway's mode switch.
-/// The second exists because a same-asset transfer cannot be split: both legs would spend from
-/// the same pool, and a wallet holding one note has no second note to pay with.
+/// Two shapes, selected by whether `fee_bundle` is present:
+///   * with `fee_bundle` → two bundles, `transferWithFee(pool, opCall, feeCall)`;
+///   * without → ONE combined bundle, `transferWithFee(pool, call, EMPTY)` — same entrypoint,
+///     empty fee call, which is the gateway's mode switch. Allowed ONLY for `contract ==
+///     fee_pool`; anywhere else an absent fee bundle is a request for free sponsorship.
+///
+/// The combined shape exists because a same-asset transfer cannot always be split: both legs
+/// would spend from the same pool, and a wallet holding one note has no second note to pay with.
+/// A same-asset caller that DOES hold two confirmed notes may still send the two-bundle form —
+/// it is only rejected when the two legs name the same nullifier.
 async fn http_transfer_submit(
     State(cfg): State<Arc<RelayerHttpConfig>>,
     Json(req): Json<HttpTransferSubmitRequest>,
@@ -1631,12 +1637,27 @@ async fn http_transfer_submit(
     })?;
     let tx_hash = match req.fee_bundle.as_ref() {
         Some(fee_bundle) => {
+            // Two bundles against ONE pool can still be legitimate — a wallet holding two
+            // confirmed notes may prefer this shape — but only if they spend different notes.
+            // The gateway executes the fee leg first, so a shared nullifier is a deterministic
+            // same-transaction double spend; say so here instead of burning an RPC simulation
+            // on a `NullifierSpent()` revert.
+            if let Some(fee_pool) = cfg.fee_pool.as_deref() {
+                ensure_transfer_fee_nullifiers_disjoint(
+                    &contract,
+                    fee_pool,
+                    &req.bundle,
+                    fee_bundle,
+                )
+                .map_err(http_error)?;
+            }
             submit_transfer_with_fee(
                 &cfg.rpc_url,
                 cfg.chain_id,
                 &cfg.private_key,
                 &gateway,
                 &contract,
+                cfg.fee_pool.as_deref(),
                 &req.bundle,
                 fee_bundle,
                 cfg.gas_price_gwei,
@@ -3454,6 +3475,7 @@ async fn submit_transfer_with_fee(
     private_key: &str,
     gateway: &str,
     pool: &str,
+    fee_pool: Option<&str>,
     op_bundle: &OrchardStoredBundle,
     fee_bundle: &OrchardStoredBundle,
     gas_price_gwei: f64,
@@ -3463,6 +3485,9 @@ async fn submit_transfer_with_fee(
 ) -> Result<String> {
     // Both legs are subject to the frozen-root compliance gate, same as any other bundle.
     enforce_frozen_compliance(rpc_url, pool, op_bundle).await?;
+    if let Some(fee_pool) = fee_pool {
+        enforce_frozen_compliance(rpc_url, fee_pool, fee_bundle).await?;
+    }
 
     let pool_addr = parse_evm_address_hex(pool).map_err(|e| anyhow!("bad pool address: {e}"))?;
     let op_call = bundle_to_privacy_call(op_bundle)?;
@@ -3527,6 +3552,43 @@ async fn submit_transfer_with_fee_same_asset(
         nonce_cache,
     )
     .await
+}
+
+/// A Gateway call executes the fee bundle first and the operation bundle second. When the
+/// operation pool is also the fee pool, reusing any nullifier across those independent calls is
+/// a deterministic same-transaction double spend: the fee leg consumes it and the operation leg
+/// reverts `NullifierSpent()`. Reject that client error before proof simulation or nonce work.
+///
+/// This guards the TWO-bundle shape only. A same-asset caller that omits `fee_bundle` entirely
+/// takes the combined single-bundle path above, where there is only one spend and nothing to
+/// collide — that is the shape a single-note wallet has to use.
+fn ensure_transfer_fee_nullifiers_disjoint(
+    operation_pool: &str,
+    fee_pool: &str,
+    operation_bundle: &OrchardStoredBundle,
+    fee_bundle: &OrchardStoredBundle,
+) -> Result<()> {
+    if operation_pool != fee_pool {
+        return Ok(());
+    }
+
+    let operation_nullifiers: HashSet<[u8; 32]> = operation_bundle
+        .actions
+        .iter()
+        .map(|action| action.nullifier)
+        .collect();
+    if fee_bundle
+        .actions
+        .iter()
+        .any(|action| operation_nullifiers.contains(&action.nullifier))
+    {
+        return Err(anyhow!(
+            "operation and fee bundles reuse a nullifier in the same fee pool; \
+             resubmit as a single combined bundle (omit fee_bundle), use a separate confirmed \
+             fee note, or submit the transfer with self-paid gas"
+        ));
+    }
+    Ok(())
 }
 
 /// Submit `unshield()` on-chain using a pre-proven `OrchardStoredBundle`.
@@ -5273,6 +5335,81 @@ mod tests {
             binding_sig_bn254: None,
             value_balance_bn254: 0,
         }
+    }
+
+    /// The two same-pool fixes meet here. The disjointness guard covers the TWO-bundle shape;
+    /// the combined shape has one spend and must not be routed through it at all — otherwise the
+    /// single-note case (the whole reason the combined shape exists) would be rejected by the
+    /// very check meant to explain why it used to fail.
+    #[tokio::test]
+    async fn same_fee_pool_combined_bundle_skips_the_disjointness_guard() {
+        let app = build_router(test_state());
+        let fee_pool = "0x2222222222222222222222222222222222222222";
+
+        // Two bundles, same pool, SAME nullifier → rejected with the explanatory error.
+        let (st, err) = call(
+            &app,
+            "POST",
+            "/transfer/submit",
+            Some(serde_json::json!({
+                "contract": fee_pool,
+                "bundle": test_bundle(),
+                "fee_bundle": test_bundle(),
+            })),
+        )
+        .await;
+        assert_ne!(st, Sc::OK);
+        assert!(err.to_string().contains("reuse a nullifier"), "{err}");
+
+        // The same single bundle, submitted as the combined form, is NOT rejected for reuse —
+        // it gets as far as the (absent) RPC.
+        let (st, err) = call(
+            &app,
+            "POST",
+            "/transfer/submit",
+            Some(serde_json::json!({ "contract": fee_pool, "bundle": test_bundle() })),
+        )
+        .await;
+        assert_ne!(st, Sc::OK);
+        assert!(
+            !err.to_string().contains("reuse a nullifier"),
+            "the combined single-bundle path has one spend and nothing to collide with: {err}"
+        );
+    }
+
+    #[test]
+    fn same_fee_pool_rejects_cross_bundle_nullifier_reuse() {
+        let operation = test_bundle();
+        let fee = operation.clone();
+        let pool = "0x1111111111111111111111111111111111111111";
+
+        let err = ensure_transfer_fee_nullifiers_disjoint(pool, pool, &operation, &fee)
+            .unwrap_err();
+        assert!(err.to_string().contains("reuse a nullifier"), "{err}");
+    }
+
+    #[test]
+    fn same_fee_pool_accepts_disjoint_bundle_nullifiers() {
+        let operation = test_bundle();
+        let mut fee = test_bundle();
+        fee.actions[0].nullifier = [9u8; 32];
+        let pool = "0x1111111111111111111111111111111111111111";
+
+        ensure_transfer_fee_nullifiers_disjoint(pool, pool, &operation, &fee).unwrap();
+    }
+
+    #[test]
+    fn different_pools_may_use_the_same_nullifier_value() {
+        let operation = test_bundle();
+        let fee = operation.clone();
+
+        ensure_transfer_fee_nullifiers_disjoint(
+            "0x1111111111111111111111111111111111111111",
+            "0x2222222222222222222222222222222222222222",
+            &operation,
+            &fee,
+        )
+        .unwrap();
     }
 
     #[test]
