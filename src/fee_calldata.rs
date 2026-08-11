@@ -127,6 +127,34 @@ pub fn encode_transfer_with_fee_calldata(
     with_selector(transfer_with_fee_selector(), encode(&tokens))
 }
 
+/// `Perc20FeeGateway.transferWithFee(pool, combinedCall, EMPTY)` — the same-asset form, used
+/// when the transferred asset IS the fee asset.
+///
+/// The single bundle both moves the notes and unshields the fee, which is what lets a wallet
+/// with one note pay for its own transfer; two bundles in one pool would have to spend that
+/// note twice and revert on the duplicate nullifier.
+///
+/// The empty fee call must be an EMPTY `bytes`, which is why this does not go through
+/// `privacy_call_token` with an empty action list: that encodes `BundleAction[](0)` as 64 bytes
+/// (offset + zero length), and the gateway tests `feeCall.actions.length == 0`. A 64-byte
+/// "empty" would silently take the two-bundle branch and be rejected by the pool as an empty
+/// bundle — fail-closed, but for a reason nobody would find quickly.
+pub fn encode_transfer_with_fee_same_asset_calldata(
+    pool: &[u8; 20],
+    combined_call: &PrivacyCallArgs,
+) -> Vec<u8> {
+    let empty_call = Token::Tuple(vec![
+        Token::Bytes(Vec::new()),
+        Token::FixedArray(vec![Token::Uint(Uint::zero()); 8]),
+    ]);
+    let tokens = vec![
+        Token::Address(ethabi::Address::from(*pool)),
+        privacy_call_token(combined_call),
+        empty_call,
+    ];
+    with_selector(transfer_with_fee_selector(), encode(&tokens))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,5 +206,29 @@ mod tests {
         assert_ne!(off_op, off_fee);
         // the fee leg's distinguishing binding word must appear in the payload
         assert!(cd.windows(32).any(|w| w == [0xABu8; 32]));
+    }
+
+    /// The same-asset form rides the SAME selector; the mode switch is the empty `actions`.
+    /// Asserting the emptiness is the point: an `actions` of 64 bytes (an ABI-encoded empty
+    /// array) reads as the two-bundle form and the gateway would route it the other way.
+    #[test]
+    fn same_asset_reuses_transfer_with_fee_with_an_empty_fee_call() {
+        let mut call = empty_call();
+        call.binding_proof[0] = [0xCD; 32];
+        let cd = encode_transfer_with_fee_same_asset_calldata(&[0x55; 20], &call);
+        assert_eq!(&cd[..4], &transfer_with_fee_selector());
+        let body = &cd[4..];
+        assert_eq!(&body[12..32], &[0x55u8; 20]);
+        assert!(cd.windows(32).any(|w| w == [0xCDu8; 32]));
+
+        // Walk to the fee tuple and read its `actions` length: it must be exactly 0.
+        let off_fee = Uint::from_big_endian(&body[64..96]).as_usize();
+        let fee_tuple = &body[off_fee..];
+        let off_actions = Uint::from_big_endian(&fee_tuple[0..32]).as_usize();
+        assert_eq!(
+            Uint::from_big_endian(&fee_tuple[off_actions..off_actions + 32]),
+            Uint::zero(),
+            "the fee call's actions must be EMPTY bytes — that is the same-asset mode switch",
+        );
     }
 }

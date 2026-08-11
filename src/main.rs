@@ -30,7 +30,10 @@ use privacy_core::ethereum::{
 };
 // The fee release changed `unshield`'s ABI and added the gateway; privacy-core is pinned to a
 // rev that predates both, so those two calls are encoded locally (see `fee_calldata`).
-use fee_calldata::{encode_transfer_with_fee_calldata, encode_unshield_v2_calldata};
+use fee_calldata::{
+    encode_transfer_with_fee_calldata, encode_transfer_with_fee_same_asset_calldata,
+    encode_unshield_v2_calldata,
+};
 use reqwest::Client;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
@@ -427,6 +430,10 @@ struct RelayerHttpConfig {
     /// straight to a pool — that is what makes the protocol fee unavoidable on the sponsored
     /// path (docs/tx_fee_impl.md §4). Required whenever transfer sponsorship is enabled.
     fee_gateway: Option<String>,
+    /// The pool the gateway charges fees from (`Perc20FeeGateway.feePool()`). Needed to decide
+    /// whether a sponsored transfer is SAME-ASSET — a transfer of the fee asset itself pays with
+    /// one combined bundle instead of two, because both legs live in this one pool.
+    fee_pool: Option<String>,
     /// Default `SwapCoordinator` address for /swap/* routes (per-request override allowed).
     swap_coordinator: Option<String>,
     /// Gas limit for `settle` (heaviest swap call).
@@ -1230,6 +1237,7 @@ async fn run_http_server(
         gas_limit_transfer,
         gas_limit_margin_bps,
         fee_gateway,
+        fee_pool,
         swap_coordinator,
         gas_limit_swap,
         auto_shield,
@@ -1556,10 +1564,17 @@ struct HttpTransferSubmitRequest {
     bundle: OrchardStoredBundle,
     /// Pool contract address (0x-prefixed 20 bytes). Required — works for both BTC and ERC pools.
     contract: String,
-    /// pUSDC unshield bundle paying the protocol fee. REQUIRED: sponsoring a transfer costs us
-    /// gas, and this is what pays for it. Its amount/recipient/context are supplied by the
-    /// gateway on-chain, so a wrong bundle fails verification rather than under-paying.
-    fee_bundle: OrchardStoredBundle,
+    /// pUSDC unshield bundle paying the protocol fee. Its amount/recipient/context are supplied
+    /// by the gateway on-chain, so a wrong bundle fails verification rather than under-paying.
+    ///
+    /// Omitted ONLY for a same-asset transfer — one where `contract` is the fee pool itself.
+    /// There `bundle` is a COMBINED bundle that both moves the notes and unshields the fee, and
+    /// a second bundle is not merely redundant but impossible: two spends in one pool cannot
+    /// draw on the same note, and a single-note wallet has nothing else to offer. Any other
+    /// pool without a `fee_bundle` is rejected — that is what keeps sponsorship paid for
+    /// (docs/tx_fee_impl.md §4, R-3).
+    #[serde(default)]
+    fee_bundle: Option<OrchardStoredBundle>,
 }
 
 /// GET /tx/status?hash=0x...
@@ -1596,6 +1611,13 @@ async fn http_tx_status(
 ///
 /// Users who prefer not to pay simply submit their own transaction with `executor = 0`; that
 /// bundle is valid but consumes none of our gas, which is exactly the intended trade.
+///
+/// Two shapes, decided by the pool — never by the caller's preference:
+///   * `contract != fee_pool` → two bundles, `transferWithFee(pool, opCall, feeCall)`;
+///   * `contract == fee_pool` → ONE combined bundle, `transferWithFee(pool, call, EMPTY)` —
+///     same entrypoint, empty fee call, which is the gateway's mode switch.
+/// The second exists because a same-asset transfer cannot be split: both legs would spend from
+/// the same pool, and a wallet holding one note has no second note to pay with.
 async fn http_transfer_submit(
     State(cfg): State<Arc<RelayerHttpConfig>>,
     Json(req): Json<HttpTransferSubmitRequest>,
@@ -1607,20 +1629,55 @@ async fn http_transfer_submit(
              (set PRIVACYBTC_FEE_GATEWAY_ADDRESS)"
         ))
     })?;
-    let tx_hash = submit_transfer_with_fee(
-        &cfg.rpc_url,
-        cfg.chain_id,
-        &cfg.private_key,
-        &gateway,
-        &contract,
-        &req.bundle,
-        &req.fee_bundle,
-        cfg.gas_price_gwei,
-        cfg.gas_limit_transfer,
-        cfg.gas_limit_margin_bps,
-        &cfg.nonce_cache,
-    )
-    .await
+    let tx_hash = match req.fee_bundle.as_ref() {
+        Some(fee_bundle) => {
+            submit_transfer_with_fee(
+                &cfg.rpc_url,
+                cfg.chain_id,
+                &cfg.private_key,
+                &gateway,
+                &contract,
+                &req.bundle,
+                fee_bundle,
+                cfg.gas_price_gwei,
+                cfg.gas_limit_transfer,
+                cfg.gas_limit_margin_bps,
+                &cfg.nonce_cache,
+            )
+            .await
+        }
+        None => {
+            // Fail closed on anything that is not provably a same-asset transfer. A missing
+            // `fee_bundle` for some other pool is a fee-free sponsorship request, which is the
+            // exact thing this handler exists to refuse; an unconfigured `fee_pool` means we
+            // cannot tell the two apart, so we refuse that too rather than guess.
+            let fee_pool = cfg.fee_pool.clone().ok_or_else(|| {
+                http_error(anyhow!(
+                    "fee_bundle is required: the same-asset single-bundle path needs \
+                     PRIVACYBTC_FEE_POOL_ADDRESS configured to be recognised"
+                ))
+            })?;
+            if contract != fee_pool {
+                return Err(http_error(anyhow!(
+                    "fee_bundle is required for pool {contract}: only transfers of the fee \
+                     asset itself ({fee_pool}) pay with a single combined bundle"
+                )));
+            }
+            submit_transfer_with_fee_same_asset(
+                &cfg.rpc_url,
+                cfg.chain_id,
+                &cfg.private_key,
+                &gateway,
+                &contract,
+                &req.bundle,
+                cfg.gas_price_gwei,
+                cfg.gas_limit_transfer,
+                cfg.gas_limit_margin_bps,
+                &cfg.nonce_cache,
+            )
+            .await
+        }
+    }
     .map_err(http_error)?;
     tokio::spawn(notify_pending_tx(cfg.indexer_url.clone(), tx_hash.clone(), contract));
     Ok(Json(HttpTxResponse { tx_hash }))
@@ -3428,6 +3485,50 @@ async fn submit_transfer_with_fee(
     .await
 }
 
+/// Submit the SAME-ASSET form of `transferWithFee`: one combined bundle plus an empty fee call.
+///
+/// Used when the transferred asset IS the fee asset, where the two-bundle form cannot work: both
+/// legs would spend from this same pool, so a wallet whose balance sits in one note would have to
+/// name that note twice and the transaction would revert on the duplicate nullifier. The combined
+/// bundle instead carries the recipient's note, the sender's change, and a `valueBalance` equal to
+/// the protocol fee.
+///
+/// Same entrypoint, same selector as the two-bundle form — the gateway branches on the empty fee
+/// call. It still rejects the pairing unless `pool` is its own `feePool`.
+#[allow(clippy::too_many_arguments)]
+async fn submit_transfer_with_fee_same_asset(
+    rpc_url: &str,
+    chain_id: u64,
+    private_key: &str,
+    gateway: &str,
+    pool: &str,
+    bundle: &OrchardStoredBundle,
+    gas_price_gwei: f64,
+    gas_limit_cap: u64,
+    gas_limit_margin_bps: u64,
+    nonce_cache: &Arc<Mutex<Option<u64>>>,
+) -> Result<String> {
+    enforce_frozen_compliance(rpc_url, pool, bundle).await?;
+
+    let pool_addr = parse_evm_address_hex(pool).map_err(|e| anyhow!("bad pool address: {e}"))?;
+    let call = bundle_to_privacy_call(bundle)?;
+    let calldata = encode_transfer_with_fee_same_asset_calldata(&pool_addr, &call);
+
+    send_raw_calldata(
+        rpc_url,
+        chain_id,
+        private_key,
+        gateway,
+        calldata,
+        0,
+        gas_price_gwei,
+        gas_limit_cap,
+        gas_limit_margin_bps,
+        nonce_cache,
+    )
+    .await
+}
+
 /// Submit `unshield()` on-chain using a pre-proven `OrchardStoredBundle`.
 ///
 /// The bundle must contain per-action proofs/publics and `binding_proof_bn254`.
@@ -4503,6 +4604,9 @@ mod tests {
             gas_limit_transfer: 5_000_000,
             gas_limit_margin_bps: DEFAULT_GAS_MARGIN_BPS,
             fee_gateway: Some("0x00000000000000000000000000000000000000bb".into()),
+            // Deliberately one of the `protocol_pools` below: the same-asset transfer path is
+            // reached only for the fee pool, so it has to be a pool the relayer serves.
+            fee_pool: Some("0x2222222222222222222222222222222222222222".into()),
             swap_coordinator: Some("0xc".into()),
             gas_limit_swap: 12_000_000,
             auto_shield: None,
@@ -4770,6 +4874,45 @@ mod tests {
             .collect();
         assert_eq!(methods, vec!["eth_estimateGas"]);
         server.abort();
+    }
+
+    /// R-3 with its same-asset carve-out. Omitting `fee_bundle` is how a caller would ask for
+    /// free sponsorship, so it is refused — EXCEPT for the fee pool itself, where the single
+    /// bundle in `bundle` already carries the fee and a second one is impossible to build.
+    #[tokio::test]
+    async fn transfer_submit_requires_fee_bundle_unless_pool_is_the_fee_pool() {
+        let app = build_router(test_state());
+        let body = |pool: &str| {
+            serde_json::json!({ "contract": pool, "bundle": test_bundle() })
+        };
+
+        let (st, err) = call(
+            &app,
+            "POST",
+            "/transfer/submit",
+            Some(body("0x1111111111111111111111111111111111111111")),
+        )
+        .await;
+        assert_ne!(st, Sc::OK);
+        assert!(
+            err.to_string().contains("fee_bundle is required"),
+            "a non-fee pool must not be sponsored without a fee bundle: {err}"
+        );
+
+        // The fee pool takes the combined path instead; it gets as far as the (absent) RPC,
+        // which is a different failure entirely.
+        let (st, err) = call(
+            &app,
+            "POST",
+            "/transfer/submit",
+            Some(body("0x2222222222222222222222222222222222222222")),
+        )
+        .await;
+        assert_ne!(st, Sc::OK);
+        assert!(
+            !err.to_string().contains("fee_bundle is required"),
+            "the fee pool's own transfers must reach the combined path: {err}"
+        );
     }
 
     #[tokio::test]
