@@ -6,10 +6,11 @@
 
 mod fee_calldata;
 mod screening;
+mod tx_queue;
 
 use anyhow::{anyhow, Context, Result};
 use axum::{
-    extract::{ConnectInfo, Query, State},
+    extract::{ConnectInfo, Path as AxumPath, Query, State},
     http::{HeaderMap, StatusCode},
     routing::get,
     routing::post,
@@ -46,13 +47,23 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify, Semaphore};
 use tower_http::cors::CorsLayer;
 use url::Url;
+
+use tx_queue::{
+    EnqueueError, NewTxRequest, PendingJob, TxQueue, TxRequestView, STATUS_CONFIRMED,
+    STATUS_REVERTED,
+};
 
 const GAS_BPS_DENOMINATOR: u64 = 10_000;
 const DEFAULT_GAS_MARGIN_BPS: u64 = 200;
 const MAX_GAS_MARGIN_BPS: u64 = 1_000;
+
+/// Serializes every EVM submission made by the HTTP server. The durable typed queue uses the
+/// same lane as the retained legacy handlers, so an accidental legacy request cannot race the
+/// queue between nonce allocation and broadcast inside this process.
+static EVM_SIGNER_LANE: Mutex<()> = Mutex::const_new(());
 
 #[derive(Parser)]
 #[command(name = "privacybtc-relayer", version, about = "Federation shield relay + BTC watch (V1)")]
@@ -416,6 +427,91 @@ fn gas_limit_with_margin(estimated: u64, margin_bps: u64, cap: u64) -> Result<u6
 }
 
 #[derive(Clone)]
+struct TxQueueRuntimeConfig {
+    max_inflight: u64,
+    max_prepare_attempts: u32,
+    receipt_batch_size: usize,
+    receipt_poll_ms: u64,
+    replacement_after_secs: u64,
+    max_replacements: u32,
+    worker_lease_secs: u64,
+}
+
+impl TxQueueRuntimeConfig {
+    fn from_env(queue_capacity: usize) -> Result<Self> {
+        let max_prepare_attempts = positive_env_u64(
+            "PRIVACYBTC_TX_QUEUE_MAX_PREPARE_ATTEMPTS",
+            5,
+        )?;
+        let receipt_batch_size = positive_env_u64(
+            "PRIVACYBTC_TX_QUEUE_RECEIPT_BATCH_SIZE",
+            100,
+        )?;
+        let max_replacements = positive_env_u64(
+            "PRIVACYBTC_TX_QUEUE_MAX_REPLACEMENTS",
+            3,
+        )?;
+        let cfg = Self {
+            max_inflight: positive_env_u64("PRIVACYBTC_TX_QUEUE_MAX_INFLIGHT", 64)?,
+            max_prepare_attempts: u32::try_from(max_prepare_attempts)
+                .context("PRIVACYBTC_TX_QUEUE_MAX_PREPARE_ATTEMPTS exceeds u32")?,
+            receipt_batch_size: usize::try_from(receipt_batch_size)
+                .context("PRIVACYBTC_TX_QUEUE_RECEIPT_BATCH_SIZE exceeds usize")?,
+            receipt_poll_ms: positive_env_u64(
+                "PRIVACYBTC_TX_QUEUE_RECEIPT_POLL_MS",
+                3_000,
+            )?,
+            replacement_after_secs: positive_env_u64(
+                "PRIVACYBTC_TX_QUEUE_REPLACEMENT_AFTER_SECS",
+                120,
+            )?,
+            max_replacements: u32::try_from(max_replacements)
+                .context("PRIVACYBTC_TX_QUEUE_MAX_REPLACEMENTS exceeds u32")?,
+            worker_lease_secs: positive_env_u64(
+                "PRIVACYBTC_TX_QUEUE_WORKER_LEASE_SECS",
+                60,
+            )?,
+        };
+        if cfg.max_inflight > queue_capacity as u64 || cfg.max_inflight > 1_024 {
+            return Err(anyhow!(
+                "PRIVACYBTC_TX_QUEUE_MAX_INFLIGHT must be <= queue capacity and <= 1024"
+            ));
+        }
+        if cfg.max_prepare_attempts > 20 {
+            return Err(anyhow!(
+                "PRIVACYBTC_TX_QUEUE_MAX_PREPARE_ATTEMPTS must be <= 20"
+            ));
+        }
+        if cfg.receipt_batch_size > 1_000 {
+            return Err(anyhow!(
+                "PRIVACYBTC_TX_QUEUE_RECEIPT_BATCH_SIZE must be <= 1000"
+            ));
+        }
+        if !(250..=60_000).contains(&cfg.receipt_poll_ms) {
+            return Err(anyhow!(
+                "PRIVACYBTC_TX_QUEUE_RECEIPT_POLL_MS must be in 250..=60000"
+            ));
+        }
+        if !(30..=3_600).contains(&cfg.replacement_after_secs) {
+            return Err(anyhow!(
+                "PRIVACYBTC_TX_QUEUE_REPLACEMENT_AFTER_SECS must be in 30..=3600"
+            ));
+        }
+        if cfg.max_replacements > 10 {
+            return Err(anyhow!(
+                "PRIVACYBTC_TX_QUEUE_MAX_REPLACEMENTS must be <= 10"
+            ));
+        }
+        if !(30..=300).contains(&cfg.worker_lease_secs) {
+            return Err(anyhow!(
+                "PRIVACYBTC_TX_QUEUE_WORKER_LEASE_SECS must be in 30..=300"
+            ));
+        }
+        Ok(cfg)
+    }
+}
+
+#[derive(Clone)]
 struct RelayerHttpConfig {
     rpc_url: String,
     chain_id: u64,
@@ -455,6 +551,16 @@ struct RelayerHttpConfig {
     /// In-process nonce counter. Initialized from chain on first use, then incremented
     /// locally so concurrent / back-to-back requests never reuse the same nonce.
     nonce_cache: Arc<Mutex<Option<u64>>>,
+    /// Durable SQLite WAL queue used by the supported gas-sponsored typed endpoints.
+    tx_queue: Arc<TxQueue>,
+    tx_queue_runtime: TxQueueRuntimeConfig,
+    tx_queue_notify: Arc<Notify>,
+    /// Bounds RPC-heavy frozen-root/screening validation before a request reaches the queue.
+    tx_validation_slots: Arc<Semaphore>,
+    /// Rolling request/gas budget for `/transfer/submit` and `/wrapped/unshield/submit`.
+    tx_queue_limiter: Arc<Mutex<SubmitRawLimiter>>,
+    tx_queue_trusted_proxy_ips: HashSet<IpAddr>,
+    http_body_limit_bytes: usize,
     /// Layer 1 sanctions screening (off by default; configured via `SCREENING_*` env).
     screening: Arc<screening::ScreeningConfig>,
     /// LP swap order book (offers + orders). Persisted when `swap_book_path` is configured.
@@ -815,14 +921,20 @@ struct SubmitRawLimiter {
     cfg: SubmitRawLimitConfig,
     global: SubmitRawUsage,
     clients: HashMap<String, SubmitRawUsage>,
+    scope: &'static str,
 }
 
 impl SubmitRawLimiter {
     fn new(cfg: SubmitRawLimitConfig) -> Self {
+        Self::new_scoped(cfg, "submit_raw")
+    }
+
+    fn new_scoped(cfg: SubmitRawLimitConfig, scope: &'static str) -> Self {
         Self {
             cfg,
             global: SubmitRawUsage::default(),
             clients: HashMap::new(),
+            scope,
         }
     }
 
@@ -837,12 +949,12 @@ impl SubmitRawLimiter {
         if self.global.entries.len() as u64 >= self.cfg.global_max_requests
             || self.global.gas.saturating_add(reserved_gas) > self.cfg.global_max_gas
         {
-            return Err(anyhow!("submit_raw global rolling budget exhausted"));
+            return Err(anyhow!("{} global rolling budget exhausted", self.scope));
         }
         if client.entries.len() as u64 >= self.cfg.client_max_requests
             || client.gas.saturating_add(reserved_gas) > self.cfg.client_max_gas
         {
-            return Err(anyhow!("submit_raw client rolling budget exhausted"));
+            return Err(anyhow!("{} client rolling budget exhausted", self.scope));
         }
         self.global.entries.push_back((now, reserved_gas));
         self.global.gas = self.global.gas.saturating_add(reserved_gas);
@@ -858,6 +970,63 @@ impl SubmitRawLimiter {
             .as_secs();
         self.reserve_at(client_id, reserved_gas, now)
     }
+}
+
+fn positive_env_u64(name: &str, default: u64) -> Result<u64> {
+    let value = std::env::var(name)
+        .ok()
+        .filter(|raw| !raw.trim().is_empty())
+        .map(|raw| {
+            raw.parse::<u64>()
+                .with_context(|| format!("{name} must be a positive u64"))
+        })
+        .transpose()?
+        .unwrap_or(default);
+    if value == 0 {
+        return Err(anyhow!("{name} must be > 0"));
+    }
+    Ok(value)
+}
+
+fn tx_queue_limit_config_from_env() -> Result<SubmitRawLimitConfig> {
+    let cfg = SubmitRawLimitConfig {
+        window_secs: positive_env_u64("PRIVACYBTC_TX_QUEUE_WINDOW_SECS", 60)?,
+        global_max_requests: positive_env_u64(
+            "PRIVACYBTC_TX_QUEUE_GLOBAL_REQUESTS_PER_WINDOW",
+            600,
+        )?,
+        client_max_requests: positive_env_u64(
+            "PRIVACYBTC_TX_QUEUE_CLIENT_REQUESTS_PER_WINDOW",
+            600,
+        )?,
+        global_max_gas: positive_env_u64(
+            "PRIVACYBTC_TX_QUEUE_GLOBAL_GAS_PER_WINDOW",
+            7_200_000_000,
+        )?,
+        client_max_gas: positive_env_u64(
+            "PRIVACYBTC_TX_QUEUE_CLIENT_GAS_PER_WINDOW",
+            7_200_000_000,
+        )?,
+    };
+    if cfg.client_max_requests > cfg.global_max_requests {
+        return Err(anyhow!(
+            "PRIVACYBTC_TX_QUEUE_CLIENT_REQUESTS_PER_WINDOW cannot exceed global limit"
+        ));
+    }
+    if cfg.client_max_gas > cfg.global_max_gas {
+        return Err(anyhow!(
+            "PRIVACYBTC_TX_QUEUE_CLIENT_GAS_PER_WINDOW cannot exceed global limit"
+        ));
+    }
+    if cfg.window_secs > 86_400
+        || cfg.global_max_requests > 1_000_000
+        || cfg.global_max_gas > 100_000_000_000_000
+    {
+        return Err(anyhow!(
+            "typed transaction queue rate budget exceeds the runtime safety ceiling"
+        ));
+    }
+    Ok(cfg)
 }
 
 fn parse_bool_env(name: &str, default: bool) -> Result<bool> {
@@ -1228,6 +1397,66 @@ async fn run_http_server(
         .filter(|token| !token.trim().is_empty());
     let swap_book_path = swap_book_path_from_env();
     let swap_book = load_swap_book(swap_book_path.as_deref())?;
+    let signing_key = parse_hex_key(private_key).context("parse relayer signer for tx queue")?;
+    let signer = format!(
+        "0x{}",
+        hex::encode(eth_address_from_signing_key(&signing_key))
+    );
+    let tx_queue_path = PathBuf::from(
+        std::env::var("PRIVACYBTC_TX_QUEUE_PATH")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "/data/relayer-tx-queue.sqlite".to_string()),
+    );
+    let tx_queue_capacity = usize::try_from(positive_env_u64(
+        "PRIVACYBTC_TX_QUEUE_CAPACITY",
+        10_000,
+    )?)
+    .context("PRIVACYBTC_TX_QUEUE_CAPACITY exceeds usize")?;
+    let tx_queue = Arc::new(TxQueue::open(
+        &tx_queue_path,
+        tx_queue_capacity,
+        chain_id,
+        &signer,
+    )?);
+    let tx_queue_runtime = TxQueueRuntimeConfig::from_env(tx_queue_capacity)?;
+    let tx_validation_slots = usize::try_from(positive_env_u64(
+        "PRIVACYBTC_TX_QUEUE_VALIDATION_CONCURRENCY",
+        16,
+    )?)
+    .context("PRIVACYBTC_TX_QUEUE_VALIDATION_CONCURRENCY exceeds usize")?;
+    if tx_validation_slots > 128 {
+        return Err(anyhow!(
+            "PRIVACYBTC_TX_QUEUE_VALIDATION_CONCURRENCY must be <= 128"
+        ));
+    }
+    let tx_queue_limit_cfg = tx_queue_limit_config_from_env()?;
+    let tx_queue_trust_proxy_headers =
+        parse_bool_env("PRIVACYBTC_TX_QUEUE_TRUST_PROXY_HEADERS", false)?;
+    let tx_queue_trusted_proxy_ips = parse_trusted_proxy_ips(
+        &std::env::var("PRIVACYBTC_TX_QUEUE_TRUSTED_PROXY_IPS").unwrap_or_default(),
+    )?;
+    if tx_queue_trust_proxy_headers && tx_queue_trusted_proxy_ips.is_empty() {
+        return Err(anyhow!(
+            "PRIVACYBTC_TX_QUEUE_TRUST_PROXY_HEADERS=true requires \
+             PRIVACYBTC_TX_QUEUE_TRUSTED_PROXY_IPS"
+        ));
+    }
+    let tx_queue_trusted_proxy_ips = if tx_queue_trust_proxy_headers {
+        tx_queue_trusted_proxy_ips
+    } else {
+        HashSet::new()
+    };
+    let http_body_limit_bytes = usize::try_from(positive_env_u64(
+        "PRIVACYBTC_HTTP_BODY_LIMIT_BYTES",
+        2 * 1024 * 1024,
+    )?)
+    .context("PRIVACYBTC_HTTP_BODY_LIMIT_BYTES exceeds usize")?;
+    if !(65_536..=16 * 1024 * 1024).contains(&http_body_limit_bytes) {
+        return Err(anyhow!(
+            "PRIVACYBTC_HTTP_BODY_LIMIT_BYTES must be in 65536..=16777216"
+        ));
+    }
     let state = Arc::new(RelayerHttpConfig {
         rpc_url: rpc_url.to_string(),
         chain_id,
@@ -1249,6 +1478,16 @@ async fn run_http_server(
         btc_payout_evm_confirmations,
         indexer_url,
         nonce_cache: Arc::new(Mutex::new(None)),
+        tx_queue,
+        tx_queue_runtime,
+        tx_queue_notify: Arc::new(Notify::new()),
+        tx_validation_slots: Arc::new(Semaphore::new(tx_validation_slots)),
+        tx_queue_limiter: Arc::new(Mutex::new(SubmitRawLimiter::new_scoped(
+            tx_queue_limit_cfg,
+            "typed transaction queue",
+        ))),
+        tx_queue_trusted_proxy_ips,
+        http_body_limit_bytes,
         screening: Arc::new(screening::ScreeningConfig::from_env()),
         swap_book: Arc::new(Mutex::new(swap_book)),
         swap_book_path,
@@ -1262,25 +1501,32 @@ async fn run_http_server(
         expected_protocol_version: protocol.version,
         expected_verifier_set_id: protocol.verifier_set_id,
     });
-    let app = build_router(state);
+    let app = build_router(state.clone());
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .with_context(|| format!("bind {bind}"))?;
     println!("relayer http listening on {bind}");
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await?;
+    tokio::select! {
+        result = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        ) => result.context("relayer HTTP server stopped")?,
+        result = tx_queue_worker(state) => {
+            result.context("durable transaction queue worker stopped")?;
+            return Err(anyhow!("durable transaction queue worker exited unexpectedly"));
+        }
+    }
     Ok(())
 }
 
 /// Build the relayer's axum router with all routes wired to `state`. Split out of `run_http`
 /// so integration tests can drive the HTTP surface (notably the LP order book) in-process.
 fn build_router(state: Arc<RelayerHttpConfig>) -> Router {
+    let body_limit = state.http_body_limit_bytes;
     Router::new()
         .route("/healthz", get(http_health))
         .route("/tx/status", get(http_tx_status))
+        .route("/tx/requests/:request_id", get(http_tx_request))
         .route("/shield/address", get(http_shield_address))
         .route("/shield/check", get(http_shield_check))
         .route("/shield/submit", post(http_shield_submit))
@@ -1302,19 +1548,36 @@ fn build_router(state: Arc<RelayerHttpConfig>) -> Router {
         .route("/swap/accept", post(http_swap_accept))
         .route("/swap/requests", get(http_swap_requests))
         .route("/swap/order", get(http_swap_order))
+        .layer(axum::extract::DefaultBodyLimit::max(body_limit))
         .layer(build_cors_layer())
         .with_state(state)
 }
 
 async fn http_health(
     State(cfg): State<Arc<RelayerHttpConfig>>,
-) -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "ok": true,
-        "protocol_version": cfg.expected_protocol_version,
-        "verifier_set_id": format!("0x{}", hex::encode(cfg.expected_verifier_set_id)),
-        "protocol_pool_count": cfg.protocol_pools.len(),
-    }))
+) -> (StatusCode, Json<serde_json::Value>) {
+    match cfg.tx_queue.stats() {
+        Ok(queue) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "protocol_version": cfg.expected_protocol_version,
+                "verifier_set_id": format!("0x{}", hex::encode(cfg.expected_verifier_set_id)),
+                "protocol_pool_count": cfg.protocol_pools.len(),
+                "tx_queue": queue,
+            })),
+        ),
+        Err(error) => {
+            eprintln!("[tx-queue] health check failed: {error:#}");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": "transaction queue unavailable",
+                })),
+            )
+        }
+    }
 }
 
 /// Return the configured BTC deposit address so the frontend can send BTC before proving.
@@ -1603,12 +1866,92 @@ async fn http_tx_status(
     }
 }
 
+async fn http_tx_request(
+    State(cfg): State<Arc<RelayerHttpConfig>>,
+    AxumPath(request_id): AxumPath<String>,
+) -> Result<Json<TxRequestView>, (StatusCode, Json<HttpErrorResponse>)> {
+    match cfg.tx_queue.request(&request_id).map_err(http_error)? {
+        Some(request) => Ok(Json(request)),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(HttpErrorResponse {
+                error: format!("transaction request not found: {request_id}"),
+                code: Some("TX_REQUEST_NOT_FOUND".to_string()),
+            }),
+        )),
+    }
+}
+
+fn http_queue_error(error: EnqueueError) -> (StatusCode, Json<HttpErrorResponse>) {
+    let (status, code) = match error {
+        EnqueueError::Full { .. } => (StatusCode::TOO_MANY_REQUESTS, "TX_QUEUE_FULL"),
+        EnqueueError::NullifierReserved { .. } => {
+            (StatusCode::CONFLICT, "NULLIFIER_RESERVED")
+        }
+        EnqueueError::Storage(_) => (StatusCode::INTERNAL_SERVER_ERROR, "TX_QUEUE_STORAGE"),
+    };
+    (status, Json(HttpErrorResponse {
+        error: error.to_string(),
+        code: Some(code.to_string()),
+    }))
+}
+
+async fn reserve_typed_request_budget(
+    cfg: &RelayerHttpConfig,
+    headers: &HeaderMap,
+    peer: Option<SocketAddr>,
+    reserved_gas: u64,
+) -> Result<(), (StatusCode, Json<HttpErrorResponse>)> {
+    let client_id = submit_raw_client_id(headers, peer, &cfg.tx_queue_trusted_proxy_ips);
+    cfg.tx_queue_limiter
+        .lock()
+        .await
+        .reserve_now(&client_id, reserved_gas)
+        .map_err(http_rate_limited)
+}
+
+fn queue_nullifiers(
+    pool: &str,
+    bundle: &OrchardStoredBundle,
+) -> Vec<(String, [u8; 32])> {
+    bundle
+        .actions
+        .iter()
+        .map(|action| action.nullifier)
+        .filter(|nullifier| *nullifier != [0u8; 32])
+        .map(|nullifier| (pool.to_string(), nullifier))
+        .collect()
+}
+
+fn enqueue_typed_transaction(
+    cfg: &RelayerHttpConfig,
+    kind: &str,
+    target: String,
+    calldata: Vec<u8>,
+    gas_cap: u64,
+    nullifiers: Vec<(String, [u8; 32])>,
+) -> Result<(StatusCode, Json<TxRequestView>), (StatusCode, Json<HttpErrorResponse>)> {
+    let request = cfg
+        .tx_queue
+        .enqueue(NewTxRequest {
+            kind: kind.to_string(),
+            target,
+            value: 0,
+            calldata,
+            gas_cap,
+            gas_margin_bps: cfg.gas_limit_margin_bps,
+            nullifiers,
+        })
+        .map_err(http_queue_error)?;
+    cfg.tx_queue_notify.notify_one();
+    Ok((StatusCode::ACCEPTED, Json(request)))
+}
+
 /// Sponsored private transfer. ALWAYS routed through `Perc20FeeGateway` — never straight to the
 /// pool — because the gateway is what collects the protocol fee.
 ///
-/// This handler is one of the two places that make the fee unavoidable on the sponsored path.
-/// The other is the `/submit_raw` policy table, which must NOT contain a (pool, `transfer`)
-/// pair; otherwise a caller could sponsor a fee-free transfer through that route instead
+/// Production keeps `/submit_raw` fail-closed. Its defensive policy validation also rejects any
+/// direct pool-transfer pair, so this typed Gateway path is the only supported sponsorship route
 /// (docs/tx_fee_impl.md §4, R-5).
 ///
 /// Users who prefer not to pay simply submit their own transaction with `executor = 0`; that
@@ -1626,8 +1969,22 @@ async fn http_tx_status(
 /// it is only rejected when the two legs name the same nullifier.
 async fn http_transfer_submit(
     State(cfg): State<Arc<RelayerHttpConfig>>,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
     Json(req): Json<HttpTransferSubmitRequest>,
-) -> Result<Json<HttpTxResponse>, (StatusCode, Json<HttpErrorResponse>)> {
+) -> Result<(StatusCode, Json<TxRequestView>), (StatusCode, Json<HttpErrorResponse>)> {
+    reserve_typed_request_budget(
+        &cfg,
+        &headers,
+        peer.map(|ConnectInfo(address)| address),
+        cfg.gas_limit_transfer,
+    )
+    .await?;
+    let _validation_permit = cfg
+        .tx_validation_slots
+        .acquire()
+        .await
+        .map_err(|_| http_error(anyhow!("transaction validation pool is closed")))?;
     let contract = cfg.ensure_protocol_pool(&req.contract).map_err(http_error)?;
     let gateway = cfg.fee_gateway.clone().ok_or_else(|| {
         http_error(anyhow!(
@@ -1635,37 +1992,42 @@ async fn http_transfer_submit(
              (set PRIVACYBTC_FEE_GATEWAY_ADDRESS)"
         ))
     })?;
-    let tx_hash = match req.fee_bundle.as_ref() {
+    let (calldata, nullifiers) = match req.fee_bundle.as_ref() {
         Some(fee_bundle) => {
             // Two bundles against ONE pool can still be legitimate — a wallet holding two
             // confirmed notes may prefer this shape — but only if they spend different notes.
             // The gateway executes the fee leg first, so a shared nullifier is a deterministic
             // same-transaction double spend; say so here instead of burning an RPC simulation
             // on a `NullifierSpent()` revert.
-            if let Some(fee_pool) = cfg.fee_pool.as_deref() {
-                ensure_transfer_fee_nullifiers_disjoint(
-                    &contract,
-                    fee_pool,
-                    &req.bundle,
-                    fee_bundle,
-                )
-                .map_err(http_error)?;
-            }
-            submit_transfer_with_fee(
-                &cfg.rpc_url,
-                cfg.chain_id,
-                &cfg.private_key,
-                &gateway,
+            let fee_pool = cfg.fee_pool.as_deref().ok_or_else(|| {
+                http_error(anyhow!(
+                    "sponsored transfers require PRIVACYBTC_FEE_POOL_ADDRESS so the fee proof \
+                     can be validated and its nullifiers reserved"
+                ))
+            })?;
+            ensure_transfer_fee_nullifiers_disjoint(
                 &contract,
-                cfg.fee_pool.as_deref(),
+                fee_pool,
                 &req.bundle,
                 fee_bundle,
-                cfg.gas_price_gwei,
-                cfg.gas_limit_transfer,
-                cfg.gas_limit_margin_bps,
-                &cfg.nonce_cache,
             )
-            .await
+            .map_err(http_error)?;
+            enforce_frozen_compliance(&cfg.rpc_url, &contract, &req.bundle)
+                .await
+                .map_err(http_error)?;
+            enforce_frozen_compliance(&cfg.rpc_url, fee_pool, fee_bundle)
+                .await
+                .map_err(http_error)?;
+            let pool_addr = parse_evm_address_hex(&contract)
+                .map_err(|error| http_error(anyhow!("bad pool address: {error}")))?;
+            let op_call = bundle_to_privacy_call(&req.bundle).map_err(http_error)?;
+            let fee_call = bundle_to_privacy_call(fee_bundle).map_err(http_error)?;
+            let mut nullifiers = queue_nullifiers(&contract, &req.bundle);
+            nullifiers.extend(queue_nullifiers(fee_pool, fee_bundle));
+            (
+                encode_transfer_with_fee_calldata(&pool_addr, &op_call, &fee_call),
+                nullifiers,
+            )
         }
         None => {
             // Fail closed on anything that is not provably a same-asset transfer. A missing
@@ -1684,24 +2046,26 @@ async fn http_transfer_submit(
                      asset itself ({fee_pool}) pay with a single combined bundle"
                 )));
             }
-            submit_transfer_with_fee_same_asset(
-                &cfg.rpc_url,
-                cfg.chain_id,
-                &cfg.private_key,
-                &gateway,
-                &contract,
-                &req.bundle,
-                cfg.gas_price_gwei,
-                cfg.gas_limit_transfer,
-                cfg.gas_limit_margin_bps,
-                &cfg.nonce_cache,
+            enforce_frozen_compliance(&cfg.rpc_url, &contract, &req.bundle)
+                .await
+                .map_err(http_error)?;
+            let pool_addr = parse_evm_address_hex(&contract)
+                .map_err(|error| http_error(anyhow!("bad pool address: {error}")))?;
+            let call = bundle_to_privacy_call(&req.bundle).map_err(http_error)?;
+            (
+                encode_transfer_with_fee_same_asset_calldata(&pool_addr, &call),
+                queue_nullifiers(&contract, &req.bundle),
             )
-            .await
         }
-    }
-    .map_err(http_error)?;
-    tokio::spawn(notify_pending_tx(cfg.indexer_url.clone(), tx_hash.clone(), contract));
-    Ok(Json(HttpTxResponse { tx_hash }))
+    };
+    enqueue_typed_transaction(
+        &cfg,
+        "transfer",
+        gateway,
+        calldata,
+        cfg.gas_limit_transfer,
+        nullifiers,
+    )
 }
 
 /// Generic raw-calldata relay: sign + broadcast a pre-built call from the relayer
@@ -1942,7 +2306,7 @@ fn bundle_binding_proof(bundle: &OrchardStoredBundle) -> Result<[[u8; 32]; 8]> {
 //
 // Custody model: **raw_relay**. The relayer never holds or approves the underlying
 // ERC20. `shield` (which pulls funds from `msg.sender`) is returned as calldata for the
-// depositor to sign and send (or push via /submit_raw). `unshield`/`swap` are value-neutral
+// depositor to sign and send. `unshield`/`swap` are value-neutral
 // or recipient-bound at the contract layer, so the relayer can sign them as the orchestrator
 // without custody risk. The relayer only forwards already-proved bundles
 // (v3 sighash, executor bound by the Binding proof).
@@ -2044,8 +2408,8 @@ struct CalldataResponse {
 }
 
 /// `shield` is custody-sensitive (pulls underlying from `msg.sender`), so under the raw_relay
-/// model the relayer returns the calldata for the depositor to sign + send themselves (or push
-/// via /submit_raw). It does not sign.
+/// model the relayer returns the calldata for the depositor to sign + send themselves. It does
+/// not sign, and the production `/submit_raw` policy remains empty.
 async fn http_wrapped_shield_calldata(
     State(cfg): State<Arc<RelayerHttpConfig>>,
     Json(req): Json<WrappedShieldCalldataRequest>,
@@ -2084,8 +2448,22 @@ struct WrappedUnshieldSubmitRequest {
 /// the recipient is bound into the on-chain sighash, so the relayer cannot redirect funds.
 async fn http_wrapped_unshield_submit(
     State(cfg): State<Arc<RelayerHttpConfig>>,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
     Json(req): Json<WrappedUnshieldSubmitRequest>,
-) -> Result<Json<HttpTxResponse>, (StatusCode, Json<HttpErrorResponse>)> {
+) -> Result<(StatusCode, Json<TxRequestView>), (StatusCode, Json<HttpErrorResponse>)> {
+    reserve_typed_request_budget(
+        &cfg,
+        &headers,
+        peer.map(|ConnectInfo(address)| address),
+        cfg.gas_limit_unshield,
+    )
+    .await?;
+    let _validation_permit = cfg
+        .tx_validation_slots
+        .acquire()
+        .await
+        .map_err(|_| http_error(anyhow!("transaction validation pool is closed")))?;
     let contract = cfg.ensure_protocol_pool(&req.contract).map_err(http_error)?;
     // Layer 1: screen the declared recipient (the payout target, not the relayer)
     // before broadcasting. Recipient binding makes this the address that matters.
@@ -2104,23 +2482,15 @@ async fn http_wrapped_unshield_submit(
     // this bundle fail verification rather than paying the user less — nothing to check here.
     let calldata =
         encode_unshield_v2_calldata(req.amount_units, &recipient, &[0u8; 32], &[0u8; 20], &call);
-    let tx_hash = send_raw_calldata(
-        &cfg.rpc_url,
-        cfg.chain_id,
-        &cfg.private_key,
-        &contract,
+    let nullifiers = queue_nullifiers(&contract, &req.bundle);
+    enqueue_typed_transaction(
+        &cfg,
+        "wrapped_unshield",
+        contract,
         calldata,
-        0,
-        cfg.gas_price_gwei,
         cfg.gas_limit_unshield,
-        cfg.gas_limit_margin_bps,
-        &cfg.nonce_cache,
+        nullifiers,
     )
-    .await
-    .map_err(http_error)?;
-    tokio::spawn(notify_pending_tx(cfg.indexer_url.clone(), tx_hash.clone(), contract));
-    println!("[wrapped/unshield] submitted: tx={tx_hash} amount_units={}", req.amount_units);
-    Ok(Json(HttpTxResponse { tx_hash }))
 }
 
 // ─────────────────────────── LP swap order book (in-memory) ────────────────────────────
@@ -2920,6 +3290,455 @@ async fn watch_tx_final_status(rpc_url: &str, tx_hash: &str) -> Option<bool> {
     None
 }
 
+async fn tx_queue_worker(cfg: Arc<RelayerHttpConfig>) -> Result<()> {
+    let signing_key = parse_hex_key(&cfg.private_key).context("parse tx queue signing key")?;
+    let sender_hex = format!(
+        "0x{}",
+        hex::encode(eth_address_from_signing_key(&signing_key))
+    );
+    let owner = format!(
+        "{}:{}:{}",
+        sender_hex,
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    let client = EthRpcClient::new(cfg.rpc_url.clone());
+    let mut lease_held = false;
+    let mut next_lease_renewal = tokio::time::Instant::now();
+    let receipt_interval = Duration::from_millis(cfg.tx_queue_runtime.receipt_poll_ms);
+    let mut next_receipt_poll = tokio::time::Instant::now();
+
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= next_lease_renewal {
+            lease_held = cfg
+                .tx_queue
+                .acquire_or_renew_lease(&owner, cfg.tx_queue_runtime.worker_lease_secs)?;
+            next_lease_renewal = now
+                + Duration::from_secs((cfg.tx_queue_runtime.worker_lease_secs / 3).max(1));
+        }
+        if !lease_held {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+
+        let mut did_work = false;
+        if now >= next_receipt_poll {
+            reconcile_queue_receipts(&cfg, &client).await;
+            next_receipt_poll = tokio::time::Instant::now() + receipt_interval;
+            did_work = true;
+        }
+
+        // Crash recovery always wins: a raw transaction already persisted in WAL must be
+        // replayed byte-for-byte before allocating another nonce.
+        if let Some(prepared) = cfg.tx_queue.next_prepared()? {
+            let _lane = EVM_SIGNER_LANE.lock().await;
+            broadcast_prepared_job(&cfg, &client, prepared, true).await;
+            did_work = true;
+        } else if let Some(stale) = cfg.tx_queue.stale_pending(
+            cfg.tx_queue_runtime.replacement_after_secs,
+            cfg.tx_queue_runtime.max_replacements,
+        )? {
+            let _lane = EVM_SIGNER_LANE.lock().await;
+            replace_pending_job(&cfg, &client, &signing_key, stale).await;
+            did_work = true;
+        } else if cfg.tx_queue.active_inflight()? < cfg.tx_queue_runtime.max_inflight {
+            if let Some(job) = cfg.tx_queue.next_queued()? {
+                prepare_and_broadcast_queue_job(
+                    &cfg,
+                    &client,
+                    &signing_key,
+                    &sender_hex,
+                    &owner,
+                    job,
+                )
+                .await;
+                did_work = true;
+            }
+        }
+
+        if did_work {
+            tokio::task::yield_now().await;
+        } else {
+            tokio::select! {
+                _ = cfg.tx_queue_notify.notified() => {},
+                _ = tokio::time::sleep(Duration::from_millis(250)) => {},
+            }
+        }
+    }
+}
+
+async fn prepare_and_broadcast_queue_job(
+    cfg: &RelayerHttpConfig,
+    client: &EthRpcClient,
+    signing_key: &SigningKey,
+    sender_hex: &str,
+    owner: &str,
+    job: tx_queue::QueueJob,
+) {
+    let prepared = async {
+        let estimated = client
+            .estimate_gas(sender_hex, &job.target, &job.calldata, job.value)
+            .await?;
+        let gas_limit = gas_limit_with_margin(
+            estimated,
+            job.gas_margin_bps,
+            job.gas_cap,
+        )?;
+        let (max_priority_fee, max_fee) = client.suggest_eip1559_fees(cfg.gas_price_gwei).await;
+
+        // The RPC work above can approach the lease TTL. Renew immediately before entering the
+        // signer lane; if another process legitimately owns it now, do not sign.
+        if !cfg
+            .tx_queue
+            .acquire_or_renew_lease(owner, cfg.tx_queue_runtime.worker_lease_secs)?
+        {
+            return Err(anyhow!("transaction queue signer lease was lost before preparation"));
+        }
+        let _lane = EVM_SIGNER_LANE.lock().await;
+        let chain_pending_nonce = client.get_transaction_count(sender_hex).await?;
+        let target = job.target.clone();
+        let calldata = job.calldata.clone();
+        let prepared = cfg
+            .tx_queue
+            .prepare(
+                &job.request_id,
+                chain_pending_nonce,
+                gas_limit,
+                max_priority_fee,
+                max_fee,
+                |nonce| {
+                    build_and_sign_eip1559_tx(
+                        nonce,
+                        max_priority_fee,
+                        max_fee,
+                        gas_limit,
+                        &target,
+                        job.value,
+                        &calldata,
+                        cfg.chain_id,
+                        signing_key,
+                    )
+                },
+            )?
+            .ok_or_else(|| anyhow!("queued request changed state during preparation"))?;
+        {
+            let mut nonce_cache = cfg.nonce_cache.lock().await;
+            let next = prepared.nonce.saturating_add(1);
+            *nonce_cache = Some(nonce_cache.unwrap_or(0).max(next));
+        }
+        let selector = job
+            .calldata
+            .get(..4)
+            .map(hex::encode)
+            .unwrap_or_else(|| "short".to_string());
+        eprintln!(
+            "[tx-queue] prepared request={} kind={} selector=0x{} nonce={} estimate={} signed_limit={} cap={}",
+            job.request_id,
+            job.kind,
+            selector,
+            prepared.nonce,
+            estimated,
+            gas_limit,
+            job.gas_cap,
+        );
+        broadcast_prepared_job(cfg, client, prepared, false).await;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    if let Err(error) = prepared {
+        eprintln!(
+            "[tx-queue] prepare failed request={} failure={} error={error:#}",
+            job.request_id,
+            job.prepare_failures.saturating_add(1),
+        );
+        if let Err(store_error) = cfg.tx_queue.record_prepare_error(
+            &job.request_id,
+            &format!("{error:#}"),
+            cfg.tx_queue_runtime.max_prepare_attempts,
+        ) {
+            eprintln!(
+                "[tx-queue] failed to persist prepare error request={}: {store_error:#}",
+                job.request_id
+            );
+        }
+    }
+}
+
+async fn broadcast_prepared_job(
+    cfg: &RelayerHttpConfig,
+    client: &EthRpcClient,
+    prepared: tx_queue::PreparedJob,
+    check_existing: bool,
+) {
+    // A prior process may have broadcast successfully and died before updating SQLite. Check the
+    // precomputed hash first; if the node knows it, move forward without changing nonce/raw bytes.
+    if check_existing {
+        match client.transaction_exists(&prepared.tx_hash).await {
+            Ok(true) => {
+                if let Err(error) = cfg.tx_queue.mark_pending(&prepared.request_id) {
+                    eprintln!(
+                        "[tx-queue] failed to mark recovered transaction pending request={}: {error:#}",
+                        prepared.request_id
+                    );
+                }
+                return;
+            }
+            Ok(false) => {}
+            Err(error) => eprintln!(
+                "[tx-queue] pre-broadcast lookup failed request={}: {error:#}; replaying stored raw tx",
+                prepared.request_id
+            ),
+        }
+    }
+
+    match client.send_raw_transaction(&prepared.raw_tx).await {
+        Ok(rpc_hash) if rpc_hash.eq_ignore_ascii_case(&prepared.tx_hash) => {
+            if let Err(error) = cfg.tx_queue.mark_pending(&prepared.request_id) {
+                eprintln!(
+                    "[tx-queue] broadcast accepted but pending state write failed request={}: {error:#}",
+                    prepared.request_id
+                );
+            } else {
+                println!(
+                    "[tx-queue] broadcast request={} nonce={} tx={}",
+                    prepared.request_id, prepared.nonce, prepared.tx_hash
+                );
+            }
+        }
+        Ok(rpc_hash) => {
+            let error = format!(
+                "RPC returned tx hash {rpc_hash}, expected precomputed {}",
+                prepared.tx_hash
+            );
+            let _ = cfg
+                .tx_queue
+                .record_broadcast_error(&prepared.request_id, &error);
+            eprintln!("[tx-queue] {error}");
+        }
+        Err(error) if err_is_already_known(&error) => {
+            let _ = cfg.tx_queue.mark_pending(&prepared.request_id);
+        }
+        Err(error) if err_is_nonce_too_low(&error) => {
+            match client.transaction_exists(&prepared.tx_hash).await {
+                Ok(true) => {
+                    let _ = cfg.tx_queue.mark_pending(&prepared.request_id);
+                }
+                _ => match queue_alias_receipt(cfg, client, &prepared.request_id).await {
+                    Some(true) => {
+                        let _ = cfg.tx_queue.mark_terminal(
+                            &prepared.request_id,
+                            STATUS_CONFIRMED,
+                            None,
+                        );
+                    }
+                    Some(false) => {
+                        let _ = cfg.tx_queue.mark_terminal(
+                            &prepared.request_id,
+                            STATUS_REVERTED,
+                            Some("transaction reverted on-chain"),
+                        );
+                    }
+                    None => {
+                        let message = format!(
+                            "nonce too low but precomputed transaction is not visible; refusing to allocate a different nonce: {error:#}"
+                        );
+                        let _ = cfg
+                            .tx_queue
+                            .record_broadcast_error(&prepared.request_id, &message);
+                        eprintln!(
+                            "[tx-queue] ambiguous nonce request={}: {message}",
+                            prepared.request_id
+                        );
+                    }
+                },
+            }
+        }
+        Err(error) => {
+            let message = format!("{error:#}");
+            let _ = cfg
+                .tx_queue
+                .record_broadcast_error(&prepared.request_id, &message);
+            eprintln!(
+                "[tx-queue] broadcast failed request={} failure={} error={message}",
+                prepared.request_id,
+                prepared.broadcast_failures.saturating_add(1),
+            );
+        }
+    }
+}
+
+async fn queue_alias_receipt(
+    cfg: &RelayerHttpConfig,
+    client: &EthRpcClient,
+    request_id: &str,
+) -> Option<bool> {
+    let request = match cfg.tx_queue.request(request_id) {
+        Ok(Some(request)) => request,
+        Ok(None) => return None,
+        Err(error) => {
+            eprintln!(
+                "[tx-queue] could not read hash aliases request={request_id}: {error:#}"
+            );
+            return None;
+        }
+    };
+    let mut reverted = false;
+    for tx_hash in request.tx_hashes {
+        match client.get_transaction_receipt_status(&tx_hash).await {
+            Ok(Some(true)) => return Some(true),
+            Ok(Some(false)) => reverted = true,
+            Ok(None) => {}
+            Err(error) => eprintln!(
+                "[tx-queue] alias receipt lookup failed request={request_id} tx={tx_hash}: {error:#}"
+            ),
+        }
+    }
+    reverted.then_some(false)
+}
+
+async fn reconcile_queue_receipts(cfg: &RelayerHttpConfig, client: &EthRpcClient) {
+    let jobs = match cfg
+        .tx_queue
+        .pending_jobs(cfg.tx_queue_runtime.receipt_batch_size)
+    {
+        Ok(jobs) => jobs,
+        Err(error) => {
+            eprintln!("[tx-queue] receipt scan could not read pending jobs: {error:#}");
+            return;
+        }
+    };
+    let mut checks = tokio::task::JoinSet::new();
+    for job in jobs {
+        for tx_hash in job.tx_hashes {
+            let rpc = client.clone();
+            let request_id = job.request_id.clone();
+            checks.spawn(async move {
+                let result = rpc.get_transaction_receipt_status(&tx_hash).await;
+                (request_id, tx_hash, result)
+            });
+        }
+    }
+    let mut outcomes: HashMap<String, Option<bool>> = HashMap::new();
+    while let Some(joined) = checks.join_next().await {
+        match joined {
+            Ok((request_id, _tx_hash, Ok(Some(true)))) => {
+                outcomes.insert(request_id, Some(true));
+            }
+            Ok((request_id, _tx_hash, Ok(Some(false)))) => {
+                outcomes.entry(request_id).or_insert(Some(false));
+            }
+            Ok((_request_id, _tx_hash, Ok(None))) => {}
+            Ok((request_id, tx_hash, Err(error))) => eprintln!(
+                "[tx-queue] receipt lookup failed request={request_id} tx={tx_hash}: {error:#}"
+            ),
+            Err(error) => eprintln!("[tx-queue] receipt task failed: {error}"),
+        }
+    }
+    for (request_id, outcome) in outcomes {
+        let result = match outcome {
+            Some(true) => cfg
+                .tx_queue
+                .mark_terminal(&request_id, STATUS_CONFIRMED, None),
+            Some(false) => cfg.tx_queue.mark_terminal(
+                &request_id,
+                STATUS_REVERTED,
+                Some("transaction reverted on-chain"),
+            ),
+            None => Ok(()),
+        };
+        if let Err(error) = result {
+            eprintln!(
+                "[tx-queue] failed to persist receipt outcome request={request_id}: {error:#}"
+            );
+        }
+    }
+}
+
+async fn replace_pending_job(
+    cfg: &RelayerHttpConfig,
+    client: &EthRpcClient,
+    signing_key: &SigningKey,
+    pending: PendingJob,
+) {
+    // Recheck every alias immediately before replacement; the receipt poll and this branch are
+    // intentionally redundant around the race where the original tx is mined at the threshold.
+    for tx_hash in &pending.tx_hashes {
+        match client.get_transaction_receipt_status(tx_hash).await {
+            Ok(Some(true)) => {
+                let _ = cfg
+                    .tx_queue
+                    .mark_terminal(&pending.request_id, STATUS_CONFIRMED, None);
+                return;
+            }
+            Ok(Some(false)) => {
+                let _ = cfg.tx_queue.mark_terminal(
+                    &pending.request_id,
+                    STATUS_REVERTED,
+                    Some("transaction reverted on-chain"),
+                );
+                return;
+            }
+            _ => {}
+        }
+    }
+
+    let (suggested_priority, suggested_max) = client.suggest_eip1559_fees(cfg.gas_price_gwei).await;
+    let bumped_priority = bump_eip1559_fee(pending.max_priority_fee).max(suggested_priority);
+    let bumped_max = bump_eip1559_fee(pending.max_fee)
+        .max(suggested_max)
+        .max(bumped_priority);
+    match cfg.tx_queue.prepare_replacement(
+        &pending.request_id,
+        bumped_priority,
+        bumped_max,
+        |job| {
+            build_and_sign_eip1559_tx(
+                job.nonce,
+                bumped_priority,
+                bumped_max,
+                job.gas_limit,
+                &job.target,
+                job.value,
+                &job.calldata,
+                cfg.chain_id,
+                signing_key,
+            )
+        },
+    ) {
+        Ok(Some(prepared)) => {
+            eprintln!(
+                "[tx-queue] replacing request={} nonce={} replacement={} tx={}",
+                pending.request_id,
+                pending.nonce,
+                pending.attempt.saturating_add(1),
+                prepared.tx_hash,
+            );
+            broadcast_prepared_job(cfg, client, prepared, false).await;
+        }
+        Ok(None) => {}
+        Err(error) => eprintln!(
+            "[tx-queue] replacement preparation failed request={}: {error:#}",
+            pending.request_id
+        ),
+    }
+}
+
+fn bump_eip1559_fee(value: u128) -> u128 {
+    value.saturating_add((value / 8).max(1))
+}
+
+fn err_is_already_known(err: &anyhow::Error) -> bool {
+    let message = format!("{err:#}").to_ascii_lowercase();
+    message.contains("already known")
+        || message.contains("known transaction")
+        || message.contains("already imported")
+}
+
 /// Acquire the next sequential nonce.
 ///
 /// Uses an in-process counter for back-to-back relayer submits, but **re-syncs with
@@ -3011,6 +3830,7 @@ async fn send_raw_calldata(
     );
     // Dynamic EIP-1559 (type-2) fees: pay ~baseFee+tip, cap maxFee at baseFee*2+tip.
     let (max_priority_fee, max_fee) = client.suggest_eip1559_fees(gas_price_gwei).await;
+    let _signer_lane = EVM_SIGNER_LANE.lock().await;
     send_raw_with_nonce_retry(&client, &sender_hex, nonce_cache, |nonce| {
         build_and_sign_eip1559_tx(
             nonce,
@@ -3448,102 +4268,6 @@ async fn submit_transfer_bundle(
         chain_id,
         private_key,
         contract,
-        calldata,
-        0,
-        gas_price_gwei,
-        gas_limit_cap,
-        gas_limit_margin_bps,
-        nonce_cache,
-    )
-    .await
-}
-
-/// Submit `Perc20FeeGateway.transferWithFee(pool, opCall, feeCall)`.
-///
-/// Two independent bundles ride in one transaction: the business transfer on `pool` (proved with
-/// `executor = gateway`, so it can ONLY execute here) and a pUSDC unshield paying the protocol
-/// fee. The gateway derives the binding context from `opCall` itself and supplies the fee amount
-/// and recipient from its own storage, so the relayer has nothing to validate — a mismatched or
-/// borrowed fee bundle fails the on-chain Binding proof.
-///
-/// Gas note: this verifies TWO bundles' Groth16 proofs, so `gas_limit_transfer` must be sized
-/// well above the single-bundle figure used before the fee release.
-#[allow(clippy::too_many_arguments)]
-async fn submit_transfer_with_fee(
-    rpc_url: &str,
-    chain_id: u64,
-    private_key: &str,
-    gateway: &str,
-    pool: &str,
-    fee_pool: Option<&str>,
-    op_bundle: &OrchardStoredBundle,
-    fee_bundle: &OrchardStoredBundle,
-    gas_price_gwei: f64,
-    gas_limit_cap: u64,
-    gas_limit_margin_bps: u64,
-    nonce_cache: &Arc<Mutex<Option<u64>>>,
-) -> Result<String> {
-    // Both legs are subject to the frozen-root compliance gate, same as any other bundle.
-    enforce_frozen_compliance(rpc_url, pool, op_bundle).await?;
-    if let Some(fee_pool) = fee_pool {
-        enforce_frozen_compliance(rpc_url, fee_pool, fee_bundle).await?;
-    }
-
-    let pool_addr = parse_evm_address_hex(pool).map_err(|e| anyhow!("bad pool address: {e}"))?;
-    let op_call = bundle_to_privacy_call(op_bundle)?;
-    let fee_call = bundle_to_privacy_call(fee_bundle)?;
-
-    let calldata = encode_transfer_with_fee_calldata(&pool_addr, &op_call, &fee_call);
-
-    send_raw_calldata(
-        rpc_url,
-        chain_id,
-        private_key,
-        gateway,
-        calldata,
-        0,
-        gas_price_gwei,
-        gas_limit_cap,
-        gas_limit_margin_bps,
-        nonce_cache,
-    )
-    .await
-}
-
-/// Submit the SAME-ASSET form of `transferWithFee`: one combined bundle plus an empty fee call.
-///
-/// Used when the transferred asset IS the fee asset, where the two-bundle form cannot work: both
-/// legs would spend from this same pool, so a wallet whose balance sits in one note would have to
-/// name that note twice and the transaction would revert on the duplicate nullifier. The combined
-/// bundle instead carries the recipient's note, the sender's change, and a `valueBalance` equal to
-/// the protocol fee.
-///
-/// Same entrypoint, same selector as the two-bundle form — the gateway branches on the empty fee
-/// call. It still rejects the pairing unless `pool` is its own `feePool`.
-#[allow(clippy::too_many_arguments)]
-async fn submit_transfer_with_fee_same_asset(
-    rpc_url: &str,
-    chain_id: u64,
-    private_key: &str,
-    gateway: &str,
-    pool: &str,
-    bundle: &OrchardStoredBundle,
-    gas_price_gwei: f64,
-    gas_limit_cap: u64,
-    gas_limit_margin_bps: u64,
-    nonce_cache: &Arc<Mutex<Option<u64>>>,
-) -> Result<String> {
-    enforce_frozen_compliance(rpc_url, pool, bundle).await?;
-
-    let pool_addr = parse_evm_address_hex(pool).map_err(|e| anyhow!("bad pool address: {e}"))?;
-    let call = bundle_to_privacy_call(bundle)?;
-    let calldata = encode_transfer_with_fee_same_asset_calldata(&pool_addr, &call);
-
-    send_raw_calldata(
-        rpc_url,
-        chain_id,
-        private_key,
-        gateway,
         calldata,
         0,
         gas_price_gwei,
@@ -4095,6 +4819,7 @@ fn describe_rpc_error(error: &JsonRpcError) -> String {
     }
 }
 
+#[derive(Clone)]
 struct EthRpcClient {
     http: Client,
     urls: Vec<String>,
@@ -4221,6 +4946,19 @@ impl EthRpcClient {
         let hex_tx = format!("0x{}", hex::encode(raw_tx));
         self.rpc_call("eth_sendRawTransaction", serde_json::json!([hex_tx]))
             .await
+    }
+
+    async fn transaction_exists(&self, tx_hash: &str) -> Result<bool> {
+        let transaction: Option<Value> = self
+            .rpc_call(
+                "eth_getTransactionByHash",
+                serde_json::json!([tx_hash]),
+            )
+            .await?;
+        if transaction.is_some() {
+            return Ok(true);
+        }
+        Ok(self.get_transaction_receipt_status(tx_hash).await?.is_some())
     }
 
     /// Current `baseFeePerGas` (wei) from the latest block (EIP-1559 chains).
@@ -4678,6 +5416,30 @@ mod tests {
             btc_payout_evm_confirmations: 12,
             indexer_url: None,
             nonce_cache: Arc::new(Mutex::new(None)),
+            tx_queue: Arc::new(TxQueue::in_memory(100, 1, "0xtest-signer").unwrap()),
+            tx_queue_runtime: TxQueueRuntimeConfig {
+                max_inflight: 8,
+                max_prepare_attempts: 3,
+                receipt_batch_size: 20,
+                receipt_poll_ms: 100,
+                replacement_after_secs: 120,
+                max_replacements: 2,
+                worker_lease_secs: 60,
+            },
+            tx_queue_notify: Arc::new(Notify::new()),
+            tx_validation_slots: Arc::new(Semaphore::new(4)),
+            tx_queue_limiter: Arc::new(Mutex::new(SubmitRawLimiter::new_scoped(
+                SubmitRawLimitConfig {
+                    window_secs: 3_600,
+                    global_max_requests: 100,
+                    client_max_requests: 100,
+                    global_max_gas: 1_000_000_000,
+                    client_max_gas: 1_000_000_000,
+                },
+                "typed transaction queue",
+            ))),
+            tx_queue_trusted_proxy_ips: HashSet::new(),
+            http_body_limit_bytes: 2 * 1024 * 1024,
             screening: Arc::new(screening::ScreeningConfig::from_env()),
             swap_book: Arc::new(Mutex::new(SwapBook::default())),
             swap_book_path: None,
@@ -4961,20 +5723,40 @@ mod tests {
             "a non-fee pool must not be sponsored without a fee bundle: {err}"
         );
 
-        // The fee pool takes the combined path instead; it gets as far as the (absent) RPC,
-        // which is a different failure entirely.
-        let (st, err) = call(
+        // The fee pool takes the combined path and is durably queued even though the test does
+        // not start a broadcast worker.
+        let combined = body("0x2222222222222222222222222222222222222222");
+        let (st, accepted) = call(
             &app,
             "POST",
             "/transfer/submit",
-            Some(body("0x2222222222222222222222222222222222222222")),
+            Some(combined.clone()),
         )
         .await;
-        assert_ne!(st, Sc::OK);
-        assert!(
-            !err.to_string().contains("fee_bundle is required"),
-            "the fee pool's own transfers must reach the combined path: {err}"
-        );
+        assert_eq!(st, Sc::ACCEPTED);
+        assert_eq!(accepted["status"], "queued");
+        let request_id = accepted["request_id"].as_str().unwrap();
+        assert!(request_id.starts_with("txreq_"));
+
+        let (st, duplicate) = call(
+            &app,
+            "POST",
+            "/transfer/submit",
+            Some(combined),
+        )
+        .await;
+        assert_eq!(st, Sc::ACCEPTED);
+        assert_eq!(duplicate["request_id"], request_id);
+
+        let (st, status) = call(
+            &app,
+            "GET",
+            &format!("/tx/requests/{request_id}"),
+            None,
+        )
+        .await;
+        assert_eq!(st, Sc::OK);
+        assert_eq!(status["status"], "queued");
     }
 
     #[tokio::test]
@@ -5361,20 +6143,17 @@ mod tests {
         assert_ne!(st, Sc::OK);
         assert!(err.to_string().contains("reuse a nullifier"), "{err}");
 
-        // The same single bundle, submitted as the combined form, is NOT rejected for reuse —
-        // it gets as far as the (absent) RPC.
-        let (st, err) = call(
+        // The same single bundle, submitted as the combined form, is NOT rejected for reuse and
+        // is accepted into the durable queue.
+        let (st, body) = call(
             &app,
             "POST",
             "/transfer/submit",
             Some(serde_json::json!({ "contract": fee_pool, "bundle": test_bundle() })),
         )
         .await;
-        assert_ne!(st, Sc::OK);
-        assert!(
-            !err.to_string().contains("reuse a nullifier"),
-            "the combined single-bundle path has one spend and nothing to collide with: {err}"
-        );
+        assert_eq!(st, Sc::ACCEPTED);
+        assert_eq!(body["status"], "queued");
     }
 
     #[test]

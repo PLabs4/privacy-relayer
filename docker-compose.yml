@@ -3,13 +3,27 @@
 #   cp .env.example .env   # then edit RPC URL, chain id, relayer key, …
 #   docker compose up -d --build
 #
-# The relayer broadcasts client-signed/encoded calldata via /submit_raw so that a
-# holder's EOA never appears on-chain. The relayer pays gas from its own key.
+# Typed Transfer and wrapped Unshield are durably queued before the relayer pays
+# gas. Keep /submit_raw unconfigured unless a separately reviewed policy needs it.
 #
 # Layer 1 screening (SCREENING_ENABLED=true in .env) makes outbound HTTPS calls to
 # TRM / Chainalysis — ensure the deployment network allows egress to those hosts.
 # All SCREENING_* vars are read from the env_file below; no structural change needed.
 services:
+  relayer-data-init:
+    build: .
+    image: privacy-relayer:latest
+    user: "0:0"
+    restart: "no"
+    network_mode: none
+    cap_drop: [ALL]
+    cap_add: [CHOWN, FOWNER]
+    security_opt: ["no-new-privileges:true"]
+    entrypoint: ["/bin/sh", "-ec"]
+    command: ["chown 10001:10001 /data && chmod 0700 /data"]
+    volumes:
+      - relayer-data:/data
+
   relayer:
     build: .
     image: privacy-relayer:latest
@@ -22,10 +36,14 @@ services:
       PRIVACYBTC_RELAYER_BIND: 0.0.0.0:8790
       # Durable LP swap matching state. Keep this on a persistent volume.
       PRIVACYBTC_SWAP_BOOK_PATH: /data/swap-book.json
+      PRIVACYBTC_TX_QUEUE_PATH: /data/relayer-tx-queue.sqlite
     ports:
       - "${RELAYER_HOST_BIND:-127.0.0.1}:${RELAYER_HOST_PORT:-8790}:8790"
     volumes:
       - relayer-data:/data
+    depends_on:
+      relayer-data-init:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8790/healthz"]
       interval: 30s
