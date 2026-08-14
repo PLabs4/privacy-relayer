@@ -32,8 +32,8 @@ use privacy_core::ethereum::{
 // The fee release changed `unshield`'s ABI and added the gateway; privacy-core is pinned to a
 // rev that predates both, so those two calls are encoded locally (see `fee_calldata`).
 use fee_calldata::{
-    encode_transfer_with_fee_calldata, encode_transfer_with_fee_same_asset_calldata,
-    encode_unshield_v2_calldata,
+    encode_settle_atomic_calldata, encode_transfer_calldata, encode_transfer_with_fee_calldata,
+    encode_transfer_with_fee_same_asset_calldata, encode_unshield_v2_calldata, pair_sighash_v1,
 };
 use reqwest::Client;
 use serde::de::DeserializeOwned;
@@ -579,6 +579,10 @@ struct RelayerHttpConfig {
     submit_raw_trusted_proxy_ips: HashSet<IpAddr>,
     /// Shared secret required to create or refresh LP offers. User accepts remain public.
     lp_offer_token: Option<String>,
+    /// DEX-only: pair-settle is stateless (no LP order lifecycle), so `/swap/settle_atomic`
+    /// cannot be gated on the swap book. Set `PRIVACYBTC_ALLOW_STATELESS_SWAP=1` in the local
+    /// DEX stack to skip the LP-token gate; unset (the default) keeps it required.
+    allow_stateless_swap: bool,
     /// Every v3 pool this process may target. All entries are checked on-chain at startup.
     protocol_pools: HashSet<String>,
     expected_protocol_version: u64,
@@ -1497,6 +1501,9 @@ async fn run_http_server(
         ))),
         submit_raw_trusted_proxy_ips,
         lp_offer_token,
+        allow_stateless_swap: std::env::var("PRIVACYBTC_ALLOW_STATELESS_SWAP")
+            .map(|v| v == "1")
+            .unwrap_or(false),
         protocol_pools: protocol.pools,
         expected_protocol_version: protocol.version,
         expected_verifier_set_id: protocol.verifier_set_id,
@@ -1543,6 +1550,9 @@ fn build_router(state: Arc<RelayerHttpConfig>) -> Router {
         .route("/swap/initiate", post(http_swap_initiate))
         .route("/swap/join", post(http_swap_join))
         .route("/swap/settle", post(http_swap_settle))
+        // DEX-only NEW route (pair-settle v2). The three routes above keep their existing logic.
+        .route("/swap/settle_atomic", post(http_swap_settle_atomic))
+        .route("/dex/transfer/submit", post(http_dex_transfer_submit))
         // ── LP swap order book (matching layer; see docs/lp-swap-design.md) ──
         .route("/swap/offers", get(http_swap_offer_list).post(http_swap_offer_post))
         .route("/swap/accept", post(http_swap_accept))
@@ -3156,6 +3166,227 @@ struct SwapSettleRequest {
     /// Optional order-book request id; when present, the order is advanced to `Settled`.
     #[serde(default)]
     request_id: Option<String>,
+}
+
+#[cfg(test)]
+mod dex_leg_commit_tests {
+    use super::*;
+
+    /// CROSS-CRATE pin. The prover derives `swap_meta.privacy_call_commit_hex` with
+    /// `privacybtc_ethereum::perc20_privacy_call_commit`; the relayer derives the `commit_a` /
+    /// `commit_b` that go into the on-chain `pairId` with `privacy_core::ethereum::
+    /// privacy_call_commit` over `bundle_to_privacy_call` — a DIFFERENT crate and a different
+    /// decoder. If they ever disagree by one field, every `settleAtomic` reverts `BadMakerSig`
+    /// and nothing else in the test suite would notice.
+    ///
+    /// The fixture is a real 2-action transfer leg proved by `POST /dex/prove_note` against the
+    /// local anvil stack; the expected digest is that response's `swap_meta` value.
+    ///
+    /// Watch the ANCHOR in particular: `bundle_to_action_args` deliberately uses the PER-ACTION
+    /// `pub_fields_bn254[0]`, not the bundle-level `anchor_orchard`, and the prover was aligned
+    /// to match. A bundle whose actions carry different anchors is the case that breaks if one
+    /// side regresses to the bundle anchor.
+    #[test]
+    fn relayer_commit_matches_prover_swap_meta() {
+        let bundle: OrchardStoredBundle =
+            serde_json::from_str(include_str!("../tests/fixtures/dex_leg_bundle.json"))
+                .expect("fixture parses as OrchardStoredBundle");
+        let call = bundle_to_privacy_call(&bundle).expect("bundle -> PrivacyCall");
+        assert_eq!(
+            format!("0x{}", hex::encode(privacy_call_commit(&call))),
+            "0x5239e8cf3079b93c382a6827fb520469154e3c4884125d02b32033cc091b1928",
+            "relayer commit diverged from the prover's swap_meta.privacy_call_commit_hex"
+        );
+    }
+
+    /// The anchor convention itself, stated as an assertion rather than a comment.
+    #[test]
+    fn action_args_use_per_action_anchor() {
+        let bundle: OrchardStoredBundle =
+            serde_json::from_str(include_str!("../tests/fixtures/dex_leg_bundle.json")).unwrap();
+        let args = bundle_to_action_args(&bundle).unwrap();
+        for (i, a) in args.iter().enumerate() {
+            assert_eq!(a.anchor, a.pub_fields[0], "action[{i}] anchor must be pubFields[0]");
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SwapSettleAtomicRequest {
+    #[serde(default)]
+    coordinator: Option<String>,
+    pool_a: String,
+    pool_b: String,
+    deadline: u64,
+    salt_hex: String,
+    /// Maker signature [Rx, Ry, s] under leg-A's rk over the pair sighash (32-byte hex each).
+    sig_a_hex: [String; 3],
+    /// Taker signature under leg-B's rk.
+    sig_b_hex: [String; 3],
+    bundle_a: OrchardStoredBundle,
+    bundle_b: OrchardStoredBundle,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct SwapSettleAtomicResponse {
+    tx_hash: String,
+    /// The pair sighash == the `PairSettled` event's `pairId` (re-derived server-side as a
+    /// cross-check; the client signed this exact value or the tx will revert).
+    pair_id: String,
+    commit_a: String,
+    commit_b: String,
+}
+
+/// `settleAtomic(...)` — pair-settle v2: ONE relayer-signed tx executes both co-signed legs.
+///
+/// DEX-only NEW route (this tree had no `/swap/settle_atomic`); the existing `/swap/initiate`,
+/// `/swap/join` and `/swap/settle` are untouched. Unlike `/swap/settle`, there is no LP order to
+/// match against — pair-settle carries its whole authorisation in the two signatures — so the
+/// swap-book check is replaced by the `allow_stateless_swap` / LP-token gate.
+async fn http_swap_settle_atomic(
+    State(cfg): State<Arc<RelayerHttpConfig>>,
+    headers: HeaderMap,
+    Json(req): Json<SwapSettleAtomicRequest>,
+) -> Result<Json<SwapSettleAtomicResponse>, (StatusCode, Json<HttpErrorResponse>)> {
+    if !cfg.allow_stateless_swap {
+        require_lp_token(&cfg, &headers)?;
+    }
+    let coordinator = resolve_coordinator(&cfg, &req.coordinator).map_err(http_error)?;
+    let coord20 = parse_evm_address_hex(&coordinator)
+        .map_err(|e| http_error(anyhow!("bad coordinator: {e}")))?;
+    cfg.ensure_protocol_pool(&req.pool_a).map_err(http_error)?;
+    cfg.ensure_protocol_pool(&req.pool_b).map_err(http_error)?;
+    let pool_a =
+        parse_evm_address_hex(&req.pool_a).map_err(|e| http_error(anyhow!("bad pool_a: {e}")))?;
+    let pool_b =
+        parse_evm_address_hex(&req.pool_b).map_err(|e| http_error(anyhow!("bad pool_b: {e}")))?;
+    let salt = parse_hex32(&req.salt_hex).map_err(|e| http_error(anyhow!("salt_hex: {e}")))?;
+    let mut sig_a = [[0u8; 32]; 3];
+    let mut sig_b = [[0u8; 32]; 3];
+    for i in 0..3 {
+        sig_a[i] = parse_hex32(&req.sig_a_hex[i])
+            .map_err(|e| http_error(anyhow!("sig_a_hex[{i}]: {e}")))?;
+        sig_b[i] = parse_hex32(&req.sig_b_hex[i])
+            .map_err(|e| http_error(anyhow!("sig_b_hex[{i}]: {e}")))?;
+    }
+    // Frozen-compliance preflight on both legs (the on-chain settle would otherwise revert late).
+    enforce_frozen_compliance(&cfg.rpc_url, &req.pool_a, &req.bundle_a)
+        .await
+        .map_err(http_error)?;
+    enforce_frozen_compliance(&cfg.rpc_url, &req.pool_b, &req.bundle_b)
+        .await
+        .map_err(http_error)?;
+
+    let call_a = bundle_to_privacy_call(&req.bundle_a).map_err(http_error)?;
+    let call_b = bundle_to_privacy_call(&req.bundle_b).map_err(http_error)?;
+    let act_a = call_a
+        .actions
+        .first()
+        .ok_or_else(|| http_error(anyhow!("bundle_a has no actions")))?;
+    let act_b = call_b
+        .actions
+        .first()
+        .ok_or_else(|| http_error(anyhow!("bundle_b has no actions")))?;
+    let commit_a = privacy_call_commit(&call_a);
+    let commit_b = privacy_call_commit(&call_b);
+    // Re-derived, never trusted from the client: if it differs from what the parties signed the
+    // tx reverts with BadMakerSig/BadTakerSig, so returning it makes the mismatch debuggable.
+    let pair_id = pair_sighash_v1(
+        cfg.chain_id,
+        &coord20,
+        &pool_a,
+        &pool_b,
+        &commit_a,
+        &commit_b,
+        &act_a.pub_fields[4],
+        &act_a.pub_fields[5],
+        &act_b.pub_fields[4],
+        &act_b.pub_fields[5],
+        req.deadline,
+        &salt,
+    );
+    let calldata = encode_settle_atomic_calldata(
+        &pool_a, &pool_b, &call_a, &call_b, req.deadline, &salt, &sig_a, &sig_b,
+    );
+    let tx_hash = send_raw_calldata(
+        &cfg.rpc_url,
+        cfg.chain_id,
+        &cfg.private_key,
+        &coordinator,
+        calldata,
+        0,
+        cfg.gas_price_gwei,
+        cfg.gas_limit_swap,
+        cfg.gas_limit_margin_bps,
+        &cfg.nonce_cache,
+    )
+    .await
+    .map_err(http_error)?;
+    for pool in [req.pool_a.clone(), req.pool_b.clone()] {
+        tokio::spawn(notify_pending_tx(cfg.indexer_url.clone(), tx_hash.clone(), pool));
+    }
+    println!("[swap/settle_atomic] tx={tx_hash} pair_id=0x{}", hex::encode(pair_id));
+    Ok(Json(SwapSettleAtomicResponse {
+        tx_hash,
+        pair_id: format!("0x{}", hex::encode(pair_id)),
+        commit_a: format!("0x{}", hex::encode(commit_a)),
+        commit_b: format!("0x{}", hex::encode(commit_b)),
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct DexTransferSubmitRequest {
+    /// PERC20 pool the bundle executes against.
+    contract: String,
+    /// A complete bundle from the prover: per-action proofs + the bundle-level binding proof.
+    bundle: OrchardStoredBundle,
+}
+
+/// `transfer(PrivacyCall)` — relayer-signed permissionless shielded transfer against a pool.
+///
+/// DEX-only NEW route. It is NOT a variant of `/transfer/submit`, which is the wallet's
+/// **sponsored** path: that one requires a `Perc20FeeGateway` plus a pUSDC fee bundle so the user
+/// pays for their own gas. The DEX's balanceOf/order bundles have no fee leg — the relayer eats
+/// the gas on a dev stack — so they need the plain pool entrypoint. Keeping them apart means the
+/// wallet's fee accounting cannot be bypassed by posting to the DEX route: this one is reachable
+/// only for pools in `PROTOCOL_POOLS`, and it never touches the gateway.
+///
+/// Compliance parity with `/transfer/submit`: same `ensure_protocol_pool` + `enforce_frozen_compliance`
+/// preflight, so this is not a weaker door standing next to a stronger one.
+async fn http_dex_transfer_submit(
+    State(cfg): State<Arc<RelayerHttpConfig>>,
+    Json(req): Json<DexTransferSubmitRequest>,
+) -> Result<Json<HttpTxResponse>, (StatusCode, Json<HttpErrorResponse>)> {
+    let contract = cfg.ensure_protocol_pool(&req.contract).map_err(http_error)?;
+    enforce_frozen_compliance(&cfg.rpc_url, &contract, &req.bundle)
+        .await
+        .map_err(http_error)?;
+    let call = bundle_to_privacy_call(&req.bundle).map_err(http_error)?;
+    let calldata = encode_transfer_calldata(&call);
+    let tx_hash = send_raw_calldata(
+        &cfg.rpc_url,
+        cfg.chain_id,
+        &cfg.private_key,
+        &contract,
+        calldata,
+        0,
+        cfg.gas_price_gwei,
+        cfg.gas_limit_transfer,
+        cfg.gas_limit_margin_bps,
+        &cfg.nonce_cache,
+    )
+    .await
+    .map_err(http_error)?;
+    tokio::spawn(notify_pending_tx(
+        cfg.indexer_url.clone(),
+        tx_hash.clone(),
+        contract,
+    ));
+    println!(
+        "[dex/transfer/submit] tx={tx_hash} actions={}",
+        call.actions.len()
+    );
+    Ok(Json(HttpTxResponse { tx_hash }))
 }
 
 /// `settle(swapId, secret, callA, callB)` — relayer-signed; atomically executes both legs.
@@ -5455,6 +5686,7 @@ mod tests {
             ))),
             submit_raw_trusted_proxy_ips: HashSet::new(),
             lp_offer_token: Some("test-lp-token".into()),
+            allow_stateless_swap: false,
             protocol_pools: [
                 "0x1111111111111111111111111111111111111111".to_string(),
                 "0x2222222222222222222222222222222222222222".to_string(),
