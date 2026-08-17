@@ -449,12 +449,19 @@ fn gas_limit_with_margin(estimated: u64, margin_bps: u64, cap: u64) -> Result<u6
     Ok(padded)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TxReceiptFinality {
+    Mined,
+    Finalized,
+}
+
 #[derive(Clone)]
 struct TxQueueRuntimeConfig {
     max_inflight: u64,
     max_prepare_attempts: u32,
     receipt_batch_size: usize,
     receipt_poll_ms: u64,
+    receipt_finality: TxReceiptFinality,
     replacement_after_secs: u64,
     max_replacements: u32,
     worker_lease_secs: u64,
@@ -478,6 +485,20 @@ impl TxQueueRuntimeConfig {
             "PRIVACYBTC_TX_QUEUE_MAX_REPLACEMENTS",
             3,
         )?;
+        let receipt_finality = match std::env::var("PRIVACYBTC_TX_QUEUE_RECEIPT_FINALITY")
+            .unwrap_or_else(|_| "mined".to_string())
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "mined" => TxReceiptFinality::Mined,
+            "finalized" => TxReceiptFinality::Finalized,
+            _ => {
+                return Err(anyhow!(
+                    "PRIVACYBTC_TX_QUEUE_RECEIPT_FINALITY must be mined or finalized"
+                ))
+            }
+        };
         let cfg = Self {
             max_inflight: positive_env_u64("PRIVACYBTC_TX_QUEUE_MAX_INFLIGHT", 64)?,
             max_prepare_attempts: u32::try_from(max_prepare_attempts)
@@ -488,6 +509,7 @@ impl TxQueueRuntimeConfig {
                 "PRIVACYBTC_TX_QUEUE_RECEIPT_POLL_MS",
                 3_000,
             )?,
+            receipt_finality,
             replacement_after_secs: positive_env_u64(
                 "PRIVACYBTC_TX_QUEUE_REPLACEMENT_AFTER_SECS",
                 120,
@@ -1512,6 +1534,11 @@ async fn run_http_server(
         &signer,
     )?);
     let tx_queue_runtime = TxQueueRuntimeConfig::from_env(tx_queue_capacity)?;
+    if tx_queue_runtime.receipt_finality == TxReceiptFinality::Finalized && rpc.urls.len() < 2 {
+        return Err(anyhow!(
+            "finalized transaction queue receipts require an independent PRIVACYBTC_ETH_RPC_FALLBACK_URLS endpoint"
+        ));
+    }
     let tx_validation_slots = usize::try_from(positive_env_u64(
         "PRIVACYBTC_TX_QUEUE_VALIDATION_CONCURRENCY",
         16,
@@ -3790,7 +3817,13 @@ async fn queue_alias_receipt(
     };
     let mut reverted = false;
     for tx_hash in request.tx_hashes {
-        match client.get_transaction_receipt_status(&tx_hash).await {
+        match client
+            .get_transaction_receipt_status_for_queue(
+                &tx_hash,
+                cfg.tx_queue_runtime.receipt_finality,
+            )
+            .await
+        {
             Ok(Some(true)) => return Some(true),
             Ok(Some(false)) => reverted = true,
             Ok(None) => {}
@@ -3814,12 +3847,15 @@ async fn reconcile_queue_receipts(cfg: &RelayerHttpConfig, client: &EthRpcClient
         }
     };
     let mut checks = tokio::task::JoinSet::new();
+    let receipt_finality = cfg.tx_queue_runtime.receipt_finality;
     for job in jobs {
         for tx_hash in job.tx_hashes {
             let rpc = client.clone();
             let request_id = job.request_id.clone();
             checks.spawn(async move {
-                let result = rpc.get_transaction_receipt_status(&tx_hash).await;
+                let result = rpc
+                    .get_transaction_receipt_status_for_queue(&tx_hash, receipt_finality)
+                    .await;
                 (request_id, tx_hash, result)
             });
         }
@@ -3869,7 +3905,13 @@ async fn replace_pending_job(
     // Recheck every alias immediately before replacement; the receipt poll and this branch are
     // intentionally redundant around the race where the original tx is mined at the threshold.
     for tx_hash in &pending.tx_hashes {
-        match client.get_transaction_receipt_status(tx_hash).await {
+        match client
+            .get_transaction_receipt_status_for_queue(
+                tx_hash,
+                cfg.tx_queue_runtime.receipt_finality,
+            )
+            .await
+        {
             Ok(Some(true)) => {
                 let _ = cfg
                     .tx_queue
@@ -3885,6 +3927,21 @@ async fn replace_pending_job(
                 return true;
             }
             _ => {}
+        }
+        if cfg.tx_queue_runtime.receipt_finality == TxReceiptFinality::Finalized {
+            match client.get_transaction_receipt_status(tx_hash).await {
+                Ok(Some(_)) => {
+                    // The nonce is already mined. Keep the request pending until
+                    // both RPCs include this exact receipt under `finalized`;
+                    // replacing an already-mined transaction would be unsafe.
+                    return true;
+                }
+                Ok(None) => {}
+                Err(error) => eprintln!(
+                    "[tx-queue] mined receipt recheck failed request={} tx={}: {error:#}",
+                    pending.request_id, tx_hash
+                ),
+            }
         }
     }
 
@@ -5243,6 +5300,112 @@ impl EthRpcClient {
         Ok(result.map(|r| r.status == "0x1"))
     }
 
+    /// Queue terminality policy. `Mined` preserves the existing Monad behavior.
+    /// `Finalized` requires every configured RPC to agree on the same canonical
+    /// receipt and to place its block at or below that RPC's finalized head.
+    async fn get_transaction_receipt_status_for_queue(
+        &self,
+        tx_hash: &str,
+        finality: TxReceiptFinality,
+    ) -> Result<Option<bool>> {
+        if finality == TxReceiptFinality::Mined {
+            return self.get_transaction_receipt_status(tx_hash).await;
+        }
+        if self.urls.len() < 2 {
+            return Err(anyhow!(
+                "finalized queue receipt verification requires at least two RPC endpoints"
+            ));
+        }
+
+        let mut agreed: Option<(bool, u64, String)> = None;
+        for (index, url) in self.urls.iter().enumerate() {
+            let receipt: Option<Value> = self
+                .rpc_call_url(
+                    url,
+                    "eth_getTransactionReceipt",
+                    serde_json::json!([tx_hash]),
+                )
+                .await
+                .with_context(|| format!("queue receipt lookup through RPC endpoint {index}"))?;
+            let Some(receipt) = receipt else {
+                return Ok(None);
+            };
+            if !receipt
+                .get("transactionHash")
+                .and_then(Value::as_str)
+                .is_some_and(|value| value.eq_ignore_ascii_case(tx_hash))
+            {
+                return Err(anyhow!("RPC endpoint {index} returned the wrong transaction receipt"));
+            }
+            let status = match receipt.get("status").and_then(Value::as_str) {
+                Some("0x1") => true,
+                Some("0x0") => false,
+                _ => return Err(anyhow!("RPC endpoint {index} returned an invalid receipt status")),
+            };
+            let block_number = parse_hex_u64(
+                receipt
+                    .get("blockNumber")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("RPC endpoint {index} receipt has no block number"))?,
+            )?;
+            let block_hash = receipt
+                .get("blockHash")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("RPC endpoint {index} receipt has no block hash"))?
+                .to_ascii_lowercase();
+
+            let finalized: Option<Value> = self
+                .rpc_call_url(
+                    url,
+                    "eth_getBlockByNumber",
+                    serde_json::json!(["finalized", false]),
+                )
+                .await
+                .with_context(|| format!("finalized head lookup through RPC endpoint {index}"))?;
+            let finalized_number = parse_hex_u64(
+                finalized
+                    .as_ref()
+                    .and_then(|value| value.get("number"))
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("RPC endpoint {index} does not support finalized blocks"))?,
+            )?;
+            if block_number > finalized_number {
+                return Ok(None);
+            }
+
+            let canonical: Option<Value> = self
+                .rpc_call_url(
+                    url,
+                    "eth_getBlockByNumber",
+                    serde_json::json!([format!("0x{block_number:x}"), false]),
+                )
+                .await
+                .with_context(|| format!("canonical block lookup through RPC endpoint {index}"))?;
+            let canonical_hash = canonical
+                .as_ref()
+                .and_then(|value| value.get("hash"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("RPC endpoint {index} returned no canonical receipt block"))?;
+            if !canonical_hash.eq_ignore_ascii_case(&block_hash) {
+                return Err(anyhow!(
+                    "RPC endpoint {index} receipt block is not canonical at finalized head"
+                ));
+            }
+
+            if let Some((agreed_status, agreed_number, agreed_hash)) = &agreed {
+                if *agreed_status != status
+                    || *agreed_number != block_number
+                    || !agreed_hash.eq_ignore_ascii_case(&block_hash)
+                {
+                    return Err(anyhow!("RPC endpoints disagree on finalized queue receipt"));
+                }
+            } else {
+                agreed = Some((status, block_number, block_hash));
+            }
+        }
+        Ok(agreed.map(|(status, _, _)| status))
+    }
+
     /// Fail closed before an irreversible BTC payout: every configured RPC must agree
     /// on a successful, sufficiently deep transaction whose target and calldata are exactly
     /// those produced by this relayer for the unshield request.
@@ -5258,14 +5421,14 @@ impl EthRpcClient {
         }
         let expected_contract = normalize_evm_address(expected_contract)?;
         let mut agreed_block_hash: Option<String> = None;
-        for url in &self.urls {
+        for (index, url) in self.urls.iter().enumerate() {
             let receipt: Option<Value> = self.rpc_call_url(url, "eth_getTransactionReceipt", serde_json::json!([tx_hash])).await?;
             let Some(receipt) = receipt else { return Ok(false); };
             if receipt["status"].as_str() != Some("0x1")
                 || receipt["transactionHash"].as_str() != Some(tx_hash)
                 || receipt["to"].as_str().map(normalize_evm_address).transpose()? != Some(expected_contract.clone())
             {
-                return Err(anyhow!("RPC {url} returned an unexpected receipt"));
+                return Err(anyhow!("RPC endpoint {index} returned an unexpected receipt"));
             }
             let block_hash = receipt["blockHash"].as_str().ok_or_else(|| anyhow!("receipt missing blockHash"))?.to_owned();
             if let Some(previous) = &agreed_block_hash {
@@ -5277,13 +5440,17 @@ impl EthRpcClient {
             let head: String = self.rpc_call_url(url, "eth_blockNumber", serde_json::json!([])).await?;
             if parse_hex_u64(&head)?.saturating_sub(block).saturating_add(1) < min_confirmations { return Ok(false); }
             let tx: Option<Value> = self.rpc_call_url(url, "eth_getTransactionByHash", serde_json::json!([tx_hash])).await?;
-            let input = tx.and_then(|t| t["input"].as_str().map(str::to_owned)).ok_or_else(|| anyhow!("RPC {url} missing transaction input"))?;
+            let input = tx
+                .and_then(|t| t["input"].as_str().map(str::to_owned))
+                .ok_or_else(|| anyhow!("RPC endpoint {index} missing transaction input"))?;
             let actual_calldata_hash: [u8; 32] = Keccak256::digest(
                 hex::decode(strip_0x(&input)).context("invalid transaction input hex")?,
             )
             .into();
             if &actual_calldata_hash != expected_calldata_hash {
-                return Err(anyhow!("RPC {url} transaction calldata does not match submitted unshield"));
+                return Err(anyhow!(
+                    "RPC endpoint {index} transaction calldata does not match submitted unshield"
+                ));
             }
         }
         Ok(true)
@@ -5291,14 +5458,23 @@ impl EthRpcClient {
 
     async fn rpc_call_url<T: DeserializeOwned>(&self, url: &str, method: &str, params: Value) -> Result<T> {
         let req = serde_json::json!({ "jsonrpc": "2.0", "id": 1u64, "method": method, "params": params });
-        let response = self.http.post(url).json(&req).send().await
-            .with_context(|| format!("RPC request to {url}"))?
-            .json::<JsonRpcResponse<T>>().await
-            .with_context(|| format!("RPC decode from {url}"))?;
+        let response = self
+            .http
+            .post(url)
+            .json(&req)
+            .send()
+            .await
+            .map_err(|_| anyhow!("RPC request to configured endpoint failed"))?
+            .json::<JsonRpcResponse<T>>()
+            .await
+            .map_err(|_| anyhow!("RPC response decode from configured endpoint failed"))?;
         match (response.result, response.error) {
             (Some(value), None) => Ok(value),
-            (None, Some(error)) => Err(anyhow!("{} (from {url})", describe_rpc_error(&error))),
-            _ => Err(anyhow!("malformed RPC response from {url}")),
+            (None, Some(error)) => Err(anyhow!(
+                "{} (from configured RPC endpoint)",
+                describe_rpc_error(&error)
+            )),
+            _ => Err(anyhow!("malformed RPC response from configured endpoint")),
         }
     }
 
@@ -5311,7 +5487,7 @@ impl EthRpcClient {
             "params": params,
         });
         let mut last_err = anyhow::anyhow!("no rpc urls configured");
-        for url in &self.urls {
+        for (index, url) in self.urls.iter().enumerate() {
             match self.http.post(url).json(&req).send().await {
                 Ok(resp) => match resp.json::<JsonRpcResponse<T>>().await {
                     Ok(r) => match (r.result, r.error) {
@@ -5321,13 +5497,13 @@ impl EthRpcClient {
                             // JSON-RPC 应用层错误不换节点，直接返回
                             return Err(last_err);
                         }
-                        _ => { last_err = anyhow!("malformed rpc response from {url}"); }
+                        _ => { last_err = anyhow!("malformed response from RPC endpoint {index}"); }
                     },
-                    Err(e) => { last_err = anyhow!("decode error from {url}: {e}"); }
+                    Err(_) => { last_err = anyhow!("decode error from RPC endpoint {index}"); }
                 },
-                Err(e) => {
-                    eprintln!("[relayer] rpc {url} failed ({e}), trying next…");
-                    last_err = anyhow!("connection error from {url}: {e}");
+                Err(_) => {
+                    eprintln!("[relayer] RPC endpoint {index} failed, trying next…");
+                    last_err = anyhow!("connection error from RPC endpoint {index}");
                 }
             }
         }
@@ -5663,6 +5839,7 @@ mod tests {
                 max_prepare_attempts: 3,
                 receipt_batch_size: 20,
                 receipt_poll_ms: 100,
+                receipt_finality: TxReceiptFinality::Mined,
                 replacement_after_secs: 120,
                 max_replacements: 2,
                 worker_lease_secs: 60,
@@ -6648,6 +6825,141 @@ mod tests {
 
         let without = JsonRpcError { code: -32000, message: "boom".to_string(), data: None };
         assert_eq!(describe_rpc_error(&without), "rpc error -32000: boom");
+    }
+
+    #[derive(Clone)]
+    struct QueueReceiptRpcState {
+        tx_hash: String,
+        block_hash: String,
+        receipt_block: u64,
+        finalized_block: u64,
+        status: &'static str,
+    }
+
+    async fn queue_receipt_rpc(
+        State(state): State<QueueReceiptRpcState>,
+        Json(request): Json<Value>,
+    ) -> Json<Value> {
+        let method = request.get("method").and_then(Value::as_str).unwrap_or_default();
+        let params = request.get("params").cloned().unwrap_or(Value::Null);
+        let result = match method {
+            "eth_getTransactionReceipt" => serde_json::json!({
+                "transactionHash": state.tx_hash,
+                "status": state.status,
+                "blockNumber": format!("0x{:x}", state.receipt_block),
+                "blockHash": state.block_hash,
+            }),
+            "eth_getBlockByNumber"
+                if params.get(0).and_then(Value::as_str) == Some("finalized") =>
+            {
+                serde_json::json!({
+                    "number": format!("0x{:x}", state.finalized_block),
+                    "hash": format!("0x{}", "fa".repeat(32)),
+                })
+            }
+            "eth_getBlockByNumber" => serde_json::json!({
+                "number": format!("0x{:x}", state.receipt_block),
+                "hash": state.block_hash,
+            }),
+            _ => Value::Null,
+        };
+        Json(serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": result}))
+    }
+
+    async fn spawn_queue_receipt_rpc(state: QueueReceiptRpcState) -> String {
+        let app = Router::new()
+            .route("/", post(queue_receipt_rpc))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn queue_receipt_finality_requires_two_rpc_canonical_agreement() {
+        let tx_hash = format!("0x{}", "11".repeat(32));
+        let state = QueueReceiptRpcState {
+            tx_hash: tx_hash.clone(),
+            block_hash: format!("0x{}", "22".repeat(32)),
+            receipt_block: 16,
+            finalized_block: 16,
+            status: "0x1",
+        };
+        let primary = spawn_queue_receipt_rpc(state.clone()).await;
+        let fallback = spawn_queue_receipt_rpc(state).await;
+        let client = EthRpcClient {
+            http: Client::builder().no_proxy().build().unwrap(),
+            urls: vec![primary, fallback],
+        };
+        assert_eq!(
+            client
+                .get_transaction_receipt_status_for_queue(
+                    &tx_hash,
+                    TxReceiptFinality::Finalized,
+                )
+                .await
+                .unwrap(),
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn queue_receipt_stays_pending_before_finalized_head() {
+        let tx_hash = format!("0x{}", "33".repeat(32));
+        let state = QueueReceiptRpcState {
+            tx_hash: tx_hash.clone(),
+            block_hash: format!("0x{}", "44".repeat(32)),
+            receipt_block: 17,
+            finalized_block: 16,
+            status: "0x1",
+        };
+        let primary = spawn_queue_receipt_rpc(state.clone()).await;
+        let fallback = spawn_queue_receipt_rpc(state).await;
+        let client = EthRpcClient {
+            http: Client::builder().no_proxy().build().unwrap(),
+            urls: vec![primary, fallback],
+        };
+        assert_eq!(
+            client
+                .get_transaction_receipt_status_for_queue(
+                    &tx_hash,
+                    TxReceiptFinality::Finalized,
+                )
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn queue_receipt_rejects_rpc_block_hash_disagreement() {
+        let tx_hash = format!("0x{}", "55".repeat(32));
+        let first = QueueReceiptRpcState {
+            tx_hash: tx_hash.clone(),
+            block_hash: format!("0x{}", "66".repeat(32)),
+            receipt_block: 18,
+            finalized_block: 18,
+            status: "0x1",
+        };
+        let mut second = first.clone();
+        second.block_hash = format!("0x{}", "77".repeat(32));
+        let primary = spawn_queue_receipt_rpc(first).await;
+        let fallback = spawn_queue_receipt_rpc(second).await;
+        let client = EthRpcClient {
+            http: Client::builder().no_proxy().build().unwrap(),
+            urls: vec![primary, fallback],
+        };
+        let error = client
+            .get_transaction_receipt_status_for_queue(
+                &tx_hash,
+                TxReceiptFinality::Finalized,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("disagree"), "{error:#}");
     }
 
     #[test]
