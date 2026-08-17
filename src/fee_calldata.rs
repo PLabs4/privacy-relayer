@@ -73,6 +73,7 @@ fn privacy_call_token(call: &PrivacyCallArgs) -> Token {
 }
 
 const UNSHIELD_V2_SIG: &[u8] = b"unshield(uint256,address,bytes32,address,(bytes,uint256[8]))";
+const NATIVE_ETH_UNSHIELD_SIG: &[u8] = b"unshieldETH(uint256,address,(bytes,uint256[8]))";
 const TRANSFER_WITH_FEE_SIG: &[u8] =
     b"transferWithFee(address,(bytes,uint256[8]),(bytes,uint256[8]))";
 
@@ -82,6 +83,10 @@ pub fn unshield_v2_selector() -> [u8; 4] {
 
 pub fn transfer_with_fee_selector() -> [u8; 4] {
     selector(TRANSFER_WITH_FEE_SIG)
+}
+
+pub fn native_eth_unshield_selector() -> [u8; 4] {
+    selector(NATIVE_ETH_UNSHIELD_SIG)
 }
 
 /// `ERC20Shield.unshield(amountUnits, recipient, context, executor, call)`.
@@ -107,6 +112,24 @@ pub fn encode_unshield_v2_calldata(
         privacy_call_token(call),
     ];
     with_selector(unshield_v2_selector(), encode(&tokens))
+}
+
+/// `NativeEthGateway.unshieldETH(amountUnits, finalRecipient, call)`.
+///
+/// The gateway supplies itself as the pool recipient/executor and derives the
+/// application context on-chain. The caller supplies only the already-proved
+/// bundle and final native recipient; any mismatch fails the pool Binding proof.
+pub fn encode_native_eth_unshield_calldata(
+    amount_units: u64,
+    final_recipient: &[u8; 20],
+    call: &PrivacyCallArgs,
+) -> Vec<u8> {
+    let tokens = vec![
+        Token::Uint(Uint::from(amount_units)),
+        Token::Address(ethabi::Address::from(*final_recipient)),
+        privacy_call_token(call),
+    ];
+    with_selector(native_eth_unshield_selector(), encode(&tokens))
 }
 
 /// `Perc20FeeGateway.transferWithFee(pool, opCall, feeCall)`.
@@ -164,11 +187,22 @@ mod tests {
     fn selectors_match_signatures() {
         assert_eq!(unshield_v2_selector(), selector(UNSHIELD_V2_SIG));
         assert_eq!(transfer_with_fee_selector(), selector(TRANSFER_WITH_FEE_SIG));
+        assert_eq!(native_eth_unshield_selector(), selector(NATIVE_ETH_UNSHIELD_SIG));
         // must differ from the legacy 3-arg unshield the contract no longer exposes
         assert_ne!(
             unshield_v2_selector(),
             selector(b"unshield(uint256,address,(bytes,uint256[8]))")
         );
+    }
+
+    #[test]
+    fn native_eth_unshield_targets_gateway_three_arg_abi() {
+        let cd = encode_native_eth_unshield_calldata(7, &[0x44; 20], &empty_call());
+        assert_eq!(&cd[..4], &native_eth_unshield_selector());
+        let body = &cd[4..];
+        assert_eq!(Uint::from_big_endian(&body[0..32]), Uint::from(7));
+        assert_eq!(&body[32 + 12..64], &[0x44u8; 20]);
+        assert_eq!(Uint::from_big_endian(&body[64..96]), Uint::from(96));
     }
 
     fn empty_call() -> PrivacyCallArgs {
