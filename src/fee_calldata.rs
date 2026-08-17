@@ -73,8 +73,13 @@ fn privacy_call_token(call: &PrivacyCallArgs) -> Token {
 }
 
 const UNSHIELD_V2_SIG: &[u8] = b"unshield(uint256,address,bytes32,address,(bytes,uint256[8]))";
+/// The multi-fee-asset gateway: `feePool` is the FIRST argument, because the gateway accepts
+/// several fee assets and prices `(fee asset, target pool)` PAIRS. The single-asset form
+/// (`transferWithFee(address,…)`, selector `0x4c4ba93b`) is gone — a relayer built against it
+/// reverts with a decode error, not a helpful message, so this constant is what must be kept in
+/// step with `PERC20/contracts/ptoken/Perc20FeeGateway.sol`.
 const TRANSFER_WITH_FEE_SIG: &[u8] =
-    b"transferWithFee(address,(bytes,uint256[8]),(bytes,uint256[8]))";
+    b"transferWithFee(address,address,(bytes,uint256[8]),(bytes,uint256[8]))";
 
 pub fn unshield_v2_selector() -> [u8; 4] {
     selector(UNSHIELD_V2_SIG)
@@ -126,17 +131,23 @@ pub fn encode_transfer_calldata(call: &PrivacyCallArgs) -> Vec<u8> {
     with_selector(transfer_selector(), encode(&[privacy_call_token(call)]))
 }
 
-/// `Perc20FeeGateway.transferWithFee(pool, opCall, feeCall)`.
+/// `Perc20FeeGateway.transferWithFee(feePool, pool, opCall, feeCall)`.
 ///
-/// `opCall` must have been proved with `executor = <gateway address>`; `feeCall` is a pUSDC
-/// unshield bundle whose amount/recipient/context the gateway supplies itself, so a mismatch
-/// fails the Binding proof rather than passing an unchecked value through.
+/// `opCall` must have been proved with `executor = <gateway address>`; `feeCall` is an unshield
+/// bundle against `fee_pool` whose amount/recipient/context the gateway supplies itself, so a
+/// mismatch fails the Binding proof rather than passing an unchecked value through.
+///
+/// `fee_pool` must be one the governor has priced for `pool` — the gateway checks
+/// `transferFeeUnits[feePool][pool] != 0` before it calls into `feePool` at all, so an unpriced
+/// pair reverts `FeeNotConfigured` rather than reaching an arbitrary contract.
 pub fn encode_transfer_with_fee_calldata(
+    fee_pool: &[u8; 20],
     pool: &[u8; 20],
     op_call: &PrivacyCallArgs,
     fee_call: &PrivacyCallArgs,
 ) -> Vec<u8> {
     let tokens = vec![
+        Token::Address(ethabi::Address::from(*fee_pool)),
         Token::Address(ethabi::Address::from(*pool)),
         privacy_call_token(op_call),
         privacy_call_token(fee_call),
@@ -144,8 +155,9 @@ pub fn encode_transfer_with_fee_calldata(
     with_selector(transfer_with_fee_selector(), encode(&tokens))
 }
 
-/// `Perc20FeeGateway.transferWithFee(pool, combinedCall, EMPTY)` — the same-asset form, used
-/// when the transferred asset IS the fee asset.
+/// `Perc20FeeGateway.transferWithFee(pool, pool, combinedCall, EMPTY)` — the same-asset form,
+/// used when the transferred asset IS the fee asset. Both address arguments are that one pool:
+/// the gateway rejects `pool != feePool` in this mode with `NotFeeAsset` before anything else.
 ///
 /// The single bundle both moves the notes and unshields the fee, which is what lets a wallet
 /// with one note pay for its own transfer; two bundles in one pool would have to spend that
@@ -165,6 +177,7 @@ pub fn encode_transfer_with_fee_same_asset_calldata(
         Token::FixedArray(vec![Token::Uint(Uint::zero()); 8]),
     ]);
     let tokens = vec![
+        Token::Address(ethabi::Address::from(*pool)),
         Token::Address(ethabi::Address::from(*pool)),
         privacy_call_token(combined_call),
         empty_call,
@@ -229,16 +242,31 @@ mod tests {
     fn transfer_with_fee_carries_two_distinct_calls() {
         let mut fee = empty_call();
         fee.binding_proof[0] = [0xAB; 32];
-        let cd = encode_transfer_with_fee_calldata(&[0x44; 20], &empty_call(), &fee);
+        let cd = encode_transfer_with_fee_calldata(&[0xFE; 20], &[0x44; 20], &empty_call(), &fee);
         assert_eq!(&cd[..4], &transfer_with_fee_selector());
         let body = &cd[4..];
-        assert_eq!(&body[12..32], &[0x44u8; 20]);
+        // arg0 is the FEE asset, arg1 the target pool — swapping them would price off the wrong
+        // row of the gateway's table and unshield from the wrong pool.
+        assert_eq!(&body[12..32], &[0xFEu8; 20]);
+        assert_eq!(&body[44..64], &[0x44u8; 20]);
         // two dynamic tuples → two distinct offsets
-        let off_op = Uint::from_big_endian(&body[32..64]);
-        let off_fee = Uint::from_big_endian(&body[64..96]);
+        let off_op = Uint::from_big_endian(&body[64..96]);
+        let off_fee = Uint::from_big_endian(&body[96..128]);
         assert_ne!(off_op, off_fee);
         // the fee leg's distinguishing binding word must appear in the payload
         assert!(cd.windows(32).any(|w| w == [0xABu8; 32]));
+    }
+
+    /// The single-fee-asset gateway's selector must NOT be what we emit: a relayer still
+    /// encoding `0x4c4ba93b` reaches the new gateway as an unknown selector and reverts in the
+    /// fallback, which reads as "the pool rejected the bundle" rather than "wrong ABI".
+    #[test]
+    fn transfer_with_fee_is_the_multi_fee_asset_signature() {
+        assert_ne!(
+            transfer_with_fee_selector(),
+            selector(b"transferWithFee(address,(bytes,uint256[8]),(bytes,uint256[8]))")
+        );
+        assert_eq!(transfer_with_fee_selector(), [0x25, 0x78, 0x4a, 0x2e]);
     }
 
     /// The same-asset form rides the SAME selector; the mode switch is the empty `actions`.
@@ -251,11 +279,14 @@ mod tests {
         let cd = encode_transfer_with_fee_same_asset_calldata(&[0x55; 20], &call);
         assert_eq!(&cd[..4], &transfer_with_fee_selector());
         let body = &cd[4..];
+        // Same-asset means BOTH address arguments are that one pool; the gateway rejects any
+        // other combination with `NotFeeAsset` before it looks at anything else.
         assert_eq!(&body[12..32], &[0x55u8; 20]);
+        assert_eq!(&body[44..64], &[0x55u8; 20]);
         assert!(cd.windows(32).any(|w| w == [0xCDu8; 32]));
 
         // Walk to the fee tuple and read its `actions` length: it must be exactly 0.
-        let off_fee = Uint::from_big_endian(&body[64..96]).as_usize();
+        let off_fee = Uint::from_big_endian(&body[96..128]).as_usize();
         let fee_tuple = &body[off_fee..];
         let off_actions = Uint::from_big_endian(&fee_tuple[0..32]).as_usize();
         assert_eq!(

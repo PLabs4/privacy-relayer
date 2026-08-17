@@ -183,7 +183,9 @@ enum Command {
         /// protocol fee cannot be skipped; without it `/transfer/submit` is disabled.
         #[arg(long, env = "PRIVACYBTC_FEE_GATEWAY_ADDRESS")]
         fee_gateway: Option<String>,
-        /// pUSDC pool backing the transfer fee (diagnostics/preflight only).
+        /// Pools whose notes may PAY the transfer fee, comma-separated. The gateway accepts
+        /// several fee assets; this is the subset this relayer will submit for. One entry keeps
+        /// `/transfer/submit` working without a `fee_pool` field in the request.
         #[arg(long, env = "PRIVACYBTC_FEE_POOL_ADDRESS")]
         fee_pool: Option<String>,
         /// Address of the `SwapCoordinator` for 3-tx atomic swaps. Required for /swap/* routes;
@@ -353,6 +355,12 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// An `address` as a 32-byte ABI head word (right-aligned, no `0x`).
+fn abi_word_address(address: &str) -> Result<String> {
+    let normalized = normalize_evm_address(address)?;
+    Ok(format!("{:0>64}", strip_0x(&normalized)))
 }
 
 fn strip_0x(s: &str) -> &str {
@@ -526,12 +534,18 @@ struct RelayerHttpConfig {
     /// straight to a pool — that is what makes the protocol fee unavoidable on the sponsored
     /// path (docs/tx_fee_impl.md §4). Required whenever transfer sponsorship is enabled.
     fee_gateway: Option<String>,
-    /// The pool the gateway charges fees from (`Perc20FeeGateway.feePool()`). Retained after the
-    /// boot-time gateway cross-check because a request targeting THIS pool is special in two ways:
+    /// Pools whose notes may PAY the transfer fee. The gateway prices `(fee asset, target pool)`
+    /// PAIRS and accepts several fee assets, so this is a list, not a single pool — there is no
+    /// `feePool()` getter to cross-check against any more.
+    ///
+    /// A request whose `contract` is one of THESE is special in two ways:
     ///   * it may pay with ONE combined bundle (same-asset mode — see `http_transfer_submit`);
     ///   * if it still sends two, they must not reuse a nullifier, which we reject here rather
     ///     than letting an RPC simulation reach `NullifierSpent()`.
-    fee_pool: Option<String>,
+    ///
+    /// With exactly one entry a request need not name its fee asset; with several it must, since
+    /// guessing would unshield from a pool the user never proved against.
+    fee_pools: Vec<String>,
     /// Default `SwapCoordinator` address for /swap/* routes (per-request override allowed).
     swap_coordinator: Option<String>,
     /// Gas limit for `settle` (heaviest swap call).
@@ -642,6 +656,29 @@ fn protocol_expectation_from_env(default_pool: &str) -> Result<ProtocolExpectati
         verifier_set_id,
         pools,
     })
+}
+
+/// `--fee-pool` / `PRIVACYBTC_FEE_POOL_ADDRESS`: comma-separated pools whose notes may pay the
+/// transfer fee.
+///
+/// Comma-separated rather than a repeated flag so the existing single-address env var keeps
+/// working byte-for-byte — a renamed or restructured key fail-closes deploy preflight, and this
+/// change already moves enough on-chain.
+fn parse_fee_pools(raw: Option<&str>) -> Result<Vec<String>> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    let mut pools: Vec<String> = Vec::new();
+    for value in raw.split(',').map(str::trim).filter(|v| !v.is_empty()) {
+        let pool = normalize_evm_address(value)?;
+        // A duplicate is a config typo, not a second fee asset; silently deduping would hide it
+        // while making the "exactly one ⇒ no fee_pool field needed" rule behave unpredictably.
+        if pools.contains(&pool) {
+            return Err(anyhow!("--fee-pool lists {pool} twice"));
+        }
+        pools.push(pool);
+    }
+    Ok(pools)
 }
 
 fn parse_protocol_pools(raw: &str) -> Result<HashSet<String>> {
@@ -1322,18 +1359,18 @@ async fn run_http_server(
             .with_context(|| format!("protocol gate for pool {pool}"))?;
     }
     let fee_gateway = fee_gateway.map(normalize_evm_address).transpose()?;
-    let fee_pool = fee_pool.map(normalize_evm_address).transpose()?;
-    match (fee_gateway.as_deref(), fee_pool.as_deref()) {
-        (Some(gw), Some(fp)) => {
-            rpc.verify_fee_gateway(gw, fp)
+    let fee_pools = parse_fee_pools(fee_pool)?;
+    match (fee_gateway.as_deref(), fee_pools.is_empty()) {
+        (Some(gw), false) => {
+            rpc.verify_fee_gateway(gw, &fee_pools, &protocol.pools)
                 .await
                 .with_context(|| format!("fee gateway config check for {gw}"))?;
         }
-        (Some(gw), None) => {
-            // Without the expected pool we cannot cross-check; say so instead of pretending.
+        (Some(gw), true) => {
+            // Without the fee assets we cannot cross-check; say so instead of pretending.
             eprintln!(
                 "[relayer] WARNING: fee gateway {gw} configured without --fee-pool; \
-                 skipping the feePool() cross-check."
+                 skipping the fee-asset pricing cross-check."
             );
         }
         (None, _) => {
@@ -1472,7 +1509,7 @@ async fn run_http_server(
         gas_limit_transfer,
         gas_limit_margin_bps,
         fee_gateway,
-        fee_pool,
+        fee_pools,
         swap_coordinator,
         gas_limit_swap,
         auto_shield,
@@ -1842,7 +1879,7 @@ struct HttpTransferSubmitRequest {
     /// pUSDC unshield bundle paying the protocol fee. Its amount/recipient/context are supplied
     /// by the gateway on-chain, so a wrong bundle fails verification rather than under-paying.
     ///
-    /// Omitted ONLY for a same-asset transfer — one where `contract` is the fee pool itself.
+    /// Omitted ONLY for a same-asset transfer — one where `contract` is a fee pool itself.
     /// There `bundle` is a COMBINED bundle that both moves the notes and unshields the fee, and
     /// a second bundle is not merely redundant but impossible: two spends in one pool cannot
     /// draw on the same note, and a single-note wallet has nothing else to offer. Any other
@@ -1850,6 +1887,14 @@ struct HttpTransferSubmitRequest {
     /// (docs/tx_fee_impl.md §4, R-3).
     #[serde(default)]
     fee_bundle: Option<OrchardStoredBundle>,
+    /// Which fee asset `fee_bundle` spends from. The gateway accepts several, so this cannot be
+    /// inferred from the bundle — and guessing would unshield from a pool the user never proved
+    /// against, failing the Binding proof with a misleading error.
+    ///
+    /// Optional only when this relayer is configured with exactly ONE fee pool, which is then
+    /// the answer. Ignored in same-asset mode: there the fee asset IS `contract`.
+    #[serde(default)]
+    fee_pool: Option<String>,
 }
 
 /// GET /tx/status?hash=0x...
@@ -2009,12 +2054,9 @@ async fn http_transfer_submit(
             // The gateway executes the fee leg first, so a shared nullifier is a deterministic
             // same-transaction double spend; say so here instead of burning an RPC simulation
             // on a `NullifierSpent()` revert.
-            let fee_pool = cfg.fee_pool.as_deref().ok_or_else(|| {
-                http_error(anyhow!(
-                    "sponsored transfers require PRIVACYBTC_FEE_POOL_ADDRESS so the fee proof \
-                     can be validated and its nullifiers reserved"
-                ))
-            })?;
+            let fee_pool = resolve_fee_pool(&cfg.fee_pools, req.fee_pool.as_deref())
+                .map_err(http_error)?;
+            let fee_pool = fee_pool.as_str();
             ensure_transfer_fee_nullifiers_disjoint(
                 &contract,
                 fee_pool,
@@ -2030,12 +2072,19 @@ async fn http_transfer_submit(
                 .map_err(http_error)?;
             let pool_addr = parse_evm_address_hex(&contract)
                 .map_err(|error| http_error(anyhow!("bad pool address: {error}")))?;
+            let fee_pool_addr = parse_evm_address_hex(fee_pool)
+                .map_err(|error| http_error(anyhow!("bad fee pool address: {error}")))?;
             let op_call = bundle_to_privacy_call(&req.bundle).map_err(http_error)?;
             let fee_call = bundle_to_privacy_call(fee_bundle).map_err(http_error)?;
             let mut nullifiers = queue_nullifiers(&contract, &req.bundle);
             nullifiers.extend(queue_nullifiers(fee_pool, fee_bundle));
             (
-                encode_transfer_with_fee_calldata(&pool_addr, &op_call, &fee_call),
+                encode_transfer_with_fee_calldata(
+                    &fee_pool_addr,
+                    &pool_addr,
+                    &op_call,
+                    &fee_call,
+                ),
                 nullifiers,
             )
         }
@@ -2044,16 +2093,19 @@ async fn http_transfer_submit(
             // `fee_bundle` for some other pool is a fee-free sponsorship request, which is the
             // exact thing this handler exists to refuse; an unconfigured `fee_pool` means we
             // cannot tell the two apart, so we refuse that too rather than guess.
-            let fee_pool = cfg.fee_pool.clone().ok_or_else(|| {
-                http_error(anyhow!(
+            if cfg.fee_pools.is_empty() {
+                return Err(http_error(anyhow!(
                     "fee_bundle is required: the same-asset single-bundle path needs \
                      PRIVACYBTC_FEE_POOL_ADDRESS configured to be recognised"
-                ))
-            })?;
-            if contract != fee_pool {
+                )));
+            }
+            // Same-asset means the transferred pool IS a fee asset. Membership, not equality:
+            // several pools can be fee assets now, and each of them may be transferred this way.
+            if !cfg.fee_pools.iter().any(|fp| fp == &contract) {
                 return Err(http_error(anyhow!(
-                    "fee_bundle is required for pool {contract}: only transfers of the fee \
-                     asset itself ({fee_pool}) pay with a single combined bundle"
+                    "fee_bundle is required for pool {contract}: only transfers of a fee asset \
+                     itself ({}) pay with a single combined bundle",
+                    cfg.fee_pools.join(", ")
                 )));
             }
             enforce_frozen_compliance(&cfg.rpc_url, &contract, &req.bundle)
@@ -4517,6 +4569,39 @@ async fn submit_transfer_bundle(
 /// This guards the TWO-bundle shape only. A same-asset caller that omits `fee_bundle` entirely
 /// takes the combined single-bundle path above, where there is only one spend and nothing to
 /// collide — that is the shape a single-note wallet has to use.
+/// Which fee asset a two-bundle sponsored transfer pays from.
+///
+/// The gateway accepts several, and it unshields from whichever one the calldata names — so
+/// picking the wrong one does not merely mis-price, it spends against a pool the user never
+/// proved for. Hence: the request names it, and we only fall back when there is exactly one
+/// configured fee asset and therefore nothing to get wrong.
+fn resolve_fee_pool(configured: &[String], requested: Option<&str>) -> Result<String> {
+    if configured.is_empty() {
+        return Err(anyhow!(
+            "sponsored transfers require PRIVACYBTC_FEE_POOL_ADDRESS so the fee proof can be \
+             validated and its nullifiers reserved"
+        ));
+    }
+    match requested {
+        Some(raw) => {
+            let pool = normalize_evm_address(raw)?;
+            if !configured.contains(&pool) {
+                return Err(anyhow!(
+                    "fee_pool {pool} is not one this relayer sponsors ({})",
+                    configured.join(", ")
+                ));
+            }
+            Ok(pool)
+        }
+        None if configured.len() == 1 => Ok(configured[0].clone()),
+        None => Err(anyhow!(
+            "fee_pool is required: this relayer accepts several fee assets ({}) and the fee \
+             bundle does not say which one it spends from",
+            configured.join(", ")
+        )),
+    }
+}
+
 fn ensure_transfer_fee_nullifiers_disjoint(
     operation_pool: &str,
     fee_pool: &str,
@@ -5093,20 +5178,58 @@ impl EthRpcClient {
     /// Boot-time guard: the gateway's own `feePool()` must be the pUSDC pool we were configured
     /// with. A mismatch means fees would be collected from a different pool than operators
     /// believe, so refuse to start rather than discover it in production accounting.
-    async fn verify_fee_gateway(&self, gateway: &str, expected_fee_pool: &str) -> Result<()> {
-        // feePool() selector = keccak("feePool()")[..4]
-        let sel = format!("0x{}", hex::encode(&Keccak256::digest(b"feePool()")[..4]));
-        let raw = self.eth_call(gateway, &sel).await?;
-        let word = strip_0x(&raw);
-        if word.len() < 64 {
-            return Err(anyhow!("feePool() returned a short word: {raw}"));
-        }
-        let actual = format!("0x{}", &word[word.len() - 40..]).to_lowercase();
-        let expected = normalize_evm_address(expected_fee_pool)?;
-        if actual != expected {
-            return Err(anyhow!(
-                "fee gateway {gateway} points at feePool {actual}, but --fee-pool is {expected}"
-            ));
+    /// Boot-time cross-check for the multi-fee-asset gateway.
+    ///
+    /// There is no `feePool()` to compare against any more — the gateway prices
+    /// `(fee asset, target pool)` PAIRS, and pricing is the admission gate for both halves. So
+    /// the meaningful check is that every configured fee asset can actually pay for at least one
+    /// pool this relayer sponsors. That catches the wrong gateway address, a gateway nobody
+    /// priced yet, and a fee pool the governor never admitted — each of which would otherwise
+    /// surface as `FeeNotConfigured` on a user's first sponsored transfer.
+    ///
+    /// `transferFeeUnits(address,address)` = keccak(sig)[..4] = 0x689bf892.
+    async fn verify_fee_gateway(
+        &self,
+        gateway: &str,
+        fee_pools: &[String],
+        protocol_pools: &HashSet<String>,
+    ) -> Result<()> {
+        let sel = hex::encode(&Keccak256::digest(b"transferFeeUnits(address,address)")[..4]);
+        for fee_pool in fee_pools {
+            let mut priced_for: Vec<&str> = Vec::new();
+            for pool in protocol_pools {
+                let data = format!(
+                    "0x{sel}{}{}",
+                    abi_word_address(fee_pool)?,
+                    abi_word_address(pool)?
+                );
+                let raw = self.eth_call(gateway, &data).await.with_context(|| {
+                    format!("transferFeeUnits({fee_pool}, {pool}) on gateway {gateway}")
+                })?;
+                let word = strip_0x(&raw);
+                if word.len() < 64 {
+                    return Err(anyhow!(
+                        "transferFeeUnits on {gateway} returned a short word ({raw}) — \
+                         is {gateway} really a Perc20FeeGateway?"
+                    ));
+                }
+                if word.trim_start_matches('0').is_empty() {
+                    continue;
+                }
+                priced_for.push(pool);
+            }
+            if priced_for.is_empty() {
+                return Err(anyhow!(
+                    "fee gateway {gateway} prices no sponsorable pool in {fee_pool}: every \
+                     transferFeeUnits({fee_pool}, <pool>) is zero, so every sponsored transfer \
+                     paid in it would revert FeeNotConfigured. Price it with setTransferFee, or \
+                     drop it from --fee-pool."
+                ));
+            }
+            eprintln!(
+                "[relayer] fee asset {fee_pool} priced for {} sponsorable pool(s)",
+                priced_for.len()
+            );
         }
         Ok(())
     }
@@ -5637,7 +5760,7 @@ mod tests {
             fee_gateway: Some("0x00000000000000000000000000000000000000bb".into()),
             // Deliberately one of the `protocol_pools` below: the same-asset transfer path is
             // reached only for the fee pool, so it has to be a pool the relayer serves.
-            fee_pool: Some("0x2222222222222222222222222222222222222222".into()),
+            fee_pools: vec!["0x2222222222222222222222222222222222222222".into()],
             swap_coordinator: Some("0xc".into()),
             gas_limit_swap: 12_000_000,
             auto_shield: None,
@@ -6386,6 +6509,53 @@ mod tests {
         .await;
         assert_eq!(st, Sc::ACCEPTED);
         assert_eq!(body["status"], "queued");
+    }
+
+    /// The single-address env var must keep working verbatim — a config that has to change
+    /// shape fail-closes deploy preflight long before anyone reads the new feature's docs.
+    #[test]
+    fn fee_pool_list_accepts_one_or_many() {
+        assert_eq!(parse_fee_pools(None).unwrap(), Vec::<String>::new());
+        assert_eq!(
+            parse_fee_pools(Some("0x1111111111111111111111111111111111111111")).unwrap(),
+            vec!["0x1111111111111111111111111111111111111111".to_string()]
+        );
+        assert_eq!(
+            parse_fee_pools(Some(
+                "0x1111111111111111111111111111111111111111, 0x2222222222222222222222222222222222222222"
+            ))
+            .unwrap()
+            .len(),
+            2
+        );
+        // A duplicate is a typo, and deduping it would silently change whether a request needs
+        // to name its fee asset.
+        assert!(parse_fee_pools(Some(
+            "0x1111111111111111111111111111111111111111,0x1111111111111111111111111111111111111111"
+        ))
+        .is_err());
+    }
+
+    /// Picking the wrong fee asset does not merely mis-price: the gateway unshields from the
+    /// pool the calldata names, so a guess spends against a pool the user never proved for.
+    #[test]
+    fn fee_pool_is_only_inferred_when_there_is_nothing_to_get_wrong() {
+        let one = vec!["0x1111111111111111111111111111111111111111".to_string()];
+        let two = vec![
+            "0x1111111111111111111111111111111111111111".to_string(),
+            "0x2222222222222222222222222222222222222222".to_string(),
+        ];
+        // exactly one configured ⇒ the request need not say
+        assert_eq!(resolve_fee_pool(&one, None).unwrap(), one[0]);
+        // several ⇒ it must
+        assert!(resolve_fee_pool(&two, None).is_err());
+        assert_eq!(
+            resolve_fee_pool(&two, Some("0x2222222222222222222222222222222222222222")).unwrap(),
+            two[1]
+        );
+        // and only from the configured set — an arbitrary pool would be unshielded from
+        assert!(resolve_fee_pool(&two, Some("0x3333333333333333333333333333333333333333")).is_err());
+        assert!(resolve_fee_pool(&[], None).is_err());
     }
 
     #[test]
