@@ -32,8 +32,8 @@ use privacy_core::ethereum::{
 // The fee release changed `unshield`'s ABI and added the gateway; privacy-core is pinned to a
 // rev that predates both, so those two calls are encoded locally (see `fee_calldata`).
 use fee_calldata::{
-    encode_transfer_with_fee_calldata, encode_transfer_with_fee_same_asset_calldata,
-    encode_unshield_v2_calldata,
+    encode_native_eth_unshield_calldata, encode_transfer_with_fee_calldata,
+    encode_transfer_with_fee_same_asset_calldata, encode_unshield_v2_calldata,
 };
 use reqwest::Client;
 use serde::de::DeserializeOwned;
@@ -161,6 +161,16 @@ enum Command {
         contract: String,
         #[arg(long, env = "PRIVACYBTC_GAS_PRICE_GWEI", default_value_t = 1.0)]
         gas_price_gwei: f64,
+        /// Keep the BTC/legacy mint, direct-submit, swap and generic relay HTTP
+        /// surfaces. Defaults on for existing Monad deployments. Additive
+        /// Ethereum shield-only deployments set this false and expose only the
+        /// closed typed queue plus user-paid wrapped Shield calldata.
+        #[arg(
+            long,
+            env = "PRIVACYBTC_LEGACY_ROUTES_ENABLED",
+            default_value_t = true
+        )]
+        legacy_routes_enabled: bool,
         /// Maximum signed gas limit for shield. The relayer estimates each exact transaction,
         /// adds `gas_limit_margin_bps`, and fails closed if the result exceeds this cap.
         #[arg(long, env = "PRIVACYBTC_GAS_LIMIT_SHIELD", default_value_t = 6_000_000)]
@@ -186,6 +196,13 @@ enum Command {
         /// pUSDC pool backing the transfer fee (diagnostics/preflight only).
         #[arg(long, env = "PRIVACYBTC_FEE_POOL_ADDRESS")]
         fee_pool: Option<String>,
+        /// WETH-backed sETH pool served by `NATIVE_ETH_GATEWAY_ADDRESS`. Both
+        /// values must be configured together; otherwise the native endpoint is disabled.
+        #[arg(long, env = "PRIVACYBTC_NATIVE_ETH_POOL_ADDRESS")]
+        native_eth_pool: Option<String>,
+        /// `NativeEthGateway` paired with `NATIVE_ETH_POOL_ADDRESS`.
+        #[arg(long, env = "PRIVACYBTC_NATIVE_ETH_GATEWAY_ADDRESS")]
+        native_eth_gateway: Option<String>,
         /// Address of the `SwapCoordinator` for 3-tx atomic swaps. Required for /swap/* routes;
         /// each request may also override it per-call.
         #[arg(long, env = "PRIVACYBTC_SWAP_COORDINATOR_ADDRESS")]
@@ -306,12 +323,15 @@ async fn main() -> Result<()> {
             private_key,
             contract,
             gas_price_gwei,
+            legacy_routes_enabled,
             gas_limit_shield,
             gas_limit_unshield,
             gas_limit_transfer,
             gas_limit_margin_bps,
             fee_gateway,
             fee_pool,
+            native_eth_pool,
+            native_eth_gateway,
             swap_coordinator,
             gas_limit_swap,
             btc_rpc_url,
@@ -331,12 +351,15 @@ async fn main() -> Result<()> {
                 &private_key,
                 &contract,
                 gas_price_gwei,
+                legacy_routes_enabled,
                 gas_limit_shield,
                 gas_limit_unshield,
                 gas_limit_transfer,
                 gas_limit_margin_bps,
                 fee_gateway.as_deref(),
                 fee_pool.as_deref(),
+                native_eth_pool.as_deref(),
+                native_eth_gateway.as_deref(),
                 swap_coordinator.as_deref(),
                 gas_limit_swap,
                 btc_rpc_url.as_deref(),
@@ -435,6 +458,10 @@ struct TxQueueRuntimeConfig {
     replacement_after_secs: u64,
     max_replacements: u32,
     worker_lease_secs: u64,
+    /// Optional hard ceiling for every typed queue EIP-1559 transaction. An
+    /// omitted value preserves the existing Monad behavior; Ethereum sets an
+    /// explicit positive cap.
+    max_fee_per_gas_cap: Option<u128>,
 }
 
 impl TxQueueRuntimeConfig {
@@ -470,6 +497,9 @@ impl TxQueueRuntimeConfig {
             worker_lease_secs: positive_env_u64(
                 "PRIVACYBTC_TX_QUEUE_WORKER_LEASE_SECS",
                 60,
+            )?,
+            max_fee_per_gas_cap: optional_positive_env_u128(
+                "PRIVACYBTC_TX_QUEUE_MAX_FEE_PER_GAS_CAP",
             )?,
         };
         if cfg.max_inflight > queue_capacity as u64 || cfg.max_inflight > 1_024 {
@@ -518,6 +548,7 @@ struct RelayerHttpConfig {
     private_key: String,
     contract: String,
     gas_price_gwei: f64,
+    legacy_routes_enabled: bool,
     gas_limit_shield: u64,
     gas_limit_unshield: u64,
     gas_limit_transfer: u64,
@@ -532,6 +563,9 @@ struct RelayerHttpConfig {
     ///   * if it still sends two, they must not reuse a nullifier, which we reject here rather
     ///     than letting an RPC simulation reach `NullifierSpent()`.
     fee_pool: Option<String>,
+    /// Optional, boot-verified fixed `(sETH pool, NativeEthGateway)` pair.
+    native_eth_pool: Option<String>,
+    native_eth_gateway: Option<String>,
     /// Default `SwapCoordinator` address for /swap/* routes (per-request override allowed).
     swap_coordinator: Option<String>,
     /// Gas limit for `settle` (heaviest swap call).
@@ -988,6 +1022,40 @@ fn positive_env_u64(name: &str, default: u64) -> Result<u64> {
     Ok(value)
 }
 
+fn optional_positive_env_u128(name: &str) -> Result<Option<u128>> {
+    let Some(raw) = std::env::var(name)
+        .ok()
+        .filter(|raw| !raw.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    let value = raw
+        .parse::<u128>()
+        .with_context(|| format!("{name} must be a positive u128"))?;
+    if value == 0 {
+        return Err(anyhow!("{name} must be > 0 when configured"));
+    }
+    Ok(Some(value))
+}
+
+fn enforce_eip1559_fee_cap(
+    priority_fee: u128,
+    max_fee: u128,
+    cap: Option<u128>,
+) -> Result<(u128, u128)> {
+    if priority_fee == 0 || priority_fee > max_fee {
+        return Err(anyhow!("invalid EIP-1559 fee relationship"));
+    }
+    if let Some(cap) = cap {
+        if priority_fee > cap || max_fee > cap {
+            return Err(anyhow!(
+                "EIP-1559 fee quote priority={priority_fee} max={max_fee} exceeds configured cap {cap}"
+            ));
+        }
+    }
+    Ok((priority_fee, max_fee))
+}
+
 fn tx_queue_limit_config_from_env() -> Result<SubmitRawLimitConfig> {
     let cfg = SubmitRawLimitConfig {
         window_secs: positive_env_u64("PRIVACYBTC_TX_QUEUE_WINDOW_SECS", 60)?,
@@ -1283,12 +1351,15 @@ async fn run_http_server(
     private_key: &str,
     contract: &str,
     gas_price_gwei: f64,
+    legacy_routes_enabled: bool,
     gas_limit_shield: u64,
     gas_limit_unshield: u64,
     gas_limit_transfer: u64,
     gas_limit_margin_bps: u64,
     fee_gateway: Option<&str>,
     fee_pool: Option<&str>,
+    native_eth_pool: Option<&str>,
+    native_eth_gateway: Option<&str>,
     swap_coordinator: Option<&str>,
     gas_limit_swap: u64,
     btc_rpc_url: Option<&str>,
@@ -1338,6 +1409,27 @@ async fn run_http_server(
                 "[relayer] WARNING: no --fee-gateway configured; /transfer/submit will reject \
                  all requests. Set PRIVACYBTC_FEE_GATEWAY_ADDRESS to enable sponsored transfers."
             );
+        }
+    }
+    let native_eth_pool = native_eth_pool.map(normalize_evm_address).transpose()?;
+    let native_eth_gateway = native_eth_gateway.map(normalize_evm_address).transpose()?;
+    match (native_eth_pool.as_deref(), native_eth_gateway.as_deref()) {
+        (Some(pool), Some(gateway)) => {
+            if !protocol.pools.contains(pool) {
+                return Err(anyhow!(
+                    "native ETH pool {pool} is missing from PRIVACYBTC_RELAYER_PROTOCOL_POOLS"
+                ));
+            }
+            rpc.verify_native_eth_gateway(gateway, pool)
+                .await
+                .with_context(|| format!("native ETH gateway config check for {gateway}"))?;
+        }
+        (None, None) => {}
+        _ => {
+            return Err(anyhow!(
+                "PRIVACYBTC_NATIVE_ETH_POOL_ADDRESS and \
+                 PRIVACYBTC_NATIVE_ETH_GATEWAY_ADDRESS must be configured together"
+            ));
         }
     }
     let swap_coordinator = swap_coordinator
@@ -1463,12 +1555,15 @@ async fn run_http_server(
         private_key: private_key.to_string(),
         contract: normalize_evm_address(contract)?,
         gas_price_gwei,
+        legacy_routes_enabled,
         gas_limit_shield,
         gas_limit_unshield,
         gas_limit_transfer,
         gas_limit_margin_bps,
         fee_gateway,
         fee_pool,
+        native_eth_pool,
+        native_eth_gateway,
         swap_coordinator,
         gas_limit_swap,
         auto_shield,
@@ -1523,31 +1618,41 @@ async fn run_http_server(
 /// so integration tests can drive the HTTP surface (notably the LP order book) in-process.
 fn build_router(state: Arc<RelayerHttpConfig>) -> Router {
     let body_limit = state.http_body_limit_bytes;
-    Router::new()
+    let app = Router::new()
         .route("/healthz", get(http_health))
         .route("/tx/status", get(http_tx_status))
         .route("/tx/requests/:request_id", get(http_tx_request))
-        .route("/shield/address", get(http_shield_address))
-        .route("/shield/check", get(http_shield_check))
-        .route("/shield/submit", post(http_shield_submit))
-        .route("/shield/prepare", post(http_shield_prepare))
-        .route("/shield/auto", post(http_shield_auto))
-        .route("/transfer/auto", post(http_transfer_auto))
+        // The supported sponsored transfer route is always FeeGateway-bound.
         .route("/transfer/submit", post(http_transfer_submit))
-        .route("/unshield/submit", post(http_unshield_submit))
-        .route("/unshield/finalize", post(http_unshield_finalize))  // legacy, kept for compat
-        .route("/submit_raw", post(http_submit_raw))
-        // ── WS-6: WrappedPERC20 shield/unshield + 3-tx atomic swap ──
+        // Wrapped Shield returns deterministic calldata only; the user signs,
+        // broadcasts and pays gas. Both Unshield routes enter the durable queue.
         .route("/wrapped/shield/calldata", post(http_wrapped_shield_calldata))
         .route("/wrapped/unshield/submit", post(http_wrapped_unshield_submit))
-        .route("/swap/initiate", post(http_swap_initiate))
-        .route("/swap/join", post(http_swap_join))
-        .route("/swap/settle", post(http_swap_settle))
-        // ── LP swap order book (matching layer; see docs/lp-swap-design.md) ──
-        .route("/swap/offers", get(http_swap_offer_list).post(http_swap_offer_post))
-        .route("/swap/accept", post(http_swap_accept))
-        .route("/swap/requests", get(http_swap_requests))
-        .route("/swap/order", get(http_swap_order))
+        .route(
+            "/wrapped/native-eth/unshield/submit",
+            post(http_native_eth_unshield_submit),
+        );
+    let app = if state.legacy_routes_enabled {
+        app.route("/shield/address", get(http_shield_address))
+            .route("/shield/check", get(http_shield_check))
+            .route("/shield/submit", post(http_shield_submit))
+            .route("/shield/prepare", post(http_shield_prepare))
+            .route("/shield/auto", post(http_shield_auto))
+            .route("/transfer/auto", post(http_transfer_auto))
+            .route("/unshield/submit", post(http_unshield_submit))
+            .route("/unshield/finalize", post(http_unshield_finalize))
+            .route("/submit_raw", post(http_submit_raw))
+            .route("/swap/initiate", post(http_swap_initiate))
+            .route("/swap/join", post(http_swap_join))
+            .route("/swap/settle", post(http_swap_settle))
+            .route("/swap/offers", get(http_swap_offer_list).post(http_swap_offer_post))
+            .route("/swap/accept", post(http_swap_accept))
+            .route("/swap/requests", get(http_swap_requests))
+            .route("/swap/order", get(http_swap_order))
+    } else {
+        app
+    };
+    app
         .layer(axum::extract::DefaultBodyLimit::max(body_limit))
         .layer(build_cors_layer())
         .with_state(state)
@@ -2465,6 +2570,11 @@ async fn http_wrapped_unshield_submit(
         .await
         .map_err(|_| http_error(anyhow!("transaction validation pool is closed")))?;
     let contract = cfg.ensure_protocol_pool(&req.contract).map_err(http_error)?;
+    if cfg.native_eth_pool.as_deref() == Some(contract.as_str()) {
+        return Err(http_error(anyhow!(
+            "the configured native ETH pool must use /wrapped/native-eth/unshield/submit"
+        )));
+    }
     // Layer 1: screen the declared recipient (the payout target, not the relayer)
     // before broadcasting. Recipient binding makes this the address that matters.
     cfg.screening
@@ -2487,6 +2597,81 @@ async fn http_wrapped_unshield_submit(
         &cfg,
         "wrapped_unshield",
         contract,
+        calldata,
+        cfg.gas_limit_unshield,
+        nullifiers,
+    )
+}
+
+#[derive(Debug, Deserialize)]
+struct NativeEthUnshieldSubmitRequest {
+    /// WETH-backed ERC20Shield pool. Must equal the boot-pinned native ETH pool.
+    contract: String,
+    /// NativeEthGateway. Must equal the boot-pinned gateway paired with `contract`.
+    native_gateway: String,
+    bundle: OrchardStoredBundle,
+    amount_units: u64,
+    /// Final native ETH recipient. The gateway derives a domain/chain/pool-bound
+    /// context from this value, and the pool Binding proof commits to that context.
+    recipient_evm: String,
+}
+
+/// Relayer-sponsored WETH-backed native ETH withdrawal. Unlike `/submit_raw`, this
+/// is a closed typed route: both pool and gateway are pinned at boot and the exact
+/// gateway ABI is encoded locally.
+async fn http_native_eth_unshield_submit(
+    State(cfg): State<Arc<RelayerHttpConfig>>,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    Json(req): Json<NativeEthUnshieldSubmitRequest>,
+) -> Result<(StatusCode, Json<TxRequestView>), (StatusCode, Json<HttpErrorResponse>)> {
+    reserve_typed_request_budget(
+        &cfg,
+        &headers,
+        peer.map(|ConnectInfo(address)| address),
+        cfg.gas_limit_unshield,
+    )
+    .await?;
+    let _validation_permit = cfg
+        .tx_validation_slots
+        .acquire()
+        .await
+        .map_err(|_| http_error(anyhow!("transaction validation pool is closed")))?;
+
+    let expected_pool = cfg.native_eth_pool.as_deref().ok_or_else(|| {
+        http_error(anyhow!(
+            "native ETH unshield is disabled: no configured native ETH pool/gateway pair"
+        ))
+    })?;
+    let expected_gateway = cfg.native_eth_gateway.as_deref().ok_or_else(|| {
+        http_error(anyhow!(
+            "native ETH unshield is disabled: no configured native ETH pool/gateway pair"
+        ))
+    })?;
+    let contract = cfg.ensure_protocol_pool(&req.contract).map_err(http_error)?;
+    let gateway = normalize_evm_address(&req.native_gateway).map_err(http_error)?;
+    if contract != expected_pool || gateway != expected_gateway {
+        return Err(http_error(anyhow!(
+            "native ETH request does not match the configured pool/gateway pair"
+        )));
+    }
+
+    cfg.screening
+        .screen_required(Some(&req.recipient_evm), "unshield_recipient")
+        .await
+        .map_err(http_rejection)?;
+    enforce_frozen_compliance(&cfg.rpc_url, &contract, &req.bundle)
+        .await
+        .map_err(http_error)?;
+    let recipient = parse_evm_address_hex(&req.recipient_evm)
+        .map_err(|e| http_error(anyhow!("bad recipient_evm: {e}")))?;
+    let call = bundle_to_privacy_call(&req.bundle).map_err(http_error)?;
+    let calldata = encode_native_eth_unshield_calldata(req.amount_units, &recipient, &call);
+    let nullifiers = queue_nullifiers(&contract, &req.bundle);
+    enqueue_typed_transaction(
+        &cfg,
+        "native_eth_unshield",
+        gateway,
         calldata,
         cfg.gas_limit_unshield,
         nullifiers,
@@ -3343,11 +3528,10 @@ async fn tx_queue_worker(cfg: Arc<RelayerHttpConfig>) -> Result<()> {
             cfg.tx_queue_runtime.max_replacements,
         )? {
             let _lane = EVM_SIGNER_LANE.lock().await;
-            replace_pending_job(&cfg, &client, &signing_key, stale).await;
-            did_work = true;
+            did_work |= replace_pending_job(&cfg, &client, &signing_key, stale).await;
         } else if cfg.tx_queue.active_inflight()? < cfg.tx_queue_runtime.max_inflight {
             if let Some(job) = cfg.tx_queue.next_queued()? {
-                prepare_and_broadcast_queue_job(
+                did_work |= prepare_and_broadcast_queue_job(
                     &cfg,
                     &client,
                     &signing_key,
@@ -3356,7 +3540,6 @@ async fn tx_queue_worker(cfg: Arc<RelayerHttpConfig>) -> Result<()> {
                     job,
                 )
                 .await;
-                did_work = true;
             }
         }
 
@@ -3378,7 +3561,25 @@ async fn prepare_and_broadcast_queue_job(
     sender_hex: &str,
     owner: &str,
     job: tx_queue::QueueJob,
-) {
+) -> bool {
+    let suggested_fees = client.suggest_eip1559_fees(cfg.gas_price_gwei).await;
+    let (max_priority_fee, max_fee) = match enforce_eip1559_fee_cap(
+        suggested_fees.0,
+        suggested_fees.1,
+        cfg.tx_queue_runtime.max_fee_per_gas_cap,
+    ) {
+        Ok(fees) => fees,
+        Err(error) => {
+            // A fee spike is transient policy state, not a malformed user request. Keep the
+            // request queued without consuming its prepare-attempt budget; the worker retries
+            // after its normal idle backoff once fees return below the reviewed ceiling.
+            eprintln!(
+                "[tx-queue] preparation paused request={} by fee cap: {error:#}",
+                job.request_id
+            );
+            return false;
+        }
+    };
     let prepared = async {
         let estimated = client
             .estimate_gas(sender_hex, &job.target, &job.calldata, job.value)
@@ -3388,7 +3589,6 @@ async fn prepare_and_broadcast_queue_job(
             job.gas_margin_bps,
             job.gas_cap,
         )?;
-        let (max_priority_fee, max_fee) = client.suggest_eip1559_fees(cfg.gas_price_gwei).await;
 
         // The RPC work above can approach the lease TTL. Renew immediately before entering the
         // signer lane; if another process legitimately owns it now, do not sign.
@@ -3467,6 +3667,7 @@ async fn prepare_and_broadcast_queue_job(
             );
         }
     }
+    true
 }
 
 async fn broadcast_prepared_job(
@@ -3664,7 +3865,7 @@ async fn replace_pending_job(
     client: &EthRpcClient,
     signing_key: &SigningKey,
     pending: PendingJob,
-) {
+) -> bool {
     // Recheck every alias immediately before replacement; the receipt poll and this branch are
     // intentionally redundant around the race where the original tx is mined at the threshold.
     for tx_hash in &pending.tx_hashes {
@@ -3673,7 +3874,7 @@ async fn replace_pending_job(
                 let _ = cfg
                     .tx_queue
                     .mark_terminal(&pending.request_id, STATUS_CONFIRMED, None);
-                return;
+                return true;
             }
             Ok(Some(false)) => {
                 let _ = cfg.tx_queue.mark_terminal(
@@ -3681,17 +3882,32 @@ async fn replace_pending_job(
                     STATUS_REVERTED,
                     Some("transaction reverted on-chain"),
                 );
-                return;
+                return true;
             }
             _ => {}
         }
     }
 
-    let (suggested_priority, suggested_max) = client.suggest_eip1559_fees(cfg.gas_price_gwei).await;
+    let (suggested_priority, suggested_max) =
+        client.suggest_eip1559_fees(cfg.gas_price_gwei).await;
     let bumped_priority = bump_eip1559_fee(pending.max_priority_fee).max(suggested_priority);
     let bumped_max = bump_eip1559_fee(pending.max_fee)
         .max(suggested_max)
         .max(bumped_priority);
+    let (bumped_priority, bumped_max) = match enforce_eip1559_fee_cap(
+        bumped_priority,
+        bumped_max,
+        cfg.tx_queue_runtime.max_fee_per_gas_cap,
+    ) {
+        Ok(fees) => fees,
+        Err(error) => {
+            eprintln!(
+                "[tx-queue] replacement paused request={} by fee cap: {error:#}",
+                pending.request_id
+            );
+            return false;
+        }
+    };
     match cfg.tx_queue.prepare_replacement(
         &pending.request_id,
         bumped_priority,
@@ -3726,6 +3942,7 @@ async fn replace_pending_job(
             pending.request_id
         ),
     }
+    true
 }
 
 fn bump_eip1559_fee(value: u128) -> u128 {
@@ -4880,6 +5097,27 @@ impl EthRpcClient {
         Ok(())
     }
 
+    /// Boot-time pairing guard for the typed native ETH endpoint. `pool()` is
+    /// immutable on NativeEthGateway, so a mismatch is always configuration drift.
+    async fn verify_native_eth_gateway(&self, gateway: &str, expected_pool: &str) -> Result<()> {
+        let sel = format!("0x{}", hex::encode(&Keccak256::digest(b"pool()")[..4]));
+        let raw = self.eth_call(gateway, &sel).await?;
+        let word = strip_0x(&raw);
+        if word.len() < 64 {
+            return Err(anyhow!(
+                "NativeEthGateway.pool() returned a short word: {raw}"
+            ));
+        }
+        let actual = format!("0x{}", &word[word.len() - 40..]).to_lowercase();
+        let expected = normalize_evm_address(expected_pool)?;
+        if actual != expected {
+            return Err(anyhow!(
+                "native ETH gateway {gateway} points at pool {actual}, expected {expected}"
+            ));
+        }
+        Ok(())
+    }
+
     async fn verify_protocol_version(&self, contract: &str, expected: u64) -> Result<()> {
         let raw = self.eth_call(contract, "0x2ae9c600").await?;
         let actual = parse_abi_u64(&raw).context("decode protocolVersion()")?;
@@ -5399,6 +5637,7 @@ mod tests {
             private_key: format!("{:064x}", 1u8),
             contract: "0x1111111111111111111111111111111111111111".into(),
             gas_price_gwei: 1.0,
+            legacy_routes_enabled: true,
             gas_limit_shield: 6_000_000,
             gas_limit_unshield: 6_000_000,
             gas_limit_transfer: 5_000_000,
@@ -5407,6 +5646,8 @@ mod tests {
             // Deliberately one of the `protocol_pools` below: the same-asset transfer path is
             // reached only for the fee pool, so it has to be a pool the relayer serves.
             fee_pool: Some("0x2222222222222222222222222222222222222222".into()),
+            native_eth_pool: Some("0x1111111111111111111111111111111111111111".into()),
+            native_eth_gateway: Some("0x3333333333333333333333333333333333333333".into()),
             swap_coordinator: Some("0xc".into()),
             gas_limit_swap: 12_000_000,
             auto_shield: None,
@@ -5425,6 +5666,7 @@ mod tests {
                 replacement_after_secs: 120,
                 max_replacements: 2,
                 worker_lease_secs: 60,
+                max_fee_per_gas_cap: None,
             },
             tx_queue_notify: Arc::new(Notify::new()),
             tx_validation_slots: Arc::new(Semaphore::new(4)),
@@ -5490,6 +5732,16 @@ mod tests {
             validate_gas_policy_config(MAX_GAS_MARGIN_BPS + 1, &[("transfer", 5_000_000)])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn eip1559_queue_fee_cap_is_optional_and_fail_closed_when_set() {
+        assert_eq!(enforce_eip1559_fee_cap(1, 20, None).unwrap(), (1, 20));
+        assert_eq!(enforce_eip1559_fee_cap(1, 20, Some(20)).unwrap(), (1, 20));
+        assert!(enforce_eip1559_fee_cap(1, 21, Some(20)).is_err());
+        assert!(enforce_eip1559_fee_cap(21, 21, Some(20)).is_err());
+        assert!(enforce_eip1559_fee_cap(0, 20, Some(20)).is_err());
+        assert!(enforce_eip1559_fee_cap(2, 1, None).is_err());
     }
 
     async fn call_with_token(
@@ -5757,6 +6009,159 @@ mod tests {
         .await;
         assert_eq!(st, Sc::OK);
         assert_eq!(status["status"], "queued");
+    }
+
+    #[tokio::test]
+    async fn native_eth_unshield_only_accepts_the_boot_pinned_pair() {
+        let app = build_router(test_state());
+        let base = serde_json::json!({
+            "contract": "0x1111111111111111111111111111111111111111",
+            "native_gateway": "0x3333333333333333333333333333333333333333",
+            "bundle": test_bundle(),
+            "amount_units": 77,
+            "recipient_evm": "0x4444444444444444444444444444444444444444"
+        });
+
+        let mut wrong_gateway = base.clone();
+        wrong_gateway["native_gateway"] =
+            Value::String("0x5555555555555555555555555555555555555555".into());
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/wrapped/native-eth/unshield/submit",
+            Some(wrong_gateway),
+        )
+        .await;
+        assert_eq!(status, Sc::BAD_REQUEST);
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("configured pool/gateway pair"));
+
+        let mut wrong_pool = base.clone();
+        wrong_pool["contract"] =
+            Value::String("0x2222222222222222222222222222222222222222".into());
+        let (status, _) = call(
+            &app,
+            "POST",
+            "/wrapped/native-eth/unshield/submit",
+            Some(wrong_pool),
+        )
+        .await;
+        assert_eq!(status, Sc::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn generic_wrapped_unshield_rejects_the_native_eth_pool() {
+        let app = build_router(test_state());
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/wrapped/unshield/submit",
+            Some(serde_json::json!({
+                "contract": "0x1111111111111111111111111111111111111111",
+                "bundle": test_bundle(),
+                "amount_units": 77,
+                "recipient_evm": "0x4444444444444444444444444444444444444444"
+            })),
+        )
+        .await;
+        assert_eq!(status, Sc::BAD_REQUEST);
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("native-eth/unshield/submit"));
+    }
+
+    #[tokio::test]
+    async fn native_eth_unshield_is_a_typed_durable_queue_route() {
+        let app = build_router(test_state());
+        let body = serde_json::json!({
+            "contract": "0x1111111111111111111111111111111111111111",
+            "native_gateway": "0x3333333333333333333333333333333333333333",
+            "bundle": test_bundle(),
+            "amount_units": 77,
+            "recipient_evm": "0x4444444444444444444444444444444444444444"
+        });
+        let (status, accepted) = call(
+            &app,
+            "POST",
+            "/wrapped/native-eth/unshield/submit",
+            Some(body.clone()),
+        )
+        .await;
+        assert_eq!(status, Sc::ACCEPTED, "{accepted}");
+        assert_eq!(accepted["status"], "queued");
+
+        // Identical proof submission is idempotent and preserves one nullifier reservation.
+        let (status, duplicate) = call(
+            &app,
+            "POST",
+            "/wrapped/native-eth/unshield/submit",
+            Some(body),
+        )
+        .await;
+        assert_eq!(status, Sc::ACCEPTED);
+        assert_eq!(duplicate["request_id"], accepted["request_id"]);
+    }
+
+    #[tokio::test]
+    async fn native_eth_unshield_is_disabled_without_explicit_pair() {
+        let mut cfg = (*test_state()).clone();
+        cfg.native_eth_pool = None;
+        cfg.native_eth_gateway = None;
+        let app = build_router(Arc::new(cfg));
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/wrapped/native-eth/unshield/submit",
+            Some(serde_json::json!({
+                "contract": "0x1111111111111111111111111111111111111111",
+                "native_gateway": "0x3333333333333333333333333333333333333333",
+                "bundle": test_bundle(),
+                "amount_units": 77,
+                "recipient_evm": "0x4444444444444444444444444444444444444444"
+            })),
+        )
+        .await;
+        assert_eq!(status, Sc::BAD_REQUEST);
+        assert!(body["error"].as_str().unwrap().contains("disabled"));
+    }
+
+    #[tokio::test]
+    async fn shield_only_router_removes_legacy_sponsored_and_swap_surfaces() {
+        let mut cfg = (*test_state()).clone();
+        cfg.legacy_routes_enabled = false;
+        let app = build_router(Arc::new(cfg));
+
+        for (method, path) in [
+            ("POST", "/shield/submit"),
+            ("POST", "/shield/auto"),
+            ("POST", "/transfer/auto"),
+            ("POST", "/unshield/submit"),
+            ("POST", "/submit_raw"),
+            ("POST", "/swap/settle"),
+        ] {
+            let (status, _) = call(&app, method, path, Some(serde_json::json!({}))).await;
+            assert_eq!(status, Sc::NOT_FOUND, "{method} {path} must not be installed");
+        }
+
+        let (status, _) = call(
+            &app,
+            "POST",
+            "/wrapped/shield/calldata",
+            Some(serde_json::json!({})),
+        )
+        .await;
+        assert_ne!(status, Sc::NOT_FOUND, "user-paid Shield calldata remains installed");
+        let (status, _) = call(
+            &app,
+            "POST",
+            "/transfer/submit",
+            Some(serde_json::json!({})),
+        )
+        .await;
+        assert_ne!(status, Sc::NOT_FOUND, "FeeGateway transfer remains installed");
     }
 
     #[tokio::test]
