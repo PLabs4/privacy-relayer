@@ -6,6 +6,7 @@
 
 mod fee_calldata;
 mod privacy_buy;
+mod privacy_swap;
 mod screening;
 mod tx_queue;
 
@@ -674,6 +675,8 @@ struct RelayerHttpConfig {
     /// Immutable, boot-verified fixed-pair privacy-buy capability. None keeps the route
     /// fail-closed while still exposing a stable typed endpoint.
     privacy_buy: Option<privacy_buy::PrivacyBuyConfig>,
+    /// Release-allowlisted Pons v2 PoolCreated routes, keyed by bytes32 route id.
+    privacy_swaps: HashMap<String, privacy_swap::PrivacySwapConfig>,
 }
 
 impl RelayerHttpConfig {
@@ -786,6 +789,12 @@ async fn privacy_buy_config_from_env(
     if accepting && !enabled {
         return Err(anyhow!(
             "PRIVACYBTC_PRIVACY_BUY_ACCEPTING requires PRIVACYBTC_PRIVACY_BUY_ENABLED"
+        ));
+    }
+    if enabled {
+        return Err(anyhow!(
+            "legacy PRIVACYBTC_PRIVACY_BUY_ENABLED is retired; phase one accepts only \
+             Pons v2 PoolCreated privacy-swap routes"
         ));
     }
     if !enabled {
@@ -1095,6 +1104,402 @@ async fn privacy_buy_config_from_env(
         min_broadcast_window_seconds,
         event_getlogs_max_span,
     }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PrivacySwapRouteEnv {
+    schema: String,
+    market: String,
+    direction: String,
+    asset_symbol: String,
+    asset_name: String,
+    route_id: String,
+    coordinator: String,
+    registry: String,
+    input_pool: String,
+    output_pool: String,
+    input_verifier_set_id: String,
+    output_verifier_set_id: String,
+    input_token: String,
+    output_token: String,
+    adapter: String,
+    adapter_runtime_codehash: String,
+    market_profile: String,
+    factory: String,
+    factory_runtime_codehash: String,
+    pool_manager: String,
+    hook: String,
+    weth: String,
+    meme_token: String,
+    pair_token: String,
+    pool_fee: u32,
+    tick_spacing: i32,
+    zero_for_one: bool,
+    fee_collector: String,
+    guardian: String,
+    swap_fee_units: String,
+    max_ttl_seconds: String,
+    max_market_slippage_bps_cap: u16,
+    route_data: String,
+    quoter: String,
+    quoter_runtime_codehash: String,
+}
+
+async fn privacy_swap_configs_from_env(
+    rpc: &EthRpcClient,
+    protocol: &ProtocolExpectation,
+    chain_id: u64,
+) -> Result<HashMap<String, privacy_swap::PrivacySwapConfig>> {
+    let enabled = parse_bool_env("PRIVACYBTC_PRIVACY_SWAP_ENABLED", false)?;
+    let accepting = parse_bool_env("PRIVACYBTC_PRIVACY_SWAP_ACCEPTING", false)?;
+    if accepting && !enabled {
+        return Err(anyhow!(
+            "PRIVACYBTC_PRIVACY_SWAP_ACCEPTING requires PRIVACYBTC_PRIVACY_SWAP_ENABLED"
+        ));
+    }
+    if !enabled {
+        return Ok(HashMap::new());
+    }
+    if chain_id != privacy_swap::ROBINHOOD_CHAIN_ID {
+        return Err(anyhow!("privacy-swap v2 is pinned to Robinhood chain 4663"));
+    }
+    let raw_routes: Vec<PrivacySwapRouteEnv> = serde_json::from_str(&required_env(
+        "PRIVACYBTC_PRIVACY_SWAP_ROUTES_JSON",
+    )?)
+    .context("PRIVACYBTC_PRIVACY_SWAP_ROUTES_JSON must be a strict route array")?;
+    if raw_routes.is_empty() {
+        return Err(anyhow!("privacy-swap route allowlist must not be empty"));
+    }
+    let gas_limit = positive_env_u64("PRIVACYBTC_GAS_LIMIT_PRIVACY_SWAP", 12_000_000)?;
+    let min_broadcast_window_seconds =
+        positive_env_u64("PRIVACYBTC_PRIVACY_SWAP_MIN_BROADCAST_WINDOW_SECS", 30)?;
+    let event_getlogs_max_span =
+        positive_env_u64("PRIVACYBTC_PRIVACY_SWAP_EVENT_GETLOGS_MAX_SPAN", 0)?;
+    if event_getlogs_max_span > 100_000 {
+        return Err(anyhow!(
+            "PRIVACYBTC_PRIVACY_SWAP_EVENT_GETLOGS_MAX_SPAN must be <= 100000"
+        ));
+    }
+
+    let mut routes = HashMap::new();
+    for raw in raw_routes {
+        if raw.schema != "perc20-privacy-swap/v2"
+            || raw.market != privacy_swap::MARKET_PROFILE
+            || !matches!(raw.direction.as_str(), "buy" | "sell")
+        {
+            return Err(anyhow!("unsupported privacy-swap schema/market/direction"));
+        }
+        if raw.asset_symbol.trim().is_empty()
+            || raw.asset_symbol.len() > 32
+            || raw.asset_name.trim().is_empty()
+            || raw.asset_name.len() > 80
+        {
+            return Err(anyhow!("privacy-swap asset display metadata is invalid"));
+        }
+        if raw.pool_fee >= (1 << 24)
+            || raw.tick_spacing <= 0
+            || raw.tick_spacing >= (1 << 23)
+        {
+            return Err(anyhow!("privacy-swap pool fee/tick spacing is outside ABI bounds"));
+        }
+        let route_id = privacy_swap::parse_fixed_hex::<32>(&raw.route_id, "routeId")?;
+        if route_id == [0u8; 32] {
+            return Err(anyhow!("privacy-swap routeId must be non-zero"));
+        }
+        let route_key = format!("0x{}", hex::encode(route_id));
+        if routes.contains_key(&route_key) {
+            return Err(anyhow!("duplicate privacy-swap routeId {route_key}"));
+        }
+        let coordinator = normalize_evm_address(&raw.coordinator)?;
+        let registry = normalize_evm_address(&raw.registry)?;
+        let input_pool = normalize_evm_address(&raw.input_pool)?;
+        let output_pool = normalize_evm_address(&raw.output_pool)?;
+        let input_token = normalize_evm_address(&raw.input_token)?;
+        let output_token = normalize_evm_address(&raw.output_token)?;
+        let adapter = normalize_evm_address(&raw.adapter)?;
+        let factory = normalize_evm_address(&raw.factory)?;
+        let pool_manager = normalize_evm_address(&raw.pool_manager)?;
+        let hook = normalize_evm_address(&raw.hook)?;
+        let weth = normalize_evm_address(&raw.weth)?;
+        let meme_token = normalize_evm_address(&raw.meme_token)?;
+        let pair_token = normalize_evm_address(&raw.pair_token)?;
+        let fee_collector = normalize_evm_address(&raw.fee_collector)?;
+        let guardian = normalize_evm_address(&raw.guardian)?;
+        let quoter = normalize_evm_address(&raw.quoter)?;
+        if pool_manager != privacy_swap::ROBINHOOD_V4_POOL_MANAGER
+            || quoter != privacy_swap::ROBINHOOD_V4_QUOTER
+        {
+            return Err(anyhow!(
+                "privacy-swap must use the canonical Robinhood V4 PoolManager and Quoter"
+            ));
+        }
+        let input_verifier_set_id =
+            privacy_swap::parse_fixed_hex(&raw.input_verifier_set_id, "inputVerifierSetId")?;
+        let output_verifier_set_id =
+            privacy_swap::parse_fixed_hex(&raw.output_verifier_set_id, "outputVerifierSetId")?;
+        let adapter_runtime_codehash = privacy_swap::parse_fixed_hex(
+            &raw.adapter_runtime_codehash,
+            "adapterRuntimeCodehash",
+        )?;
+        let market_profile =
+            privacy_swap::parse_fixed_hex(&raw.market_profile, "marketProfile")?;
+        let factory_runtime_codehash = privacy_swap::parse_fixed_hex(
+            &raw.factory_runtime_codehash,
+            "factoryRuntimeCodehash",
+        )?;
+        let quoter_runtime_codehash = privacy_swap::parse_fixed_hex(
+            &raw.quoter_runtime_codehash,
+            "quoterRuntimeCodehash",
+        )?;
+        if market_profile != privacy_swap::MARKET_PROFILE_HASH
+            || adapter_runtime_codehash == [0u8; 32]
+            || factory_runtime_codehash == [0u8; 32]
+            || quoter_runtime_codehash == [0u8; 32]
+        {
+            return Err(anyhow!("privacy-swap codehash/profile pins must be non-zero and reviewed"));
+        }
+        let swap_fee_units = raw
+            .swap_fee_units
+            .parse::<u64>()
+            .context("privacy-swap swapFeeUnits must be uint64")?;
+        let max_ttl_seconds = raw
+            .max_ttl_seconds
+            .parse::<u64>()
+            .context("privacy-swap maxTtlSeconds must be uint64")?;
+        if max_ttl_seconds == 0 || min_broadcast_window_seconds >= max_ttl_seconds {
+            return Err(anyhow!("privacy-swap TTL/broadcast window is invalid"));
+        }
+        let route_data = privacy_swap::parse_route_data(&raw.route_data)?;
+        let route_hash = privacy_swap::route_hash(&route_data);
+
+        for (label, target) in [
+            ("Coordinator", coordinator.as_str()),
+            ("Registry", registry.as_str()),
+            ("input pool", input_pool.as_str()),
+            ("output pool", output_pool.as_str()),
+            ("Adapter", adapter.as_str()),
+            ("V4 Quoter", quoter.as_str()),
+            ("Pons factory", factory.as_str()),
+            ("V4 PoolManager", pool_manager.as_str()),
+            ("Pons hook", hook.as_str()),
+            ("meme token", meme_token.as_str()),
+            ("input token", input_token.as_str()),
+            ("output token", output_token.as_str()),
+        ] {
+            rpc.require_code(target)
+                .await
+                .with_context(|| format!("privacy-swap {label} code gate"))?;
+        }
+        if pair_token != format!("0x{}", "00".repeat(20)) {
+            rpc.require_code(&pair_token).await.context("privacy-swap pair token code gate")?;
+        } else {
+            rpc.require_code(&weth).await.context("privacy-swap WETH code gate")?;
+        }
+        if rpc.runtime_codehash(&quoter).await? != quoter_runtime_codehash
+            || rpc.runtime_codehash(&factory).await? != factory_runtime_codehash
+        {
+            return Err(anyhow!("privacy-swap Quoter/factory runtime codehash drift"));
+        }
+        rpc.verify_protocol_version(&coordinator, privacy_swap::PROTOCOL_VERSION)
+            .await?;
+        if rpc.read_u64(&coordinator, "applicationVersion()").await?
+            != privacy_swap::APPLICATION_VERSION
+        {
+            return Err(anyhow!("privacy-swap Coordinator applicationVersion mismatch"));
+        }
+        for (field, actual, expected) in [
+            ("registry", rpc.read_address(&coordinator, "registry()").await?, registry.as_str()),
+            ("inputPool", rpc.read_address(&coordinator, "inputPool()").await?, input_pool.as_str()),
+            ("outputPool", rpc.read_address(&coordinator, "outputPool()").await?, output_pool.as_str()),
+            ("inputToken", rpc.read_address(&coordinator, "inputToken()").await?, input_token.as_str()),
+            ("outputToken", rpc.read_address(&coordinator, "outputToken()").await?, output_token.as_str()),
+            ("adapter", rpc.read_address(&coordinator, "adapter()").await?, adapter.as_str()),
+            ("feeCollector", rpc.read_address(&coordinator, "feeCollector()").await?, fee_collector.as_str()),
+            ("guardian", rpc.read_address(&coordinator, "guardian()").await?, guardian.as_str()),
+        ] {
+            if actual != expected {
+                return Err(anyhow!(
+                    "privacy-swap Coordinator {field} is {actual}, configured {expected}"
+                ));
+            }
+        }
+        for pool in [&input_pool, &output_pool] {
+            if !protocol.pools.contains(pool) {
+                return Err(anyhow!("privacy-swap pool {pool} is outside protocol allowlist"));
+            }
+            rpc.verify_pool_protocol(pool, protocol.version, &protocol.verifier_set_id)
+                .await?;
+            rpc.verify_registry_pool(&registry, pool).await?;
+        }
+        if rpc.read_bytes32(&coordinator, "inputVerifierSetId()").await?
+            != input_verifier_set_id
+            || rpc.read_bytes32(&coordinator, "outputVerifierSetId()").await?
+                != output_verifier_set_id
+            || input_verifier_set_id != protocol.verifier_set_id
+            || output_verifier_set_id != protocol.verifier_set_id
+            || rpc.read_bytes32(&coordinator, "marketProfile()").await? != market_profile
+            || rpc.read_bytes32(&coordinator, "routeId()").await? != route_id
+            || rpc.read_bytes32(&coordinator, "routeHash()").await? != route_hash
+        {
+            return Err(anyhow!("privacy-swap Coordinator release pins differ from Manifest"));
+        }
+        let actual_adapter_codehash = rpc.runtime_codehash(&adapter).await?;
+        if actual_adapter_codehash != adapter_runtime_codehash
+            || rpc.read_bytes32(&coordinator, "adapterRuntimeCodehash()").await?
+                != adapter_runtime_codehash
+        {
+            return Err(anyhow!("privacy-swap Adapter runtime codehash drift"));
+        }
+        for (field, actual, expected) in [
+            ("factory", rpc.read_address(&adapter, "factory()").await?, factory.as_str()),
+            ("poolManager", rpc.read_address(&adapter, "poolManager()").await?, pool_manager.as_str()),
+            ("hook", rpc.read_address(&adapter, "hook()").await?, hook.as_str()),
+            ("weth", rpc.read_address(&adapter, "weth()").await?, weth.as_str()),
+            ("memeToken", rpc.read_address(&adapter, "memeToken()").await?, meme_token.as_str()),
+            ("pairToken", rpc.read_address(&adapter, "pairToken()").await?, pair_token.as_str()),
+            ("inputToken", rpc.read_address(&adapter, "inputToken()").await?, input_token.as_str()),
+            ("outputToken", rpc.read_address(&adapter, "outputToken()").await?, output_token.as_str()),
+        ] {
+            if actual != expected {
+                return Err(anyhow!("privacy-swap Adapter {field} differs from Manifest"));
+            }
+        }
+        if rpc.read_u64(&adapter, "adapterVersion()").await? != 2
+            || rpc.read_bytes32(&adapter, "marketProfile()").await? != market_profile
+            || rpc.read_u64(&adapter, "poolFee()").await? != u64::from(raw.pool_fee)
+            || rpc.read_u64(&adapter, "tickSpacing()").await?
+                != u64::try_from(raw.tick_spacing).expect("positive checked")
+            || rpc.read_bool(&adapter, "zeroForOne()").await? != raw.zero_for_one
+            || rpc.read_bytes32(&adapter, "routeHash()").await? != route_hash
+        {
+            return Err(anyhow!("privacy-swap Adapter pool/route profile differs from Manifest"));
+        }
+        rpc.eth_call(&adapter, &view_selector("validateMarket()"))
+            .await
+            .context("privacy-swap Adapter market validation")?;
+        let configured_swap_fee = rpc.read_u64(&coordinator, "swapFeeUnits()").await?;
+        let configured_ttl = rpc.read_u64(&coordinator, "maxTtlSeconds()").await?;
+        let configured_cap = rpc
+            .read_u64(&coordinator, "maxMarketSlippageBpsCap()")
+            .await?;
+        if configured_swap_fee != swap_fee_units
+            || configured_ttl != max_ttl_seconds
+            || configured_cap != u64::from(raw.max_market_slippage_bps_cap)
+        {
+            return Err(anyhow!("privacy-swap Coordinator economics differ from Manifest"));
+        }
+        if accepting && rpc.read_bool(&coordinator, "paused()").await? {
+            return Err(anyhow!("privacy-swap cannot accept while a Coordinator is paused"));
+        }
+        if routes
+            .values()
+            .any(|configured: &privacy_swap::PrivacySwapConfig| {
+                configured.coordinator == coordinator
+            })
+        {
+            return Err(anyhow!("privacy-swap Coordinator is reused by multiple route ids"));
+        }
+
+        routes.insert(
+            route_key,
+            privacy_swap::PrivacySwapConfig {
+                accepting,
+                route_id,
+                direction: raw.direction,
+                asset_symbol: raw.asset_symbol,
+                asset_name: raw.asset_name,
+                coordinator,
+                registry,
+                input_pool: input_pool.clone(),
+                output_pool: output_pool.clone(),
+                input_verifier_set_id,
+                output_verifier_set_id,
+                input_token,
+                output_token,
+                input_scale: rpc.read_uint(&input_pool, "scale()").await?,
+                output_scale: rpc.read_uint(&output_pool, "scale()").await?,
+                input_unshield_fee_units: rpc
+                    .read_u64(&input_pool, "unshieldFeeUnits()")
+                    .await?,
+                output_shield_fee_units: rpc
+                    .read_u64(&output_pool, "shieldFeeUnits()")
+                    .await?,
+                adapter,
+                adapter_runtime_codehash,
+                market_profile,
+                fee_collector,
+                swap_fee_units,
+                max_ttl_seconds,
+                max_market_slippage_bps_cap: raw.max_market_slippage_bps_cap,
+                route_data,
+                route_hash,
+                quoter,
+                quoter_runtime_codehash,
+                factory,
+                factory_runtime_codehash,
+                pool_manager,
+                hook,
+                weth,
+                meme_token,
+                pair_token,
+                pool_fee: raw.pool_fee,
+                tick_spacing: raw.tick_spacing,
+                zero_for_one: raw.zero_for_one,
+                guardian,
+                gas_limit,
+                min_broadcast_window_seconds,
+                event_getlogs_max_span,
+            },
+        );
+    }
+
+    let mut by_meme: HashMap<String, Vec<&privacy_swap::PrivacySwapConfig>> = HashMap::new();
+    for route in routes.values() {
+        by_meme.entry(route.meme_token.clone()).or_default().push(route);
+    }
+    for pair in by_meme.values() {
+        if pair.len() != 2 {
+            return Err(anyhow!("each admitted meme requires exactly one buy and one sell route"));
+        }
+        let buy = pair.iter().find(|route| route.direction == "buy");
+        let sell = pair.iter().find(|route| route.direction == "sell");
+        let (Some(buy), Some(sell)) = (buy, sell) else {
+            return Err(anyhow!("each admitted meme requires both directions"));
+        };
+        if buy.asset_symbol != sell.asset_symbol
+            || buy.asset_name != sell.asset_name
+            || buy.input_pool != sell.output_pool
+            || buy.output_pool != sell.input_pool
+            || buy.input_scale != sell.output_scale
+            || buy.output_scale != sell.input_scale
+            || buy.input_verifier_set_id != sell.output_verifier_set_id
+            || buy.output_verifier_set_id != sell.input_verifier_set_id
+            || buy.input_token != sell.output_token
+            || buy.output_token != sell.input_token
+            || buy.registry != sell.registry
+            || buy.market_profile != sell.market_profile
+            || buy.factory != sell.factory
+            || buy.factory_runtime_codehash != sell.factory_runtime_codehash
+            || buy.pool_manager != sell.pool_manager
+            || buy.hook != sell.hook
+            || buy.weth != sell.weth
+            || buy.pair_token != sell.pair_token
+            || buy.pool_fee != sell.pool_fee
+            || buy.tick_spacing != sell.tick_spacing
+            || buy.zero_for_one == sell.zero_for_one
+            || buy.fee_collector != sell.fee_collector
+            || buy.guardian != sell.guardian
+            || buy.swap_fee_units != sell.swap_fee_units
+            || buy.max_ttl_seconds != sell.max_ttl_seconds
+            || buy.max_market_slippage_bps_cap != sell.max_market_slippage_bps_cap
+            || buy.quoter != sell.quoter
+            || buy.quoter_runtime_codehash != sell.quoter_runtime_codehash
+        {
+            return Err(anyhow!("privacy-swap buy/sell routes are not exact reverses"));
+        }
+    }
+    Ok(routes)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1812,6 +2217,7 @@ async fn run_http_server(
             .with_context(|| format!("protocol gate for pool {pool}"))?;
     }
     let privacy_buy = privacy_buy_config_from_env(&rpc, &protocol, chain_id).await?;
+    let privacy_swaps = privacy_swap_configs_from_env(&rpc, &protocol, chain_id).await?;
     let fee_gateway = fee_gateway.map(normalize_evm_address).transpose()?;
     let fee_pools = parse_fee_pools(fee_pool)?;
     let fee_gateway_version = match (fee_gateway.as_deref(), fee_pools.is_empty()) {
@@ -2031,6 +2437,7 @@ async fn run_http_server(
         expected_protocol_version: protocol.version,
         expected_verifier_set_id: protocol.verifier_set_id,
         privacy_buy,
+        privacy_swaps,
     });
     let app = build_router(state.clone());
     let listener = tokio::net::TcpListener::bind(bind)
@@ -2061,6 +2468,7 @@ fn build_router(state: Arc<RelayerHttpConfig>) -> Router {
         // The supported sponsored transfer route is always FeeGateway-bound.
         .route("/transfer/submit", post(http_transfer_submit))
         .route("/privacy-buy", post(http_privacy_buy))
+        .route("/privacy-swap", post(http_privacy_swap))
         // Wrapped Shield returns deterministic calldata only; the user signs,
         // broadcasts and pays gas. Both Unshield routes enter the durable queue.
         .route(
@@ -2121,6 +2529,12 @@ async fn http_health(
             })
         })
         .unwrap_or_else(|| serde_json::json!({ "configured": false, "accepting": false }));
+    let privacy_swap = serde_json::json!({
+        "configured": !cfg.privacy_swaps.is_empty(),
+        "accepting": cfg.privacy_swaps.values().any(|route| route.accepting),
+        "market": privacy_swap::MARKET_PROFILE,
+        "route_count": cfg.privacy_swaps.len(),
+    });
     match cfg.tx_queue.stats() {
         Ok(queue) => (
             StatusCode::OK,
@@ -2130,6 +2544,7 @@ async fn http_health(
                 "verifier_set_id": format!("0x{}", hex::encode(cfg.expected_verifier_set_id)),
                 "protocol_pool_count": cfg.protocol_pools.len(),
                 "privacy_buy": privacy_buy,
+                "privacy_swap": privacy_swap,
                 "tx_queue": queue,
             })),
         ),
@@ -2744,6 +3159,204 @@ async fn http_privacy_buy(
     enqueue_typed_transaction_with_policy(
         &cfg,
         "privacy_buy",
+        config.coordinator,
+        calldata,
+        config.gas_limit,
+        nullifiers,
+        Some(expected_context),
+        Some(validated.plan.valid_until),
+        Some(admission_block),
+    )
+}
+
+#[derive(Debug, Deserialize)]
+struct PrivacySwapRequest {
+    route_id: String,
+    expected_context: String,
+    plan: privacy_swap::SwapPlanJson,
+    quote_evidence: privacy_swap::QuoteEvidenceJson,
+    route_data: String,
+    unshield_bundle: OrchardStoredBundle,
+    shield_bundle: OrchardStoredBundle,
+}
+
+fn privacy_swap_route_key(value: &str) -> Result<String> {
+    Ok(format!(
+        "0x{}",
+        hex::encode(privacy_swap::parse_fixed_hex::<32>(value, "route_id")?)
+    ))
+}
+
+async fn quote_privacy_swap(
+    client: &EthRpcClient,
+    config: &privacy_swap::PrivacySwapConfig,
+    validated: &privacy_swap::ValidatedPlan,
+) -> Result<ethabi::Uint> {
+    if client.runtime_codehash(&config.quoter).await? != config.quoter_runtime_codehash
+        || client.runtime_codehash(&config.factory).await? != config.factory_runtime_codehash
+    {
+        return Err(anyhow!("privacy-swap Quoter/factory codehash changed after startup"));
+    }
+    let launch_call = privacy_swap::encode_get_launch_calldata(&config.meme_token)?;
+    let launch = client
+        .eth_call(&config.factory, &format!("0x{}", hex::encode(launch_call)))
+        .await
+        .context("privacy-swap Pons PoolCreated check")?;
+    privacy_swap::validate_launch_result(&launch, config)?;
+    let quote_call = privacy_swap::encode_v4_quote_calldata(config, validated.want_output_wei)?;
+    let result = client
+        .eth_call(&config.quoter, &format!("0x{}", hex::encode(quote_call)))
+        .await
+        .context("privacy-swap V4 exact-output quote")?;
+    privacy_swap::parse_first_abi_uint(&result, "V4Quoter.quoteExactOutputSingle")
+}
+
+fn privacy_swap_nullifiers(
+    config: &privacy_swap::PrivacySwapConfig,
+    unshield_bundle: &OrchardStoredBundle,
+    shield_bundle: &OrchardStoredBundle,
+) -> Result<Vec<(String, [u8; 32])>> {
+    let mut seen = HashSet::new();
+    let mut reservations = Vec::new();
+    for (pool, bundle) in [
+        (config.input_pool.as_str(), unshield_bundle),
+        (config.output_pool.as_str(), shield_bundle),
+    ] {
+        for nullifier in bundle
+            .actions
+            .iter()
+            .map(|action| action.nullifier)
+            .filter(|nullifier| *nullifier != [0u8; 32])
+        {
+            if !seen.insert(nullifier) {
+                return Err(anyhow!(
+                    "privacy-swap reuses a non-zero nullifier within the two bundles"
+                ));
+            }
+            reservations.push((pool.to_string(), nullifier));
+        }
+    }
+    Ok(reservations)
+}
+
+/// Typed, durable admission for one release-allowlisted Pons v2 PoolCreated route.
+async fn http_privacy_swap(
+    State(cfg): State<Arc<RelayerHttpConfig>>,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    Json(req): Json<PrivacySwapRequest>,
+) -> Result<(StatusCode, Json<TxRequestView>), (StatusCode, Json<HttpErrorResponse>)> {
+    let route_key = privacy_swap_route_key(&req.route_id).map_err(http_error)?;
+    let config = cfg.privacy_swaps.get(&route_key).cloned().ok_or_else(|| {
+        http_error(anyhow!("privacy-swap route is not in the coordinated release allowlist"))
+    })?;
+    if !config.accepting {
+        return Err(http_error(anyhow!("privacy-swap is configured but not accepting")));
+    }
+    reserve_typed_request_budget(
+        &cfg,
+        &headers,
+        peer.map(|ConnectInfo(address)| address),
+        config.gas_limit,
+    )
+    .await?;
+    let _validation_permit = cfg
+        .tx_validation_slots
+        .acquire()
+        .await
+        .map_err(|_| http_error(anyhow!("transaction validation pool is closed")))?;
+
+    let route_data = privacy_swap::parse_route_data(&req.route_data).map_err(http_error)?;
+    if route_data != config.route_data {
+        return Err(http_error(anyhow!("privacy-swap route_data differs from release route")));
+    }
+    let validated = privacy_swap::validate_plan(req.plan, &config, now_unix()).map_err(http_error)?;
+    privacy_swap::validate_quote_evidence(&req.quote_evidence, &config, &validated)
+        .map_err(http_error)?;
+    cfg.ensure_protocol_pool(&config.input_pool).map_err(http_error)?;
+    cfg.ensure_protocol_pool(&config.output_pool).map_err(http_error)?;
+
+    let client = EthRpcClient::new(cfg.rpc_url.clone());
+    for pool in [&config.input_pool, &config.output_pool] {
+        client
+            .verify_pool_protocol(pool, cfg.expected_protocol_version, &cfg.expected_verifier_set_id)
+            .await
+            .map_err(http_error)?;
+        client
+            .verify_registry_pool(&config.registry, pool)
+            .await
+            .map_err(http_error)?;
+    }
+    enforce_frozen_compliance_strict(&cfg.rpc_url, &config.input_pool, &req.unshield_bundle)
+        .await
+        .map_err(http_error)?;
+    enforce_frozen_compliance_strict(&cfg.rpc_url, &config.output_pool, &req.shield_bundle)
+        .await
+        .map_err(http_error)?;
+
+    let unshield_call = bundle_to_privacy_call(&req.unshield_bundle).map_err(http_error)?;
+    let shield_call = bundle_to_privacy_call(&req.shield_bundle).map_err(http_error)?;
+    let expected_context = parse_fixed_hex_32(&req.expected_context)
+        .context("privacy-swap expected_context must be bytes32")
+        .map_err(http_error)?;
+    let local_context = privacy_swap::compute_context(
+        cfg.chain_id,
+        &config,
+        &validated.plan,
+        &shield_call,
+    )
+    .map_err(http_error)?;
+    if expected_context != local_context {
+        return Err(http_error(anyhow!("privacy-swap expected_context mismatch")));
+    }
+    let context_call =
+        privacy_swap::encode_swap_context_calldata(&validated.plan, &shield_call);
+    let onchain_context = client
+        .eth_call(&config.coordinator, &format!("0x{}", hex::encode(context_call)))
+        .await
+        .context("privacy-swap Coordinator.swapContext")
+        .and_then(|value| parse_fixed_hex_32(&value))
+        .map_err(http_error)?;
+    if onchain_context != expected_context {
+        return Err(http_error(anyhow!("privacy-swap on-chain context mismatch")));
+    }
+
+    let current_quote = quote_privacy_swap(&client, &config, &validated)
+        .await
+        .map_err(http_error)?;
+    privacy_swap::validate_current_quote(&validated, current_quote).map_err(http_error)?;
+    let calldata = privacy_swap::encode_swap_calldata(
+        &validated.plan,
+        &route_data,
+        &unshield_call,
+        &shield_call,
+    );
+    let signing_key = parse_hex_key(&cfg.private_key)
+        .context("parse Relayer signer for privacy-swap")
+        .map_err(http_error)?;
+    let sender = format!("0x{}", hex::encode(eth_address_from_signing_key(&signing_key)));
+    let simulated_context = client
+        .eth_call_from(&sender, &config.coordinator, &calldata, 0)
+        .await
+        .context("privacy-swap exact transaction admission eth_call")
+        .and_then(|value| parse_fixed_hex_32(&value))
+        .map_err(http_error)?;
+    if simulated_context != expected_context {
+        return Err(http_error(anyhow!("privacy-swap simulation returned another context")));
+    }
+    let estimated = client
+        .estimate_gas(&sender, &config.coordinator, &calldata, 0)
+        .await
+        .map_err(http_error)?;
+    gas_limit_with_margin(estimated, cfg.gas_limit_margin_bps, config.gas_limit)
+        .map_err(http_error)?;
+    let nullifiers =
+        privacy_swap_nullifiers(&config, &req.unshield_bundle, &req.shield_bundle)
+            .map_err(http_error)?;
+    let admission_block = client.block_number().await.map_err(http_error)?.saturating_sub(1);
+    enqueue_typed_transaction_with_policy(
+        &cfg,
+        "privacy_swap",
         config.coordinator,
         calldata,
         config.gas_limit,
@@ -4548,7 +5161,7 @@ enum ExternalFulfillmentState {
     Fulfilled,
 }
 
-async fn converge_external_privacy_buy(
+async fn converge_external_privacy_transaction(
     cfg: &RelayerHttpConfig,
     client: &EthRpcClient,
     request_id: &str,
@@ -4556,19 +5169,46 @@ async fn converge_external_privacy_buy(
     let Some(probe) = cfg.tx_queue.external_fulfillment_probe(request_id)? else {
         return Ok(ExternalFulfillmentState::NotFound);
     };
-    let buy = cfg
-        .privacy_buy
-        .as_ref()
-        .ok_or_else(|| anyhow!("privacy-buy fulfillment probe exists while capability is disabled"))?;
-    let Some(tx_hash) = client
-        .find_privacy_buy_execution(
-            &probe.target,
-            &probe.context,
-            probe.from_block,
-            buy.event_getlogs_max_span,
-        )
-        .await?
-    else {
+    let (tx_hash, event_name) = match probe.kind.as_str() {
+        "privacy_buy" => {
+            let buy = cfg.privacy_buy.as_ref().ok_or_else(|| {
+                anyhow!("privacy-buy fulfillment probe exists while capability is disabled")
+            })?;
+            (
+                client
+                    .find_privacy_buy_execution(
+                        &probe.target,
+                        &probe.context,
+                        probe.from_block,
+                        buy.event_getlogs_max_span,
+                    )
+                    .await?,
+                "PrivacyBuyExecuted",
+            )
+        }
+        "privacy_swap" => {
+            let swap = cfg
+                .privacy_swaps
+                .values()
+                .find(|route| route.coordinator == probe.target)
+                .ok_or_else(|| {
+                    anyhow!("privacy-swap fulfillment probe target is outside the release")
+                })?;
+            (
+                client
+                    .find_privacy_swap_execution(
+                        &probe.target,
+                        &probe.context,
+                        probe.from_block,
+                        swap.event_getlogs_max_span,
+                    )
+                    .await?,
+                "PrivacySwapExecuted",
+            )
+        }
+        kind => return Err(anyhow!("unsupported external fulfillment kind {kind}")),
+    };
+    let Some(tx_hash) = tx_hash else {
         return Ok(ExternalFulfillmentState::NotFound);
     };
     match client
@@ -4579,13 +5219,13 @@ async fn converge_external_privacy_buy(
             cfg.tx_queue
                 .mark_externally_fulfilled(request_id, &tx_hash)?;
             println!(
-                "[tx-queue] privacy-buy externally fulfilled request={} tx={}",
-                request_id, tx_hash
+                "[tx-queue] {} externally fulfilled request={} tx={}",
+                probe.kind, request_id, tx_hash
             );
             Ok(ExternalFulfillmentState::Fulfilled)
         }
         Some(false) => Err(anyhow!(
-            "PrivacyBuyExecuted log points to reverted transaction {tx_hash}"
+            "{event_name} log points to reverted transaction {tx_hash}"
         )),
         None => Ok(ExternalFulfillmentState::AwaitingFinality),
     }
@@ -4599,7 +5239,7 @@ async fn prepare_and_broadcast_queue_job(
     owner: &str,
     job: tx_queue::QueueJob,
 ) -> bool {
-    match converge_external_privacy_buy(cfg, client, &job.request_id).await {
+    match converge_external_privacy_transaction(cfg, client, &job.request_id).await {
         Ok(ExternalFulfillmentState::Fulfilled) => return true,
         Ok(ExternalFulfillmentState::AwaitingFinality) => return false,
         Ok(ExternalFulfillmentState::NotFound) => {}
@@ -4608,7 +5248,7 @@ async fn prepare_and_broadcast_queue_job(
                 "[tx-queue] external fulfillment probe failed request={}: {error:#}",
                 job.request_id
             );
-            if job.kind == "privacy_buy"
+            if matches!(job.kind.as_str(), "privacy_buy" | "privacy_swap")
                 && job
                     .expires_at
                     .is_some_and(|expires_at| expires_at <= now_unix())
@@ -4702,6 +5342,34 @@ async fn prepare_and_broadcast_queue_job(
             privacy_buy::validate_current_quote(&validated, current_quote)
                 .context("pre-sign privacy-buy quote gate")?;
         }
+        if job.kind == "privacy_swap" {
+            let swap = cfg
+                .privacy_swaps
+                .values()
+                .find(|route| route.coordinator == job.target)
+                .ok_or_else(|| {
+                    anyhow!("privacy-swap queue target is outside the boot-verified release")
+                })?;
+            if job.expected_return.is_none() {
+                return Err(anyhow!("privacy-swap queue job has no expected context"));
+            }
+            let decoded = privacy_swap::decode_swap_plan_calldata(&job.calldata)?;
+            let minimum_deadline = now_unix()
+                .checked_add(swap.min_broadcast_window_seconds)
+                .ok_or_else(|| anyhow!("privacy-swap minimum deadline overflow"))?;
+            if decoded.valid_until < minimum_deadline {
+                cfg.tx_queue.mark_terminal(
+                    &job.request_id,
+                    STATUS_EXPIRED,
+                    Some("privacy-swap no longer has the minimum first-broadcast window"),
+                )?;
+                return Ok(());
+            }
+            let validated = privacy_swap::validate_plan_value(decoded, swap, now_unix())?;
+            let current_quote = quote_privacy_swap(client, swap, &validated).await?;
+            privacy_swap::validate_current_quote(&validated, current_quote)
+                .context("pre-sign privacy-swap quote/PoolCreated gate")?;
+        }
         if let Some(expected) = job.expected_return {
             let actual_raw = match client
                 .eth_call_from(sender_hex, &job.target, &job.calldata, job.value)
@@ -4709,7 +5377,7 @@ async fn prepare_and_broadcast_queue_job(
             {
                 Ok(value) => value,
                 Err(call_error) => {
-                    match converge_external_privacy_buy(cfg, client, &job.request_id).await? {
+                    match converge_external_privacy_transaction(cfg, client, &job.request_id).await? {
                         ExternalFulfillmentState::Fulfilled
                         | ExternalFulfillmentState::AwaitingFinality => return Ok(()),
                         ExternalFulfillmentState::NotFound => {
@@ -4839,7 +5507,7 @@ async fn broadcast_prepared_job(
         }
     }
 
-    match converge_external_privacy_buy(cfg, client, &prepared.request_id).await {
+    match converge_external_privacy_transaction(cfg, client, &prepared.request_id).await {
         Ok(ExternalFulfillmentState::Fulfilled) => return,
         Ok(ExternalFulfillmentState::AwaitingFinality) => return,
         Ok(ExternalFulfillmentState::NotFound) => {}
@@ -5059,7 +5727,7 @@ async fn reconcile_queue_receipts(cfg: &RelayerHttpConfig, client: &EthRpcClient
             Some(true) => cfg
                 .tx_queue
                 .mark_terminal(&request_id, STATUS_CONFIRMED, None),
-            Some(false) => match converge_external_privacy_buy(cfg, client, &request_id).await {
+            Some(false) => match converge_external_privacy_transaction(cfg, client, &request_id).await {
                 Ok(ExternalFulfillmentState::Fulfilled)
                 | Ok(ExternalFulfillmentState::AwaitingFinality) => Ok(()),
                 Ok(ExternalFulfillmentState::NotFound) => cfg.tx_queue.mark_terminal(
@@ -5107,7 +5775,7 @@ async fn replace_pending_job(
                 return true;
             }
             Ok(Some(false)) => {
-                match converge_external_privacy_buy(cfg, client, &pending.request_id).await {
+                match converge_external_privacy_transaction(cfg, client, &pending.request_id).await {
                     Ok(ExternalFulfillmentState::Fulfilled)
                     | Ok(ExternalFulfillmentState::AwaitingFinality) => return true,
                     Ok(ExternalFulfillmentState::NotFound) => {}
@@ -6605,6 +7273,55 @@ impl EthRpcClient {
         Ok(None)
     }
 
+    async fn find_privacy_swap_execution(
+        &self,
+        coordinator: &str,
+        context: &[u8; 32],
+        from_block: u64,
+        max_span: u64,
+    ) -> Result<Option<String>> {
+        if max_span == 0 {
+            return Err(anyhow!("privacy-swap event getLogs span must be positive"));
+        }
+        let latest = self.block_number().await?;
+        if from_block > latest {
+            return Ok(None);
+        }
+        let topic0 = format!(
+            "0x{}",
+            hex::encode(Keccak256::digest(
+                b"PrivacySwapExecuted(bytes32,bytes32,address,address,address,uint64,uint64,uint64,uint256,uint256,uint256,uint256,uint256)"
+            ))
+        );
+        let context_topic = format!("0x{}", hex::encode(context));
+        let mut cursor = from_block;
+        while cursor <= latest {
+            let end = cursor.saturating_add(max_span - 1).min(latest);
+            let logs: Vec<Value> = self
+                .rpc_call(
+                    "eth_getLogs",
+                    serde_json::json!([{
+                        "address": coordinator,
+                        "fromBlock": format!("0x{cursor:x}"),
+                        "toBlock": format!("0x{end:x}"),
+                        "topics": [topic0.clone(), context_topic.clone()]
+                    }]),
+                )
+                .await?;
+            if let Some(tx_hash) = logs
+                .iter()
+                .find_map(|log| log.get("transactionHash").and_then(Value::as_str))
+            {
+                return Ok(Some(tx_hash.to_string()));
+            }
+            if end == latest {
+                break;
+            }
+            cursor = end.saturating_add(1);
+        }
+        Ok(None)
+    }
+
     /// Boot-time cross-check for the multi-fee-asset gateway.
     ///
     /// There is no `feePool()` to compare against any more — the gateway prices
@@ -7410,6 +8127,7 @@ mod tests {
             expected_protocol_version: 3,
             expected_verifier_set_id: [0xabu8; 32],
             privacy_buy: None,
+            privacy_swaps: HashMap::new(),
         })
     }
 
@@ -7811,6 +8529,8 @@ mod tests {
         assert_eq!(health_status, Sc::OK);
         assert_eq!(health["privacy_buy"]["configured"], false);
         assert_eq!(health["privacy_buy"]["accepting"], false);
+        assert_eq!(health["privacy_swap"]["configured"], false);
+        assert_eq!(health["privacy_swap"]["accepting"], false);
         let (status, body) = call(
             &app,
             "POST",
@@ -7844,6 +8564,54 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("privacy-buy is disabled"));
+
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/privacy-swap",
+            Some(serde_json::json!({
+                "route_id": format!("0x{}", "11".repeat(32)),
+                "expected_context": format!("0x{}", "00".repeat(32)),
+                "plan": {
+                    "gross_input_units": "1",
+                    "input_unshield_fee_units": "0",
+                    "input_scale": "1",
+                    "gross_output_units": "1",
+                    "output_shield_fee_units": "0",
+                    "net_output_units": "1",
+                    "output_scale": "1",
+                    "quoted_input_wei": "1",
+                    "amount_in_maximum_wei": "1",
+                    "max_input_surplus_wei": "0",
+                    "max_market_slippage_bps": 1,
+                    "valid_until": "1",
+                    "route_hash": format!("0x{}", "00".repeat(32)),
+                    "salt": format!("0x{}", "00".repeat(32))
+                },
+                "quote_evidence": {
+                    "chain_id": 4663,
+                    "route_id": format!("0x{}", "11".repeat(32)),
+                    "block_number": 1,
+                    "block_hash": format!("0x{}", "22".repeat(32)),
+                    "quoter": "0x1111111111111111111111111111111111111111",
+                    "quoter_runtime_codehash": format!("0x{}", "33".repeat(32)),
+                    "factory": "0x2222222222222222222222222222222222222222",
+                    "factory_runtime_codehash": format!("0x{}", "44".repeat(32)),
+                    "launch_phase": 2,
+                    "want_output_wei": "1",
+                    "amount_in_wei": "1"
+                },
+                "route_data": format!("0x{}", "00".repeat(13 * 32)),
+                "unshield_bundle": test_bundle(),
+                "shield_bundle": test_bundle()
+            })),
+        )
+        .await;
+        assert_eq!(status, Sc::BAD_REQUEST);
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("not in the coordinated release allowlist"));
     }
 
     #[tokio::test]

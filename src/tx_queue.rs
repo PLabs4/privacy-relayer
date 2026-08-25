@@ -101,6 +101,7 @@ pub struct QueueStats {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExternalFulfillmentProbe {
+    pub kind: String,
     pub target: String,
     pub context: [u8; 32],
     pub from_block: u64,
@@ -406,17 +407,18 @@ impl TxQueue {
         let connection = self.lock()?;
         connection
             .query_row(
-                "SELECT target,expected_return,admission_block FROM tx_requests
-                 WHERE request_id=?1 AND kind='privacy_buy'",
+                "SELECT kind,target,expected_return,admission_block FROM tx_requests
+                 WHERE request_id=?1 AND kind IN ('privacy_buy','privacy_swap')",
                 params![request_id],
                 |row| {
-                    let context: Option<Vec<u8>> = row.get(1)?;
-                    let from_block: Option<i64> = row.get(2)?;
+                    let context: Option<Vec<u8>> = row.get(2)?;
+                    let from_block: Option<i64> = row.get(3)?;
                     match (context, from_block) {
                         (Some(context), Some(from_block)) => Ok(Some(ExternalFulfillmentProbe {
-                            target: row.get(0)?,
+                            kind: row.get(0)?,
+                            target: row.get(1)?,
                             context: context.try_into().map_err(|_| {
-                                sql_conversion_error("privacy-buy context is not bytes32")
+                                sql_conversion_error("privacy transaction context is not bytes32")
                             })?,
                             from_block: from_i64(from_block, "admission block")
                                 .map_err(sql_conversion_error)?,
@@ -1258,6 +1260,7 @@ mod tests {
         assert_eq!(
             queue.external_fulfillment_probe(&request_id).unwrap(),
             Some(ExternalFulfillmentProbe {
+                kind: "privacy_buy".into(),
                 target: "0x1111111111111111111111111111111111111111".into(),
                 context: [0xabu8; 32],
                 from_block: 12_345,
