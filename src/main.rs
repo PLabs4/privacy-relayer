@@ -5,6 +5,7 @@
 //! relay EOA is replaced by multisig execution; this binary stays single-key for local signing.
 
 mod fee_calldata;
+mod privacy_buy;
 mod screening;
 mod tx_queue;
 
@@ -55,7 +56,7 @@ use url::Url;
 
 use tx_queue::{
     EnqueueError, NewTxRequest, PendingJob, TxQueue, TxRequestView, STATUS_CONFIRMED,
-    STATUS_REVERTED,
+    STATUS_EXPIRED, STATUS_REVERTED,
 };
 
 const GAS_BPS_DENOMINATOR: u64 = 10_000;
@@ -670,6 +671,9 @@ struct RelayerHttpConfig {
     protocol_pools: HashSet<String>,
     expected_protocol_version: u64,
     expected_verifier_set_id: [u8; 32],
+    /// Immutable, boot-verified fixed-pair privacy-buy capability. None keeps the route
+    /// fail-closed while still exposing a stable typed endpoint.
+    privacy_buy: Option<privacy_buy::PrivacyBuyConfig>,
 }
 
 impl RelayerHttpConfig {
@@ -763,6 +767,334 @@ fn parse_protocol_pools(raw: &str) -> Result<HashSet<String>> {
         ));
     }
     Ok(pools)
+}
+
+fn view_selector(signature: &str) -> String {
+    format!(
+        "0x{}",
+        hex::encode(&Keccak256::digest(signature.as_bytes())[..4])
+    )
+}
+
+async fn privacy_buy_config_from_env(
+    rpc: &EthRpcClient,
+    protocol: &ProtocolExpectation,
+    chain_id: u64,
+) -> Result<Option<privacy_buy::PrivacyBuyConfig>> {
+    let enabled = parse_bool_env("PRIVACYBTC_PRIVACY_BUY_ENABLED", false)?;
+    let accepting = parse_bool_env("PRIVACYBTC_PRIVACY_BUY_ACCEPTING", false)?;
+    if accepting && !enabled {
+        return Err(anyhow!(
+            "PRIVACYBTC_PRIVACY_BUY_ACCEPTING requires PRIVACYBTC_PRIVACY_BUY_ENABLED"
+        ));
+    }
+    if !enabled {
+        return Ok(None);
+    }
+
+    let coordinator =
+        normalize_evm_address(&required_env("PRIVACYBTC_PRIVACY_BUY_COORDINATOR_ADDRESS")?)?;
+    let expected_registry =
+        normalize_evm_address(&required_env("PRIVACYBTC_PRIVACY_BUY_REGISTRY_ADDRESS")?)?;
+    let expected_quote_pool =
+        normalize_evm_address(&required_env("PRIVACYBTC_PRIVACY_BUY_QUOTE_POOL_ADDRESS")?)?;
+    let expected_target_pool =
+        normalize_evm_address(&required_env("PRIVACYBTC_PRIVACY_BUY_TARGET_POOL_ADDRESS")?)?;
+    let expected_quote_verifier_set_id = parse_hex32(&required_env(
+        "PRIVACYBTC_PRIVACY_BUY_QUOTE_VERIFIER_SET_ID",
+    )?)?;
+    let expected_target_verifier_set_id = parse_hex32(&required_env(
+        "PRIVACYBTC_PRIVACY_BUY_TARGET_VERIFIER_SET_ID",
+    )?)?;
+    let expected_quote_token =
+        normalize_evm_address(&required_env("PRIVACYBTC_PRIVACY_BUY_QUOTE_TOKEN_ADDRESS")?)?;
+    let expected_target_token =
+        normalize_evm_address(&required_env("PRIVACYBTC_PRIVACY_BUY_TARGET_TOKEN_ADDRESS")?)?;
+    let expected_adapter =
+        normalize_evm_address(&required_env("PRIVACYBTC_PRIVACY_BUY_ADAPTER_ADDRESS")?)?;
+    let expected_adapter_codehash = parse_hex32(&required_env(
+        "PRIVACYBTC_PRIVACY_BUY_ADAPTER_RUNTIME_CODEHASH",
+    )?)?;
+    if expected_adapter_codehash == [0u8; 32] {
+        return Err(anyhow!(
+            "PRIVACYBTC_PRIVACY_BUY_ADAPTER_RUNTIME_CODEHASH must be non-zero"
+        ));
+    }
+    let expected_fee_collector = normalize_evm_address(&required_env(
+        "PRIVACYBTC_PRIVACY_BUY_FEE_COLLECTOR_ADDRESS",
+    )?)?;
+    let expected_guardian =
+        normalize_evm_address(&required_env("PRIVACYBTC_PRIVACY_BUY_GUARDIAN_ADDRESS")?)?;
+    let expected_buy_fee_units = required_env("PRIVACYBTC_PRIVACY_BUY_BUY_FEE_UNITS")?
+        .parse::<u64>()
+        .context("PRIVACYBTC_PRIVACY_BUY_BUY_FEE_UNITS must be uint64")?;
+    let expected_max_ttl_seconds = required_env("PRIVACYBTC_PRIVACY_BUY_MAX_TTL_SECONDS")?
+        .parse::<u64>()
+        .context("PRIVACYBTC_PRIVACY_BUY_MAX_TTL_SECONDS must be uint64")?;
+    let expected_slippage_cap =
+        required_env("PRIVACYBTC_PRIVACY_BUY_MAX_MARKET_SLIPPAGE_BPS_CAP")?
+            .parse::<u16>()
+            .context(
+                "PRIVACYBTC_PRIVACY_BUY_MAX_MARKET_SLIPPAGE_BPS_CAP must be uint16",
+            )?;
+    let quoter = normalize_evm_address(&required_env("PRIVACYBTC_PRIVACY_BUY_QUOTER_ADDRESS")?)?;
+    let expected_quoter_codehash = parse_hex32(&required_env(
+        "PRIVACYBTC_PRIVACY_BUY_QUOTER_RUNTIME_CODEHASH",
+    )?)?;
+    if expected_quoter_codehash == [0u8; 32] {
+        return Err(anyhow!(
+            "PRIVACYBTC_PRIVACY_BUY_QUOTER_RUNTIME_CODEHASH must be non-zero"
+        ));
+    }
+    let route_data =
+        privacy_buy::parse_route_data(&required_env("PRIVACYBTC_PRIVACY_BUY_ROUTE_DATA")?)?;
+    let market = required_env("PRIVACYBTC_PRIVACY_BUY_MARKET")?;
+    privacy_buy::validate_market_profile(chain_id, &market, &quoter, &route_data)?;
+    let gas_limit = positive_env_u64("PRIVACYBTC_GAS_LIMIT_PRIVACY_BUY", 12_000_000)?;
+    let min_broadcast_window_seconds =
+        positive_env_u64("PRIVACYBTC_PRIVACY_BUY_MIN_BROADCAST_WINDOW_SECS", 30)?;
+    let event_getlogs_max_span =
+        positive_env_u64("PRIVACYBTC_PRIVACY_BUY_EVENT_GETLOGS_MAX_SPAN", 0)?;
+    if event_getlogs_max_span > 100_000 {
+        return Err(anyhow!(
+            "PRIVACYBTC_PRIVACY_BUY_EVENT_GETLOGS_MAX_SPAN must be <= 100000"
+        ));
+    }
+
+    for (label, address) in [
+        ("Coordinator", coordinator.as_str()),
+        ("Registry", expected_registry.as_str()),
+        ("quote pool", expected_quote_pool.as_str()),
+        ("target pool", expected_target_pool.as_str()),
+        ("QuoterV2", quoter.as_str()),
+    ] {
+        rpc.require_code(address)
+            .await
+            .with_context(|| format!("privacy-buy {label} code gate"))?;
+    }
+    let actual_quoter_codehash = rpc.runtime_codehash(&quoter).await?;
+    if actual_quoter_codehash != expected_quoter_codehash {
+        return Err(anyhow!(
+            "privacy-buy QuoterV2 runtime codehash drift: expected 0x{}, got 0x{}",
+            hex::encode(expected_quoter_codehash),
+            hex::encode(actual_quoter_codehash)
+        ));
+    }
+    rpc.verify_protocol_version(&coordinator, privacy_buy::PROTOCOL_VERSION)
+        .await
+        .context("privacy-buy Coordinator protocolVersion")?;
+    let application_version = rpc
+        .read_u64(&coordinator, "applicationVersion()")
+        .await
+        .context("privacy-buy Coordinator applicationVersion")?;
+    if application_version != privacy_buy::APPLICATION_VERSION {
+        return Err(anyhow!(
+            "privacy-buy applicationVersion mismatch: expected {}, got {application_version}",
+            privacy_buy::APPLICATION_VERSION
+        ));
+    }
+
+    let registry = rpc.read_address(&coordinator, "registry()").await?;
+    let quote_pool = rpc.read_address(&coordinator, "quotePool()").await?;
+    let target_pool = rpc.read_address(&coordinator, "targetPool()").await?;
+    for (field, actual, expected) in [
+        ("registry", registry.as_str(), expected_registry.as_str()),
+        (
+            "quotePool",
+            quote_pool.as_str(),
+            expected_quote_pool.as_str(),
+        ),
+        (
+            "targetPool",
+            target_pool.as_str(),
+            expected_target_pool.as_str(),
+        ),
+    ] {
+        if actual != expected {
+            return Err(anyhow!(
+                "privacy-buy Coordinator {field} is {actual}, configured {expected}"
+            ));
+        }
+    }
+    for pool in [&quote_pool, &target_pool] {
+        if !protocol.pools.contains(pool) {
+            return Err(anyhow!(
+                "privacy-buy pool {pool} is missing from PRIVACYBTC_RELAYER_PROTOCOL_POOLS"
+            ));
+        }
+        rpc.verify_pool_protocol(pool, protocol.version, &protocol.verifier_set_id)
+            .await
+            .with_context(|| format!("privacy-buy protocol gate for pool {pool}"))?;
+        rpc.verify_registry_pool(&registry, pool)
+            .await
+            .with_context(|| format!("privacy-buy Registry gate for pool {pool}"))?;
+    }
+
+    let quote_verifier_set_id = rpc
+        .read_bytes32(&coordinator, "quoteVerifierSetId()")
+        .await?;
+    let target_verifier_set_id = rpc
+        .read_bytes32(&coordinator, "targetVerifierSetId()")
+        .await?;
+    if quote_verifier_set_id != protocol.verifier_set_id
+        || target_verifier_set_id != protocol.verifier_set_id
+        || quote_verifier_set_id != expected_quote_verifier_set_id
+        || target_verifier_set_id != expected_target_verifier_set_id
+    {
+        return Err(anyhow!(
+            "privacy-buy Coordinator verifier snapshots do not match the Relayer/Manifest release gate"
+        ));
+    }
+    let quote_token = rpc.read_address(&coordinator, "quoteToken()").await?;
+    let target_token = rpc.read_address(&coordinator, "targetToken()").await?;
+    if quote_token != privacy_buy::ROBINHOOD_USDG
+        || target_token != privacy_buy::PONS_V1_REFERENCE_TOKEN
+        || quote_token != expected_quote_token
+        || target_token != expected_target_token
+    {
+        return Err(anyhow!(
+            "privacy-buy Coordinator/Manifest is not the reviewed USDG/PONS legacy reference pair"
+        ));
+    }
+    let quote_scale = rpc.read_uint(&coordinator, "quoteScale()").await?;
+    let target_scale = rpc.read_uint(&coordinator, "targetScale()").await?;
+    let quote_unshield_fee_units = rpc.read_u64(&quote_pool, "unshieldFeeUnits()").await?;
+    let target_shield_fee_units = rpc.read_u64(&target_pool, "shieldFeeUnits()").await?;
+    let adapter = rpc.read_address(&coordinator, "adapter()").await?;
+    if adapter != expected_adapter {
+        return Err(anyhow!(
+            "privacy-buy Coordinator adapter is {adapter}, configured {expected_adapter}"
+        ));
+    }
+    let adapter_router = rpc.read_address(&adapter, "router()").await?;
+    let adapter_factory = rpc.read_address(&adapter, "factory()").await?;
+    let adapter_weth = rpc.read_address(&adapter, "weth()").await?;
+    let adapter_quote_market_pool = rpc.read_address(&adapter, "quoteWethPool()").await?;
+    let adapter_target_market_pool = rpc.read_address(&adapter, "targetWethPool()").await?;
+    if adapter_router != privacy_buy::ROBINHOOD_SWAP_ROUTER_02
+        || adapter_factory != privacy_buy::ROBINHOOD_UNISWAP_V3_FACTORY
+        || adapter_weth != privacy_buy::ROBINHOOD_WETH
+    {
+        return Err(anyhow!(
+            "privacy-buy Adapter is not pinned to the reviewed Robinhood V3 router/factory/WETH"
+        ));
+    }
+    if adapter_target_market_pool != privacy_buy::PONS_V1_REFERENCE_WETH_POOL {
+        return Err(anyhow!(
+            "privacy-buy Adapter target market pool is not the canonical legacy PONS/WETH pool"
+        ));
+    }
+    for (label, dependency, snapshot_getter) in [
+        ("router", adapter_router.as_str(), "routerRuntimeCodehash()"),
+        ("factory", adapter_factory.as_str(), "factoryRuntimeCodehash()"),
+        ("WETH", adapter_weth.as_str(), "wethRuntimeCodehash()"),
+        ("quote token", quote_token.as_str(), "quoteTokenRuntimeCodehash()"),
+        ("target token", target_token.as_str(), "targetTokenRuntimeCodehash()"),
+        (
+            "quote market pool",
+            adapter_quote_market_pool.as_str(),
+            "quoteWethPoolRuntimeCodehash()",
+        ),
+        (
+            "target market pool",
+            adapter_target_market_pool.as_str(),
+            "targetWethPoolRuntimeCodehash()",
+        ),
+    ] {
+        let expected = rpc.read_bytes32(&adapter, snapshot_getter).await?;
+        let actual = rpc.runtime_codehash(dependency).await?;
+        if actual != expected {
+            return Err(anyhow!(
+                "privacy-buy {label} runtime codehash drift: expected 0x{}, got 0x{}",
+                hex::encode(expected),
+                hex::encode(actual)
+            ));
+        }
+    }
+    let adapter_runtime_codehash = rpc
+        .read_bytes32(&coordinator, "adapterRuntimeCodehash()")
+        .await?;
+    let actual_adapter_codehash = rpc.runtime_codehash(&adapter).await?;
+    if actual_adapter_codehash != adapter_runtime_codehash
+        || actual_adapter_codehash != expected_adapter_codehash
+    {
+        return Err(anyhow!(
+            "privacy-buy adapter runtime codehash drift: Coordinator 0x{}, Manifest 0x{}, got 0x{}",
+            hex::encode(adapter_runtime_codehash),
+            hex::encode(expected_adapter_codehash),
+            hex::encode(actual_adapter_codehash)
+        ));
+    }
+    let route_hash = rpc.read_bytes32(&coordinator, "routeHash()").await?;
+    if privacy_buy::route_hash(&route_data) != route_hash {
+        return Err(anyhow!(
+            "privacy-buy configured route data does not match Coordinator routeHash"
+        ));
+    }
+    let fee_collector = rpc.read_address(&coordinator, "feeCollector()").await?;
+    let buy_fee_units = rpc.read_u64(&coordinator, "buyFeeUnits()").await?;
+    let max_ttl_seconds = rpc.read_u64(&coordinator, "maxTtlSeconds()").await?;
+    let max_market_slippage_bps_cap_u64 = rpc
+        .read_u64(&coordinator, "maxMarketSlippageBpsCap()")
+        .await?;
+    let max_market_slippage_bps_cap = u16::try_from(max_market_slippage_bps_cap_u64)
+        .context("privacy-buy Coordinator slippage cap exceeds uint16")?;
+    let guardian = rpc.read_address(&coordinator, "guardian()").await?;
+    if fee_collector != expected_fee_collector
+        || guardian != expected_guardian
+        || buy_fee_units != expected_buy_fee_units
+        || max_ttl_seconds != expected_max_ttl_seconds
+        || max_market_slippage_bps_cap != expected_slippage_cap
+    {
+        return Err(anyhow!(
+            "privacy-buy Coordinator economic/guardian parameters do not match the Manifest release gate"
+        ));
+    }
+    if min_broadcast_window_seconds >= max_ttl_seconds {
+        return Err(anyhow!(
+            "privacy-buy minimum broadcast window must be smaller than Coordinator MAX_TTL"
+        ));
+    }
+    let coordinator_paused = rpc.read_bool(&coordinator, "paused()").await?;
+    if accepting && coordinator_paused {
+        return Err(anyhow!(
+            "privacy-buy cannot accept new requests while the Coordinator is paused"
+        ));
+    }
+    if coordinator_paused {
+        eprintln!(
+            "[relayer] privacy-buy candidate validated but not accepting; Coordinator remains paused"
+        );
+    }
+
+    Ok(Some(privacy_buy::PrivacyBuyConfig {
+        accepting,
+        coordinator,
+        registry,
+        quote_pool,
+        target_pool,
+        quote_verifier_set_id,
+        target_verifier_set_id,
+        quote_token,
+        target_token,
+        quote_scale,
+        target_scale,
+        quote_unshield_fee_units,
+        target_shield_fee_units,
+        adapter,
+        adapter_runtime_codehash,
+        fee_collector,
+        buy_fee_units,
+        max_ttl_seconds,
+        max_market_slippage_bps_cap,
+        route_data,
+        route_hash,
+        quoter,
+        quoter_runtime_codehash: expected_quoter_codehash,
+        gas_limit,
+        min_broadcast_window_seconds,
+        event_getlogs_max_span,
+    }))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1398,6 +1730,21 @@ async fn enforce_frozen_compliance(
             return Ok(());
         }
     };
+    verify_bundle_frozen_root(bundle, expected_be)
+}
+
+async fn enforce_frozen_compliance_strict(
+    rpc_url: &str,
+    contract: &str,
+    bundle: &OrchardStoredBundle,
+) -> Result<()> {
+    let expected_be = fetch_frozen_root_be(rpc_url, contract)
+        .await
+        .with_context(|| format!("fetch current frozen root for privacy-buy pool {contract}"))?;
+    verify_bundle_frozen_root(bundle, expected_be)
+}
+
+fn verify_bundle_frozen_root(bundle: &OrchardStoredBundle, expected_be: [u8; 32]) -> Result<()> {
     for (i, a) in bundle.actions.iter().enumerate() {
         let pf = a
             .pub_fields_bn254
@@ -1464,6 +1811,7 @@ async fn run_http_server(
             .await
             .with_context(|| format!("protocol gate for pool {pool}"))?;
     }
+    let privacy_buy = privacy_buy_config_from_env(&rpc, &protocol, chain_id).await?;
     let fee_gateway = fee_gateway.map(normalize_evm_address).transpose()?;
     let fee_pools = parse_fee_pools(fee_pool)?;
     let fee_gateway_version = match (fee_gateway.as_deref(), fee_pools.is_empty()) {
@@ -1580,10 +1928,8 @@ async fn run_http_server(
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| "/data/relayer-tx-queue.sqlite".to_string()),
     );
-    let tx_queue_capacity = usize::try_from(positive_env_u64(
-        "PRIVACYBTC_TX_QUEUE_CAPACITY",
-        10_000,
-    )?)
+    let tx_queue_capacity =
+        usize::try_from(positive_env_u64("PRIVACYBTC_TX_QUEUE_CAPACITY", 10_000)?)
     .context("PRIVACYBTC_TX_QUEUE_CAPACITY exceeds usize")?;
     let tx_queue = Arc::new(TxQueue::open(
         &tx_queue_path,
@@ -1684,6 +2030,7 @@ async fn run_http_server(
         protocol_pools: protocol.pools,
         expected_protocol_version: protocol.version,
         expected_verifier_set_id: protocol.verifier_set_id,
+        privacy_buy,
     });
     let app = build_router(state.clone());
     let listener = tokio::net::TcpListener::bind(bind)
@@ -1713,10 +2060,17 @@ fn build_router(state: Arc<RelayerHttpConfig>) -> Router {
         .route("/tx/requests/:request_id", get(http_tx_request))
         // The supported sponsored transfer route is always FeeGateway-bound.
         .route("/transfer/submit", post(http_transfer_submit))
+        .route("/privacy-buy", post(http_privacy_buy))
         // Wrapped Shield returns deterministic calldata only; the user signs,
         // broadcasts and pays gas. Both Unshield routes enter the durable queue.
-        .route("/wrapped/shield/calldata", post(http_wrapped_shield_calldata))
-        .route("/wrapped/unshield/submit", post(http_wrapped_unshield_submit))
+        .route(
+            "/wrapped/shield/calldata",
+            post(http_wrapped_shield_calldata),
+        )
+        .route(
+            "/wrapped/unshield/submit",
+            post(http_wrapped_unshield_submit),
+        )
         .route(
             "/wrapped/native-eth/unshield/submit",
             post(http_native_eth_unshield_submit),
@@ -1756,6 +2110,17 @@ fn build_router(state: Arc<RelayerHttpConfig>) -> Router {
 async fn http_health(
     State(cfg): State<Arc<RelayerHttpConfig>>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    let privacy_buy = cfg
+        .privacy_buy
+        .as_ref()
+        .map(|buy| {
+            serde_json::json!({
+                "configured": true,
+                "accepting": buy.accepting,
+                "market": privacy_buy::MARKET_PROFILE,
+            })
+        })
+        .unwrap_or_else(|| serde_json::json!({ "configured": false, "accepting": false }));
     match cfg.tx_queue.stats() {
         Ok(queue) => (
             StatusCode::OK,
@@ -1764,6 +2129,7 @@ async fn http_health(
                 "protocol_version": cfg.expected_protocol_version,
                 "verifier_set_id": format!("0x{}", hex::encode(cfg.expected_verifier_set_id)),
                 "protocol_pool_count": cfg.protocol_pools.len(),
+                "privacy_buy": privacy_buy,
                 "tx_queue": queue,
             })),
         ),
@@ -1865,7 +2231,10 @@ async fn http_shield_prepare(
         let intent_path = auto.intent_dir.join(&intent_name);
         let bundle_path = bundle_path_for_intent(&intent_path);
 
-        std::fs::write(&bundle_path, serde_json::to_string_pretty(&req.proved_bundle)?)
+        std::fs::write(
+            &bundle_path,
+            serde_json::to_string_pretty(&req.proved_bundle)?,
+        )
             .with_context(|| format!("write bundle {}", bundle_path.display()))?;
         std::fs::write(&intent_path, serde_json::to_string_pretty(&intent)?)
             .with_context(|| format!("write intent {}", intent_path.display()))?;
@@ -1940,7 +2309,9 @@ async fn http_shield_auto(
                 if cleanup_intent_after_receipt(&rpc_url, &tx_hash2, &intent_path2).await {
                     println!("[shield] intent cleaned up after confirmed tx {tx_hash2}");
                 } else {
-                    eprintln!("[shield] intent NOT cleaned up (tx reverted or timed out): {tx_hash2}");
+                    eprintln!(
+                        "[shield] intent NOT cleaned up (tx reverted or timed out): {tx_hash2}"
+                    );
                 }
             });
         }
@@ -2093,15 +2464,16 @@ async fn http_tx_request(
 fn http_queue_error(error: EnqueueError) -> (StatusCode, Json<HttpErrorResponse>) {
     let (status, code) = match error {
         EnqueueError::Full { .. } => (StatusCode::TOO_MANY_REQUESTS, "TX_QUEUE_FULL"),
-        EnqueueError::NullifierReserved { .. } => {
-            (StatusCode::CONFLICT, "NULLIFIER_RESERVED")
-        }
+        EnqueueError::NullifierReserved { .. } => (StatusCode::CONFLICT, "NULLIFIER_RESERVED"),
         EnqueueError::Storage(_) => (StatusCode::INTERNAL_SERVER_ERROR, "TX_QUEUE_STORAGE"),
     };
-    (status, Json(HttpErrorResponse {
-        error: error.to_string(),
-        code: Some(code.to_string()),
-    }))
+    (
+        status,
+        Json(HttpErrorResponse {
+            error: error.to_string(),
+            code: Some(code.to_string()),
+        }),
+    )
 }
 
 async fn reserve_typed_request_budget(
@@ -2139,6 +2511,22 @@ fn enqueue_typed_transaction(
     gas_cap: u64,
     nullifiers: Vec<(String, [u8; 32])>,
 ) -> Result<(StatusCode, Json<TxRequestView>), (StatusCode, Json<HttpErrorResponse>)> {
+    enqueue_typed_transaction_with_policy(
+        cfg, kind, target, calldata, gas_cap, nullifiers, None, None, None,
+    )
+}
+
+fn enqueue_typed_transaction_with_policy(
+    cfg: &RelayerHttpConfig,
+    kind: &str,
+    target: String,
+    calldata: Vec<u8>,
+    gas_cap: u64,
+    nullifiers: Vec<(String, [u8; 32])>,
+    expected_return: Option<[u8; 32]>,
+    expires_at: Option<u64>,
+    admission_block: Option<u64>,
+) -> Result<(StatusCode, Json<TxRequestView>), (StatusCode, Json<HttpErrorResponse>)> {
     let request = cfg
         .tx_queue
         .enqueue(NewTxRequest {
@@ -2148,11 +2536,222 @@ fn enqueue_typed_transaction(
             calldata,
             gas_cap,
             gas_margin_bps: cfg.gas_limit_margin_bps,
+            expected_return,
+            expires_at,
+            admission_block,
             nullifiers,
         })
         .map_err(http_queue_error)?;
     cfg.tx_queue_notify.notify_one();
     Ok((StatusCode::ACCEPTED, Json(request)))
+}
+
+#[derive(Debug, Deserialize)]
+struct PrivacyBuyRequest {
+    expected_context: String,
+    plan: privacy_buy::BuyPlanJson,
+    route_data: String,
+    unshield_bundle: OrchardStoredBundle,
+    shield_bundle: OrchardStoredBundle,
+}
+
+async fn quote_privacy_buy(
+    client: &EthRpcClient,
+    config: &privacy_buy::PrivacyBuyConfig,
+    validated: &privacy_buy::ValidatedPlan,
+) -> Result<ethabi::Uint> {
+    let actual_codehash = client.runtime_codehash(&config.quoter).await?;
+    if actual_codehash != config.quoter_runtime_codehash {
+        return Err(anyhow!(
+            "privacy-buy QuoterV2 codehash changed after startup"
+        ));
+    }
+    let calldata =
+        privacy_buy::encode_quoter_calldata(&config.route_data, validated.want_target_wei);
+    let result = client
+        .eth_call(&config.quoter, &format!("0x{}", hex::encode(calldata)))
+        .await
+        .context("privacy-buy QuoterV2 exact-output quote")?;
+    privacy_buy::parse_first_abi_uint(&result, "QuoterV2.quoteExactOutput")
+}
+
+fn privacy_buy_nullifiers(
+    config: &privacy_buy::PrivacyBuyConfig,
+    unshield_bundle: &OrchardStoredBundle,
+    shield_bundle: &OrchardStoredBundle,
+) -> Result<Vec<(String, [u8; 32])>> {
+    let mut seen = HashSet::new();
+    let mut reservations = Vec::new();
+    for (pool, bundle) in [
+        (config.quote_pool.as_str(), unshield_bundle),
+        (config.target_pool.as_str(), shield_bundle),
+    ] {
+        for nullifier in bundle
+            .actions
+            .iter()
+            .map(|action| action.nullifier)
+            .filter(|nullifier| *nullifier != [0u8; 32])
+        {
+            if !seen.insert(nullifier) {
+                return Err(anyhow!(
+                    "privacy-buy reuses a non-zero nullifier within the two bundles"
+                ));
+            }
+            reservations.push((pool.to_string(), nullifier));
+        }
+    }
+    Ok(reservations)
+}
+
+/// Fixed-pair private launchpad buy. This is a supported typed surface and deliberately does not
+/// depend on `legacy_routes_enabled` or accept caller-selected targets/calldata.
+async fn http_privacy_buy(
+    State(cfg): State<Arc<RelayerHttpConfig>>,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    Json(req): Json<PrivacyBuyRequest>,
+) -> Result<(StatusCode, Json<TxRequestView>), (StatusCode, Json<HttpErrorResponse>)> {
+    let config = cfg.privacy_buy.clone().ok_or_else(|| {
+        http_error(anyhow!(
+            "privacy-buy is disabled by PRIVACYBTC_PRIVACY_BUY_ENABLED"
+        ))
+    })?;
+    if !config.accepting {
+        return Err(http_error(anyhow!(
+            "privacy-buy is configured but not accepting new requests"
+        )));
+    }
+    reserve_typed_request_budget(
+        &cfg,
+        &headers,
+        peer.map(|ConnectInfo(address)| address),
+        config.gas_limit,
+    )
+    .await?;
+    let _validation_permit = cfg
+        .tx_validation_slots
+        .acquire()
+        .await
+        .map_err(|_| http_error(anyhow!("transaction validation pool is closed")))?;
+
+    let route_data = privacy_buy::parse_route_data(&req.route_data).map_err(http_error)?;
+    if route_data != config.route_data {
+        return Err(http_error(anyhow!(
+            "privacy-buy route_data differs from the fixed release route"
+        )));
+    }
+    let validated =
+        privacy_buy::validate_plan(req.plan, &config, now_unix()).map_err(http_error)?;
+    cfg.ensure_protocol_pool(&config.quote_pool)
+        .map_err(http_error)?;
+    cfg.ensure_protocol_pool(&config.target_pool)
+        .map_err(http_error)?;
+
+    let client = EthRpcClient::new(cfg.rpc_url.clone());
+    for pool in [&config.quote_pool, &config.target_pool] {
+        client
+            .verify_pool_protocol(
+                pool,
+                cfg.expected_protocol_version,
+                &cfg.expected_verifier_set_id,
+            )
+            .await
+            .map_err(http_error)?;
+        client
+            .verify_registry_pool(&config.registry, pool)
+            .await
+            .map_err(http_error)?;
+    }
+    enforce_frozen_compliance_strict(&cfg.rpc_url, &config.quote_pool, &req.unshield_bundle)
+        .await
+        .map_err(http_error)?;
+    enforce_frozen_compliance_strict(&cfg.rpc_url, &config.target_pool, &req.shield_bundle)
+        .await
+        .map_err(http_error)?;
+
+    let unshield_call = bundle_to_privacy_call(&req.unshield_bundle).map_err(http_error)?;
+    let shield_call = bundle_to_privacy_call(&req.shield_bundle).map_err(http_error)?;
+    let expected_context = parse_fixed_hex_32(&req.expected_context)
+        .context("expected_context must be bytes32")
+        .map_err(http_error)?;
+    let local_context =
+        privacy_buy::compute_context(cfg.chain_id, &config, &validated.plan, &shield_call)
+            .map_err(http_error)?;
+    if expected_context != local_context {
+        return Err(http_error(anyhow!(
+            "privacy-buy expected_context does not match the fixed Coordinator inputs"
+        )));
+    }
+    let context_call = privacy_buy::encode_buy_context_calldata(&validated.plan, &shield_call);
+    let onchain_context = client
+        .eth_call(
+            &config.coordinator,
+            &format!("0x{}", hex::encode(context_call)),
+        )
+        .await
+        .context("privacy-buy Coordinator.buyContext")
+        .and_then(|value| parse_fixed_hex_32(&value))
+        .map_err(http_error)?;
+    if onchain_context != expected_context {
+        return Err(http_error(anyhow!(
+            "privacy-buy Coordinator context differs from wallet/Relayer context"
+        )));
+    }
+
+    let current_quote = quote_privacy_buy(&client, &config, &validated)
+        .await
+        .map_err(http_error)?;
+    privacy_buy::validate_current_quote(&validated, current_quote).map_err(http_error)?;
+    let calldata = privacy_buy::encode_buy_calldata(
+        &validated.plan,
+        &route_data,
+        &unshield_call,
+        &shield_call,
+    );
+    let signing_key = parse_hex_key(&cfg.private_key)
+        .context("parse Relayer signer for privacy-buy")
+        .map_err(http_error)?;
+    let sender = format!(
+        "0x{}",
+        hex::encode(eth_address_from_signing_key(&signing_key))
+    );
+    let simulated_context = client
+        .eth_call_from(&sender, &config.coordinator, &calldata, 0)
+        .await
+        .context("privacy-buy exact transaction admission eth_call")
+        .and_then(|value| parse_fixed_hex_32(&value))
+        .map_err(http_error)?;
+    if simulated_context != expected_context {
+        return Err(http_error(anyhow!(
+            "privacy-buy exact transaction returned a different context"
+        )));
+    }
+    let estimated = client
+        .estimate_gas(&sender, &config.coordinator, &calldata, 0)
+        .await
+        .map_err(http_error)?;
+    let _signed_gas_limit =
+        gas_limit_with_margin(estimated, cfg.gas_limit_margin_bps, config.gas_limit)
+            .map_err(http_error)?;
+    let nullifiers = privacy_buy_nullifiers(&config, &req.unshield_bundle, &req.shield_bundle)
+        .map_err(http_error)?;
+    let admission_block = client
+        .block_number()
+        .await
+        .map_err(http_error)?
+        .saturating_sub(1);
+
+    enqueue_typed_transaction_with_policy(
+        &cfg,
+        "privacy_buy",
+        config.coordinator,
+        calldata,
+        config.gas_limit,
+        nullifiers,
+        Some(expected_context),
+        Some(validated.plan.valid_until),
+        Some(admission_block),
+    )
 }
 
 /// Sponsored private transfer. ALWAYS routed through `Perc20FeeGateway` — never straight to the
@@ -2403,26 +3002,42 @@ async fn http_unshield_submit(
     State(cfg): State<Arc<RelayerHttpConfig>>,
     Json(req): Json<HttpUnshieldSubmitRequest>,
 ) -> Result<Json<HttpTxResponse>, (StatusCode, Json<HttpErrorResponse>)> {
-    let contract = cfg.ensure_protocol_pool(&req.contract).map_err(http_error)?;
+    let contract = cfg
+        .ensure_protocol_pool(&req.contract)
+        .map_err(http_error)?;
     // Resolve recipient_meta_hex from whichever field the caller supplied.
     let recipient_meta_hex: String = match (&req.recipient_meta_hex, &req.recipient_evm) {
         (Some(meta), None) => meta.clone(),
         (None, Some(evm)) => {
-            let addr = parse_evm_address_hex(evm)
-                .map_err(|e| (StatusCode::BAD_REQUEST, Json(HttpErrorResponse {
+            let addr = parse_evm_address_hex(evm).map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(HttpErrorResponse {
                     error: format!("bad recipient_evm: {e}"),
                     code: None,
-                })))?;
+                    }),
+                )
+            })?;
             format!("0x{}", hex::encode(evm_address_to_recipient_meta(&addr)))
         }
-        (Some(_), Some(_)) => return Err((StatusCode::BAD_REQUEST, Json(HttpErrorResponse {
+        (Some(_), Some(_)) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(HttpErrorResponse {
             error: "supply exactly one of recipient_meta_hex or recipient_evm".into(),
             code: None,
-        }))),
-        (None, None) => return Err((StatusCode::BAD_REQUEST, Json(HttpErrorResponse {
+                }),
+            ))
+        }
+        (None, None) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(HttpErrorResponse {
             error: "recipient_meta_hex or recipient_evm is required".into(),
             code: None,
-        }))),
+                }),
+            ))
+        }
     };
 
     // Validate BTC address↔meta binding when both are present.
@@ -2456,12 +3071,14 @@ async fn http_unshield_submit(
     .map_err(http_error)?;
 
     let tx_hash = submitted.tx_hash;
-    tokio::spawn(notify_pending_tx(cfg.indexer_url.clone(), tx_hash.clone(), contract.clone()));
+    tokio::spawn(notify_pending_tx(
+        cfg.indexer_url.clone(),
+        tx_hash.clone(),
+        contract.clone(),
+    ));
 
     // Spawn background BTC payout (only when btc payout is configured and address provided).
-    if let (Some(btc_addr), Some(wif)) =
-        (req.recipient_btc_address, cfg.btc_payout_wif.clone())
-    {
+    if let (Some(btc_addr), Some(wif)) = (req.recipient_btc_address, cfg.btc_payout_wif.clone()) {
         let eth_rpc     = cfg.rpc_url.clone();
         let contract    = contract.clone();
         let tx          = tx_hash.clone();
@@ -2469,7 +3086,9 @@ async fn http_unshield_submit(
         let amount_sats = req.amount_sats;
         let fee_sat_vb  = cfg.btc_payout_fee_sat_vb;
         let confirmations = cfg.btc_payout_evm_confirmations;
-        let esplora_url = cfg.auto_shield.as_ref()
+        let esplora_url = cfg
+            .auto_shield
+            .as_ref()
             .map(|s| esplora_base_url(&s.btc_rpc_url))
             .unwrap_or_else(|| "https://blockstream.info/api".to_string());
         tokio::spawn(async move {
@@ -2490,16 +3109,22 @@ async fn http_unshield_submit(
 fn parse_hex32(s: &str) -> Result<[u8; 32]> {
     let clean = s.strip_prefix("0x").unwrap_or(s);
     let bytes = hex::decode(clean).context("invalid hex")?;
-    bytes.try_into().map_err(|_| anyhow!("expected 32 bytes, got {}", s.len() / 2))
+    bytes
+        .try_into()
+        .map_err(|_| anyhow!("expected 32 bytes, got {}", s.len() / 2))
 }
 
 /// Extract `Vec<BundleActionArgs>` from a proved `OrchardStoredBundle`.
 fn bundle_to_action_args(bundle: &OrchardStoredBundle) -> Result<Vec<BundleActionArgs>> {
     let mut out = Vec::with_capacity(bundle.actions.len());
     for a in &bundle.actions {
-        let proof = a.proof_bn254.clone()
+        let proof = a
+            .proof_bn254
+            .clone()
             .ok_or_else(|| anyhow!("action missing proof_bn254 — call prover first"))?;
-        let raw_pi: [[u8; 32]; 8] = a.pub_fields_bn254.as_ref()
+        let raw_pi: [[u8; 32]; 8] = a
+            .pub_fields_bn254
+            .as_ref()
             .and_then(|v| v.clone().try_into().ok())
             .ok_or_else(|| anyhow!("action missing pub_fields_bn254 (expected 8 elements)"))?;
         out.push(BundleActionArgs {
@@ -2528,7 +3153,8 @@ fn bundle_to_action_args(bundle: &OrchardStoredBundle) -> Result<Vec<BundleActio
 }
 
 fn bundle_binding_proof(bundle: &OrchardStoredBundle) -> Result<[[u8; 32]; 8]> {
-    bundle.binding_proof_bn254
+    bundle
+        .binding_proof_bn254
         .ok_or_else(|| anyhow!("bundle.binding_proof_bn254 is missing"))
 }
 
@@ -2823,23 +3449,38 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-fn default_offer_ttl() -> u64 { 120 }
-fn default_max_amount_b() -> u64 { u64::MAX }
+fn default_offer_ttl() -> u64 {
+    120
+}
+fn default_max_amount_b() -> u64 {
+    u64::MAX
+}
 /// Stale Accepted/Initiated/Joined orders expire after this many seconds.
 const ORDER_TTL_SECS: u64 = 3600;
 /// Bound untrusted order-book storage and the amount of proved bundle data retained in memory.
 const MAX_SWAP_ORDERS: usize = 1_000;
 const MAX_SWAP_BUNDLE_BYTES: usize = 256 * 1024;
 
-fn require_lp_token(cfg: &RelayerHttpConfig, headers: &HeaderMap) -> Result<(), (StatusCode, Json<HttpErrorResponse>)> {
-    let expected = cfg.lp_offer_token.as_deref().ok_or_else(|| http_error(anyhow!(
+fn require_lp_token(
+    cfg: &RelayerHttpConfig,
+    headers: &HeaderMap,
+) -> Result<(), (StatusCode, Json<HttpErrorResponse>)> {
+    let expected = cfg.lp_offer_token.as_deref().ok_or_else(|| {
+        http_error(anyhow!(
         "LP operations disabled: configure PRIVACYBTC_LP_OFFER_TOKEN"
-    )))?;
-    let supplied = headers.get("x-lp-offer-token").and_then(|value| value.to_str().ok());
+        ))
+    })?;
+    let supplied = headers
+        .get("x-lp-offer-token")
+        .and_then(|value| value.to_str().ok());
     if supplied != Some(expected) {
-        return Err((StatusCode::UNAUTHORIZED, Json(HttpErrorResponse {
-            error: "invalid LP offer token".to_owned(), code: None,
-        })));
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(HttpErrorResponse {
+                error: "invalid LP offer token".to_owned(),
+                code: None,
+            }),
+        ));
     }
     Ok(())
 }
@@ -3900,6 +4541,56 @@ async fn tx_queue_worker(cfg: Arc<RelayerHttpConfig>) -> Result<()> {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExternalFulfillmentState {
+    NotFound,
+    AwaitingFinality,
+    Fulfilled,
+}
+
+async fn converge_external_privacy_buy(
+    cfg: &RelayerHttpConfig,
+    client: &EthRpcClient,
+    request_id: &str,
+) -> Result<ExternalFulfillmentState> {
+    let Some(probe) = cfg.tx_queue.external_fulfillment_probe(request_id)? else {
+        return Ok(ExternalFulfillmentState::NotFound);
+    };
+    let buy = cfg
+        .privacy_buy
+        .as_ref()
+        .ok_or_else(|| anyhow!("privacy-buy fulfillment probe exists while capability is disabled"))?;
+    let Some(tx_hash) = client
+        .find_privacy_buy_execution(
+            &probe.target,
+            &probe.context,
+            probe.from_block,
+            buy.event_getlogs_max_span,
+        )
+        .await?
+    else {
+        return Ok(ExternalFulfillmentState::NotFound);
+    };
+    match client
+        .get_transaction_receipt_status_for_queue(&tx_hash, cfg.tx_queue_runtime.receipt_finality)
+        .await?
+    {
+        Some(true) => {
+            cfg.tx_queue
+                .mark_externally_fulfilled(request_id, &tx_hash)?;
+            println!(
+                "[tx-queue] privacy-buy externally fulfilled request={} tx={}",
+                request_id, tx_hash
+            );
+            Ok(ExternalFulfillmentState::Fulfilled)
+        }
+        Some(false) => Err(anyhow!(
+            "PrivacyBuyExecuted log points to reverted transaction {tx_hash}"
+        )),
+        None => Ok(ExternalFulfillmentState::AwaitingFinality),
+    }
+}
+
 async fn prepare_and_broadcast_queue_job(
     cfg: &RelayerHttpConfig,
     client: &EthRpcClient,
@@ -3908,6 +4599,35 @@ async fn prepare_and_broadcast_queue_job(
     owner: &str,
     job: tx_queue::QueueJob,
 ) -> bool {
+    match converge_external_privacy_buy(cfg, client, &job.request_id).await {
+        Ok(ExternalFulfillmentState::Fulfilled) => return true,
+        Ok(ExternalFulfillmentState::AwaitingFinality) => return false,
+        Ok(ExternalFulfillmentState::NotFound) => {}
+        Err(error) => {
+            eprintln!(
+                "[tx-queue] external fulfillment probe failed request={}: {error:#}",
+                job.request_id
+            );
+            if job.kind == "privacy_buy"
+                && job
+                    .expires_at
+                    .is_some_and(|expires_at| expires_at <= now_unix())
+            {
+                return false;
+            }
+        }
+    }
+    if job
+        .expires_at
+        .is_some_and(|expires_at| expires_at <= now_unix())
+    {
+        let _ = cfg.tx_queue.mark_terminal(
+            &job.request_id,
+            STATUS_EXPIRED,
+            Some("request deadline elapsed before signing"),
+        );
+        return true;
+    }
     let suggested_fees = client.suggest_eip1559_fees(cfg.gas_price_gwei).await;
     let (max_priority_fee, max_fee) = match enforce_eip1559_fee_cap(
         suggested_fees.0,
@@ -3943,6 +4663,82 @@ async fn prepare_and_broadcast_queue_job(
             .acquire_or_renew_lease(owner, cfg.tx_queue_runtime.worker_lease_secs)?
         {
             return Err(anyhow!("transaction queue signer lease was lost before preparation"));
+        }
+        if job
+            .expires_at
+            .is_some_and(|expires_at| expires_at <= now_unix())
+        {
+            cfg.tx_queue.mark_terminal(
+                &job.request_id,
+                STATUS_EXPIRED,
+                Some("request deadline elapsed during validation"),
+            )?;
+            return Ok(());
+        }
+        if job.kind == "privacy_buy" {
+            let buy = cfg
+                .privacy_buy
+                .as_ref()
+                .ok_or_else(|| anyhow!("privacy-buy queue job exists while capability is disabled"))?;
+            if job.target != buy.coordinator || job.expected_return.is_none() {
+                return Err(anyhow!(
+                    "privacy-buy queue policy does not match the boot-verified Coordinator"
+                ));
+            }
+            let decoded = privacy_buy::decode_buy_plan_calldata(&job.calldata)?;
+            let minimum_deadline = now_unix()
+                .checked_add(buy.min_broadcast_window_seconds)
+                .ok_or_else(|| anyhow!("privacy-buy minimum broadcast deadline overflow"))?;
+            if decoded.valid_until < minimum_deadline {
+                cfg.tx_queue.mark_terminal(
+                    &job.request_id,
+                    STATUS_EXPIRED,
+                    Some("privacy-buy no longer has the minimum first-broadcast window"),
+                )?;
+                return Ok(());
+            }
+            let validated = privacy_buy::validate_plan_value(decoded, buy, now_unix())?;
+            let current_quote = quote_privacy_buy(client, buy, &validated).await?;
+            privacy_buy::validate_current_quote(&validated, current_quote)
+                .context("pre-sign privacy-buy quote gate")?;
+        }
+        if let Some(expected) = job.expected_return {
+            let actual_raw = match client
+                .eth_call_from(sender_hex, &job.target, &job.calldata, job.value)
+                .await
+            {
+                Ok(value) => value,
+                Err(call_error) => {
+                    match converge_external_privacy_buy(cfg, client, &job.request_id).await? {
+                        ExternalFulfillmentState::Fulfilled
+                        | ExternalFulfillmentState::AwaitingFinality => return Ok(()),
+                        ExternalFulfillmentState::NotFound => {
+                            return Err(call_error)
+                                .context("pre-sign exact transaction eth_call")
+                        }
+                    }
+                }
+            };
+            let actual = parse_fixed_hex_32(&actual_raw)
+                .context("pre-sign exact transaction return must be bytes32")?;
+            if actual != expected {
+                return Err(anyhow!(
+                    "pre-sign exact transaction returned context 0x{}, expected 0x{}",
+                    hex::encode(actual),
+                    hex::encode(expected)
+                ));
+            }
+        }
+        if job
+            .expires_at
+            .is_some_and(|expires_at| expires_at <= now_unix())
+        {
+            cfg.tx_queue.mark_terminal(
+                &job.request_id,
+                STATUS_EXPIRED,
+                Some("request deadline elapsed after pre-sign simulation"),
+            )?;
+            return Ok(());
         }
         let _lane = EVM_SIGNER_LANE.lock().await;
         let chain_pending_nonce = client.get_transaction_count(sender_hex).await?;
@@ -4041,6 +4837,69 @@ async fn broadcast_prepared_job(
                 prepared.request_id
             ),
         }
+    }
+
+    match converge_external_privacy_buy(cfg, client, &prepared.request_id).await {
+        Ok(ExternalFulfillmentState::Fulfilled) => return,
+        Ok(ExternalFulfillmentState::AwaitingFinality) => return,
+        Ok(ExternalFulfillmentState::NotFound) => {}
+        Err(error) => {
+            eprintln!(
+                "[tx-queue] pre-broadcast external fulfillment probe failed request={}: {error:#}",
+                prepared.request_id
+            );
+            if cfg
+                .tx_queue
+                .external_fulfillment_probe(&prepared.request_id)
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                return;
+            }
+        }
+    }
+
+    if prepared
+        .expires_at
+        .is_some_and(|expires_at| expires_at <= now_unix())
+    {
+        let message = if check_existing {
+            "request deadline elapsed; refusing to replay a transaction with unknown broadcast state"
+        } else {
+            "request deadline elapsed before first broadcast"
+        };
+        let mark_result = if check_existing {
+            // Recovery cannot distinguish "never sent" from "RPC accepted, process died before
+            // mark_pending", so retain both nullifier reservations conservatively.
+            cfg.tx_queue
+                .mark_terminal(&prepared.request_id, STATUS_EXPIRED, Some(message))
+        } else {
+            // This process has not called eth_sendRawTransaction yet, so releasing the reservation
+            // is safe and lets the wallet rebuild a fresh proof after expiry.
+            cfg.tx_queue
+                .mark_definitely_unbroadcast_expired(&prepared.request_id, message)
+                .and_then(|changed| {
+                    if changed {
+                        Ok(())
+                    } else {
+                        Err(anyhow!(
+                            "prepared request changed state before pre-broadcast expiry"
+                        ))
+                    }
+                })
+        };
+        if let Err(error) = mark_result {
+            eprintln!(
+                "[tx-queue] failed to persist pre-broadcast expiry request={}: {error:#}",
+                prepared.request_id
+            );
+        }
+        eprintln!(
+            "[tx-queue] expired request={} before broadcast",
+            prepared.request_id
+        );
+        return;
     }
 
     match client.send_raw_transaction(&prepared.raw_tx).await {
@@ -4200,11 +5059,21 @@ async fn reconcile_queue_receipts(cfg: &RelayerHttpConfig, client: &EthRpcClient
             Some(true) => cfg
                 .tx_queue
                 .mark_terminal(&request_id, STATUS_CONFIRMED, None),
-            Some(false) => cfg.tx_queue.mark_terminal(
+            Some(false) => match converge_external_privacy_buy(cfg, client, &request_id).await {
+                Ok(ExternalFulfillmentState::Fulfilled)
+                | Ok(ExternalFulfillmentState::AwaitingFinality) => Ok(()),
+                Ok(ExternalFulfillmentState::NotFound) => cfg.tx_queue.mark_terminal(
                 &request_id,
                 STATUS_REVERTED,
                 Some("transaction reverted on-chain"),
             ),
+                Err(error) => {
+                    eprintln!(
+                        "[tx-queue] reverted privacy-buy external probe failed request={request_id}: {error:#}"
+                    );
+                    Ok(())
+                }
+            },
             None => Ok(()),
         };
         if let Err(error) = result {
@@ -4238,6 +5107,18 @@ async fn replace_pending_job(
                 return true;
             }
             Ok(Some(false)) => {
+                match converge_external_privacy_buy(cfg, client, &pending.request_id).await {
+                    Ok(ExternalFulfillmentState::Fulfilled)
+                    | Ok(ExternalFulfillmentState::AwaitingFinality) => return true,
+                    Ok(ExternalFulfillmentState::NotFound) => {}
+                    Err(error) => {
+                        eprintln!(
+                            "[tx-queue] replacement external probe failed request={}: {error:#}",
+                            pending.request_id
+                        );
+                        return false;
+                    }
+                }
                 let _ = cfg.tx_queue.mark_terminal(
                     &pending.request_id,
                     STATUS_REVERTED,
@@ -4487,7 +5368,10 @@ use bitcoin::{
 
 /// Strip `esplora:` prefix from btc_rpc_url to get a bare HTTPS base URL.
 fn esplora_base_url(btc_rpc_url: &str) -> String {
-    btc_rpc_url.strip_prefix("esplora:").unwrap_or(btc_rpc_url).to_string()
+    btc_rpc_url
+        .strip_prefix("esplora:")
+        .unwrap_or(btc_rpc_url)
+        .to_string()
 }
 
 /// Estimate P2TR transaction virtual size in vBytes.
@@ -4501,17 +5385,27 @@ fn estimate_p2tr_vsize(n_inputs: usize, n_outputs: usize) -> u64 {
     overhead + input_base + input_wit + outputs
 }
 
-async fn esplora_get_utxos(client: &Client, base_url: &str, address: &str) -> Result<Vec<EsploraUtxo>> {
-    let url = format!("{}/address/{}/utxo", base_url.trim_end_matches('/'), address);
+async fn esplora_get_utxos(
+    client: &Client,
+    base_url: &str,
+    address: &str,
+) -> Result<Vec<EsploraUtxo>> {
+    let url = format!(
+        "{}/address/{}/utxo",
+        base_url.trim_end_matches('/'),
+        address
+    );
     let utxos: Vec<EsploraUtxo> = client.get(&url).send().await?.json().await?;
     Ok(utxos.into_iter().filter(|u| u.status.confirmed).collect())
 }
 async fn esplora_broadcast(client: &Client, base_url: &str, tx_hex: &str) -> Result<String> {
     let url  = format!("{}/tx", base_url.trim_end_matches('/'));
-    let resp = client.post(&url)
+    let resp = client
+        .post(&url)
         .header("Content-Type", "text/plain")
         .body(tx_hex.to_string())
-        .send().await?;
+        .send()
+        .await?;
     if !resp.status().is_success() {
         let body = resp.text().await.unwrap_or_default();
         return Err(anyhow!("Esplora broadcast error: {body}"));
@@ -4568,7 +5462,9 @@ async fn btc_payout_local(
         .require_network(network)
         .context("wrong network (expected Bitcoin mainnet)")?;
 
-    let inputs: Vec<TxIn> = selected.iter().map(|u| TxIn {
+    let inputs: Vec<TxIn> = selected
+        .iter()
+        .map(|u| TxIn {
         previous_output: OutPoint {
             txid: BtcTxid::from_str(&u.txid).expect("txid"),
             vout: u.vout,
@@ -4576,7 +5472,8 @@ async fn btc_payout_local(
         script_sig: ScriptBuf::default(),
         sequence:   bitcoin::Sequence::ENABLE_RBF_NO_LOCKTIME,
         witness:    Witness::default(),
-    }).collect();
+        })
+        .collect();
 
     let mut outputs = vec![TxOut {
         value:         Amount::from_sat(amount_sats),
@@ -4596,22 +5493,29 @@ async fn btc_payout_local(
         output:    outputs,
     };
 
-    let prevouts: Vec<TxOut> = selected.iter().map(|u| TxOut {
+    let prevouts: Vec<TxOut> = selected
+        .iter()
+        .map(|u| TxOut {
         value:         Amount::from_sat(u.value),
         script_pubkey: payout_addr.script_pubkey(),
-    }).collect();
+        })
+        .collect();
 
     // Compute all sighashes first (immutable borrow), then sign (mutable)
     let tweaked_kp = keypair.tap_tweak(&secp, None);
     let sighashes: Vec<_> = {
         let mut cache = SighashCache::new(&tx);
-        (0..tx.input.len()).map(|i| {
-            cache.taproot_key_spend_signature_hash(
+        (0..tx.input.len())
+            .map(|i| {
+                cache
+                    .taproot_key_spend_signature_hash(
                 i,
                 &Prevouts::All(&prevouts),
                 TapSighashType::Default,
-            ).expect("sighash")
-        }).collect()
+                    )
+                    .expect("sighash")
+            })
+            .collect()
     };
     for (i, sh) in sighashes.into_iter().enumerate() {
         let sig = secp.sign_schnorr(
@@ -5550,6 +6454,157 @@ impl EthRpcClient {
         Ok(())
     }
 
+    async fn eth_call_from(
+        &self,
+        from: &str,
+        to: &str,
+        calldata: &[u8],
+        value: u64,
+    ) -> Result<String> {
+        self.rpc_call(
+            "eth_call",
+            serde_json::json!([{
+                "from": from,
+                "to": to,
+                "data": format!("0x{}", hex::encode(calldata)),
+                "value": format!("0x{value:x}")
+            }, "pending"]),
+        )
+        .await
+    }
+
+    async fn read_word(&self, contract: &str, signature: &str) -> Result<String> {
+        let value = self.eth_call(contract, &view_selector(signature)).await?;
+        parse_fixed_hex_32(&value)
+            .with_context(|| format!("{signature} on {contract} did not return one ABI word"))?;
+        Ok(value)
+    }
+
+    async fn read_bytes32(&self, contract: &str, signature: &str) -> Result<[u8; 32]> {
+        parse_fixed_hex_32(&self.read_word(contract, signature).await?)
+            .with_context(|| format!("decode {signature} on {contract}"))
+    }
+
+    async fn read_uint(&self, contract: &str, signature: &str) -> Result<ethabi::Uint> {
+        privacy_buy::parse_first_abi_uint(&self.read_word(contract, signature).await?, signature)
+    }
+
+    async fn read_u64(&self, contract: &str, signature: &str) -> Result<u64> {
+        parse_abi_u64(&self.read_word(contract, signature).await?)
+            .with_context(|| format!("decode {signature} on {contract}"))
+    }
+
+    async fn read_bool(&self, contract: &str, signature: &str) -> Result<bool> {
+        match self.read_u64(contract, signature).await? {
+            0 => Ok(false),
+            1 => Ok(true),
+            value => Err(anyhow!(
+                "{signature} on {contract} returned non-canonical bool {value}"
+            )),
+        }
+    }
+
+    async fn read_address(&self, contract: &str, signature: &str) -> Result<String> {
+        let word = self.read_bytes32(contract, signature).await?;
+        if word[..12].iter().any(|byte| *byte != 0) {
+            return Err(anyhow!(
+                "{signature} on {contract} returned a non-canonical ABI address"
+            ));
+        }
+        Ok(format!("0x{}", hex::encode(&word[12..])))
+    }
+
+    async fn code(&self, address: &str) -> Result<Vec<u8>> {
+        let raw: String = self
+            .rpc_call("eth_getCode", serde_json::json!([address, "latest"]))
+            .await?;
+        hex::decode(strip_0x(&raw)).context("decode eth_getCode result")
+    }
+
+    async fn require_code(&self, address: &str) -> Result<()> {
+        if self.code(address).await?.is_empty() {
+            return Err(anyhow!("address {address} has no runtime code"));
+        }
+        Ok(())
+    }
+
+    async fn runtime_codehash(&self, address: &str) -> Result<[u8; 32]> {
+        let code = self.code(address).await?;
+        if code.is_empty() {
+            return Err(anyhow!("address {address} has no runtime code"));
+        }
+        Ok(Keccak256::digest(code).into())
+    }
+
+    async fn verify_registry_pool(&self, registry: &str, pool: &str) -> Result<()> {
+        let data = format!(
+            "{}{}",
+            view_selector("isPool(address)"),
+            abi_word_address(pool)?
+        );
+        if !matches!(parse_abi_u64(&self.eth_call(registry, &data).await?)?, 1) {
+            return Err(anyhow!("Registry {registry} does not admit pool {pool}"));
+        }
+        Ok(())
+    }
+
+    async fn block_number(&self) -> Result<u64> {
+        let value: String = self
+            .rpc_call("eth_blockNumber", serde_json::json!([]))
+            .await?;
+        parse_hex_u64(&value).context("decode eth_blockNumber")
+    }
+
+    async fn find_privacy_buy_execution(
+        &self,
+        coordinator: &str,
+        context: &[u8; 32],
+        from_block: u64,
+        max_span: u64,
+    ) -> Result<Option<String>> {
+        if max_span == 0 {
+            return Err(anyhow!("privacy-buy event getLogs span must be positive"));
+        }
+        let latest = self.block_number().await?;
+        if from_block > latest {
+            return Ok(None);
+        }
+        let topic0 = format!(
+            "0x{}",
+            hex::encode(Keccak256::digest(
+                b"PrivacyBuyExecuted(bytes32,address,address,uint64,uint64,uint64,uint256,uint256,uint256,uint256,uint256)"
+            ))
+        );
+        let context_topic = format!("0x{}", hex::encode(context));
+        let mut cursor = from_block;
+        while cursor <= latest {
+            // max_span is an inclusive block COUNT measured for this chain/provider.
+            let end = cursor.saturating_add(max_span - 1).min(latest);
+            let logs: Vec<Value> = self
+                .rpc_call(
+                    "eth_getLogs",
+                    serde_json::json!([{
+                        "address": coordinator,
+                        "fromBlock": format!("0x{cursor:x}"),
+                        "toBlock": format!("0x{end:x}"),
+                        "topics": [topic0.clone(), context_topic.clone()]
+                    }]),
+                )
+                .await?;
+            if let Some(tx_hash) = logs
+                .iter()
+                .find_map(|log| log.get("transactionHash").and_then(Value::as_str))
+            {
+                return Ok(Some(tx_hash.to_string()));
+            }
+            if end == latest {
+                break;
+            }
+            cursor = end.saturating_add(1);
+        }
+        Ok(None)
+    }
+
     /// Boot-time cross-check for the multi-fee-asset gateway.
     ///
     /// There is no `feePool()` to compare against any more — the gateway prices
@@ -6193,20 +7248,40 @@ mod tests {
     fn swap_book_prune_expires_offers() {
         let mut book = SwapBook::default();
         let now = now_unix();
-        book.offers.insert("live".into(), SwapOffer {
-            offer_id: "live".into(), chain_id: 1, coordinator: "0xc".into(),
-            pool_a: "0xa".into(), pool_b: "0xb".into(),
-            pool_a_symbol: "A".into(), pool_b_symbol: "B".into(),
-            initiator_addr: "addr".into(), rate: 1.0, min_amount_b: 0, max_amount_b: u64::MAX,
+        book.offers.insert(
+            "live".into(),
+            SwapOffer {
+                offer_id: "live".into(),
+                chain_id: 1,
+                coordinator: "0xc".into(),
+                pool_a: "0xa".into(),
+                pool_b: "0xb".into(),
+                pool_a_symbol: "A".into(),
+                pool_b_symbol: "B".into(),
+                initiator_addr: "addr".into(),
+                rate: 1.0,
+                min_amount_b: 0,
+                max_amount_b: u64::MAX,
             expires_at: now + 100,
-        });
-        book.offers.insert("dead".into(), SwapOffer {
-            offer_id: "dead".into(), chain_id: 1, coordinator: "0xc".into(),
-            pool_a: "0xa".into(), pool_b: "0xb".into(),
-            pool_a_symbol: "A".into(), pool_b_symbol: "B".into(),
-            initiator_addr: "addr".into(), rate: 1.0, min_amount_b: 0, max_amount_b: u64::MAX,
+            },
+        );
+        book.offers.insert(
+            "dead".into(),
+            SwapOffer {
+                offer_id: "dead".into(),
+                chain_id: 1,
+                coordinator: "0xc".into(),
+                pool_a: "0xa".into(),
+                pool_b: "0xb".into(),
+                pool_a_symbol: "A".into(),
+                pool_b_symbol: "B".into(),
+                initiator_addr: "addr".into(),
+                rate: 1.0,
+                min_amount_b: 0,
+                max_amount_b: u64::MAX,
             expires_at: now.saturating_sub(1),
-        });
+            },
+        );
         book.prune();
         assert!(book.offers.contains_key("live"));
         assert!(!book.offers.contains_key("dead"), "expired offer pruned");
@@ -6316,15 +7391,13 @@ mod tests {
             swap_book: Arc::new(Mutex::new(SwapBook::default())),
             swap_book_path: None,
             submit_raw_allowlist: SubmitRawAllowlist::default(),
-            submit_raw_limiter: Arc::new(Mutex::new(SubmitRawLimiter::new(
-                SubmitRawLimitConfig {
+            submit_raw_limiter: Arc::new(Mutex::new(SubmitRawLimiter::new(SubmitRawLimitConfig {
                     window_secs: 3_600,
                     global_max_requests: 100,
                     client_max_requests: 10,
                     global_max_gas: 500_000_000,
                     client_max_gas: 50_000_000,
-                },
-            ))),
+            }))),
             submit_raw_trusted_proxy_ips: HashSet::new(),
             lp_offer_token: Some("test-lp-token".into()),
             allow_stateless_swap: false,
@@ -6336,6 +7409,7 @@ mod tests {
             .collect(),
             expected_protocol_version: 3,
             expected_verifier_set_id: [0xabu8; 32],
+            privacy_buy: None,
         })
     }
 
@@ -6450,6 +7524,91 @@ mod tests {
             .unwrap();
         });
         (format!("http://{address}"), calls, server)
+    }
+
+    #[derive(Clone)]
+    struct PrivacyBuyLogsRpcState {
+        calls: Arc<Mutex<Vec<Value>>>,
+        event_block: u64,
+    }
+
+    async fn privacy_buy_logs_rpc(
+        State(state): State<PrivacyBuyLogsRpcState>,
+        Json(request): Json<Value>,
+    ) -> Json<Value> {
+        state.calls.lock().await.push(request.clone());
+        let result = match request["method"].as_str().unwrap_or_default() {
+            "eth_blockNumber" => Value::String("0x12c".into()),
+            "eth_getLogs" => {
+                let filter = &request["params"][0];
+                let from = parse_hex_u64(filter["fromBlock"].as_str().unwrap()).unwrap();
+                let to = parse_hex_u64(filter["toBlock"].as_str().unwrap()).unwrap();
+                if from <= state.event_block && state.event_block <= to {
+                    serde_json::json!([{
+                        "transactionHash": format!("0x{}", "ef".repeat(32))
+                    }])
+                } else {
+                    serde_json::json!([])
+                }
+            }
+            method => panic!("unexpected privacy-buy log RPC method: {method}"),
+        };
+        Json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request["id"].clone(),
+            "result": result
+        }))
+    }
+
+    #[tokio::test]
+    async fn privacy_buy_event_lookup_uses_inclusive_bounded_log_ranges() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let state = PrivacyBuyLogsRpcState {
+            calls: calls.clone(),
+            event_block: 250,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/", post(privacy_buy_logs_rpc))
+                    .with_state(state),
+            )
+            .await
+            .unwrap();
+        });
+        let client = EthRpcClient::new(format!("http://{address}"));
+        let tx_hash = client
+            .find_privacy_buy_execution(
+                "0x1111111111111111111111111111111111111111",
+                &[0xabu8; 32],
+                50,
+                101,
+            )
+            .await
+            .unwrap();
+        assert_eq!(tx_hash, Some(format!("0x{}", "ef".repeat(32))));
+
+        let filters: Vec<Value> = calls
+            .lock()
+            .await
+            .iter()
+            .filter(|request| request["method"] == "eth_getLogs")
+            .map(|request| request["params"][0].clone())
+            .collect();
+        assert_eq!(filters.len(), 2);
+        assert_eq!(filters[0]["fromBlock"], "0x32");
+        assert_eq!(filters[0]["toBlock"], "0x96");
+        assert_eq!(filters[1]["fromBlock"], "0x97");
+        assert_eq!(filters[1]["toBlock"], "0xfb");
+        for filter in filters {
+            let from = parse_hex_u64(filter["fromBlock"].as_str().unwrap()).unwrap();
+            let to = parse_hex_u64(filter["toBlock"].as_str().unwrap()).unwrap();
+            assert!(to - from < 101);
+        }
+        server.abort();
     }
 
     /// The protocol fee on the sponsored path is only as strong as this guard: `/submit_raw`
@@ -6643,6 +7802,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn privacy_buy_route_is_typed_and_fail_closed_when_capability_is_disabled() {
+        let mut state = (*test_state()).clone();
+        state.legacy_routes_enabled = false;
+        state.privacy_buy = None;
+        let app = build_router(Arc::new(state));
+        let (health_status, health) = call(&app, "GET", "/healthz", None).await;
+        assert_eq!(health_status, Sc::OK);
+        assert_eq!(health["privacy_buy"]["configured"], false);
+        assert_eq!(health["privacy_buy"]["accepting"], false);
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/privacy-buy",
+            Some(serde_json::json!({
+                "expected_context": format!("0x{}", "00".repeat(32)),
+                "plan": {
+                    "gross_quote_units": "1",
+                    "quote_unshield_fee_units": "0",
+                    "quote_scale": "1",
+                    "gross_target_units": "1",
+                    "target_shield_fee_units": "0",
+                    "net_target_units": "1",
+                    "target_scale": "1",
+                    "quoted_amount_in_wei": "1",
+                    "amount_in_maximum_wei": "1",
+                    "max_quote_surplus_wei": "0",
+                    "max_market_slippage_bps": 1,
+                    "valid_until": "1",
+                    "route_hash": format!("0x{}", "00".repeat(32)),
+                    "salt": format!("0x{}", "00".repeat(32))
+                },
+                "route_data": format!("0x{}", "00".repeat(66)),
+                "unshield_bundle": test_bundle(),
+                "shield_bundle": test_bundle()
+            })),
+        )
+        .await;
+        assert_eq!(status, Sc::BAD_REQUEST);
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("privacy-buy is disabled"));
+    }
+
+    #[tokio::test]
     async fn native_eth_unshield_only_accepts_the_boot_pinned_pair() {
         let app = build_router(test_state());
         let base = serde_json::json!({
@@ -6832,13 +8036,19 @@ mod tests {
         let app = build_router(test_state());
 
         // 1. LP publishes an offer.
-        let (st, body) = call(&app, "POST", "/swap/offers", Some(serde_json::json!({
+        let (st, body) = call(
+            &app,
+            "POST",
+            "/swap/offers",
+            Some(serde_json::json!({
             "chain_id": 1, "coordinator": "0xc",
             "pool_a": "0xaaa", "pool_b": "0xbbb",
             "pool_a_symbol": "A", "pool_b_symbol": "B",
             "initiator_addr": "lpaddr", "rate": 2.0,
             "min_amount_b": 1, "max_amount_b": 100, "ttl_secs": 60,
-        }))).await;
+            })),
+        )
+        .await;
         assert_eq!(st, Sc::OK);
         let offer_id = body["offer_id"].as_str().unwrap().to_string();
 
@@ -6848,13 +8058,19 @@ mod tests {
         assert_eq!(body["offers"].as_array().unwrap().len(), 1);
 
         // 3. User opens an order with a proved leg-B (bundle_b is opaque here).
-        let (st, body) = call(&app, "POST", "/swap/accept", Some(serde_json::json!({
+        let (st, body) = call(
+            &app,
+            "POST",
+            "/swap/accept",
+            Some(serde_json::json!({
             "offer_id": offer_id, "chain_id": 1, "coordinator": "0xc",
             "pool_a": "0xaaa", "pool_b": "0xbbb",
             "amount_a": 200, "amount_b": 100, "joiner_addr": "useraddr",
             "rk_bx": "0x01", "rk_by": "0x02", "commit_b": "0x03",
             "bundle_b": { "actions": [] },
-        }))).await;
+            })),
+        )
+        .await;
         assert_eq!(st, Sc::OK);
         let request_id = body["request_id"].as_str().unwrap().to_string();
 
@@ -6882,13 +8098,19 @@ mod tests {
         state.swap_coordinator = Some(canonical_coordinator.into());
         let app = build_router(Arc::new(state));
 
-        let (st, body) = call(&app, "POST", "/swap/offers", Some(serde_json::json!({
+        let (st, body) = call(
+            &app,
+            "POST",
+            "/swap/offers",
+            Some(serde_json::json!({
             "chain_id": 1, "coordinator": checksum_coordinator,
             "pool_a": "0xaaa", "pool_b": "0xbbb",
             "pool_a_symbol": "A", "pool_b_symbol": "B",
             "initiator_addr": "lpaddr", "rate": 1.0,
             "min_amount_b": 1, "max_amount_b": 100, "ttl_secs": 60,
-        }))).await;
+            })),
+        )
+        .await;
         assert_eq!(st, Sc::OK, "{body}");
         let offer_id = body["offer_id"].as_str().unwrap().to_string();
 
@@ -6896,14 +8118,20 @@ mod tests {
         assert_eq!(st, Sc::OK, "{body}");
         assert_eq!(body["offers"][0]["coordinator"], canonical_coordinator);
 
-        let (st, body) = call(&app, "POST", "/swap/accept", Some(serde_json::json!({
+        let (st, body) = call(
+            &app,
+            "POST",
+            "/swap/accept",
+            Some(serde_json::json!({
             "offer_id": offer_id, "chain_id": 1,
             "coordinator": checksum_coordinator.to_uppercase().replacen("0X", "0x", 1),
             "pool_a": "0xaaa", "pool_b": "0xbbb",
             "amount_a": 10, "amount_b": 10, "joiner_addr": "useraddr",
             "rk_bx": "0x01", "rk_by": "0x02", "commit_b": "0x03",
             "bundle_b": { "actions": [] },
-        }))).await;
+            })),
+        )
+        .await;
         assert_eq!(st, Sc::OK, "{body}");
     }
 
@@ -6911,12 +8139,18 @@ mod tests {
     async fn orderbook_http_accept_validation() {
         let app = build_router(test_state());
         // Accept against a non-existent offer is rejected.
-        let (st, _) = call(&app, "POST", "/swap/accept", Some(serde_json::json!({
+        let (st, _) = call(
+            &app,
+            "POST",
+            "/swap/accept",
+            Some(serde_json::json!({
             "offer_id": "missing", "chain_id": 1, "coordinator": "0xc",
             "pool_a": "0xaaa", "pool_b": "0xbbb",
             "amount_a": 200, "amount_b": 100, "joiner_addr": "u",
             "rk_bx": "0x01", "rk_by": "0x02", "commit_b": "0x03", "bundle_b": {},
-        }))).await;
+            })),
+        )
+        .await;
         assert_ne!(st, Sc::OK);
 
         // Publish an offer with a tight range, then accept out of range.
@@ -6925,12 +8159,18 @@ mod tests {
             "initiator_addr": "lp", "rate": 1.0, "min_amount_b": 10, "max_amount_b": 20, "ttl_secs": 60,
         }))).await;
         let offer_id = body["offer_id"].as_str().unwrap().to_string();
-        let (st, _) = call(&app, "POST", "/swap/accept", Some(serde_json::json!({
+        let (st, _) = call(
+            &app,
+            "POST",
+            "/swap/accept",
+            Some(serde_json::json!({
             "offer_id": offer_id, "chain_id": 1, "coordinator": "0xc",
             "pool_a": "0xaaa", "pool_b": "0xbbb",
             "amount_a": 1000, "amount_b": 1000, "joiner_addr": "u",
             "rk_bx": "0x01", "rk_by": "0x02", "commit_b": "0x03", "bundle_b": {},
-        }))).await;
+            })),
+        )
+        .await;
         assert_ne!(st, Sc::OK, "amount_b above max must be rejected");
 
         // Unknown order id returns an error, not a panic.

@@ -61,7 +61,7 @@ fn bundle_actions_token(actions: &[BundleActionArgs]) -> Token {
 }
 
 /// The `PrivacyCall` tuple: `(bytes abi.encode(BundleAction[]), uint256[8] bindingProof)`.
-fn privacy_call_token(call: &PrivacyCallArgs) -> Token {
+pub(crate) fn privacy_call_token(call: &PrivacyCallArgs) -> Token {
     let actions_bytes = encode(&[bundle_actions_token(&call.actions)]);
     let binding_proof_token = Token::FixedArray(
         call.binding_proof

@@ -14,6 +14,8 @@ pub const STATUS_PENDING: &str = "pending";
 pub const STATUS_CONFIRMED: &str = "confirmed";
 pub const STATUS_REVERTED: &str = "reverted";
 pub const STATUS_FAILED: &str = "failed";
+pub const STATUS_EXPIRED: &str = "expired";
+pub const STATUS_EXTERNALLY_FULFILLED: &str = "externally-fulfilled";
 
 #[derive(Clone, Debug)]
 pub struct NewTxRequest {
@@ -23,6 +25,13 @@ pub struct NewTxRequest {
     pub calldata: Vec<u8>,
     pub gas_cap: u64,
     pub gas_margin_bps: u64,
+    /// Optional ABI return word that must be reproduced by an exact eth_call immediately before
+    /// signing. Privacy-buy uses this to pin the Coordinator-computed context.
+    pub expected_return: Option<[u8; 32]>,
+    /// Unix timestamp after which the first broadcast is forbidden.
+    pub expires_at: Option<u64>,
+    /// Head observed at admission, bounding an indexed external-fulfillment lookup.
+    pub admission_block: Option<u64>,
     pub nullifiers: Vec<(String, [u8; 32])>,
 }
 
@@ -35,6 +44,9 @@ pub struct QueueJob {
     pub calldata: Vec<u8>,
     pub gas_cap: u64,
     pub gas_margin_bps: u64,
+    pub expected_return: Option<[u8; 32]>,
+    pub expires_at: Option<u64>,
+    pub admission_block: Option<u64>,
     pub prepare_failures: u32,
 }
 
@@ -45,6 +57,7 @@ pub struct PreparedJob {
     pub raw_tx: Vec<u8>,
     pub tx_hash: String,
     pub broadcast_failures: u32,
+    pub expires_at: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -59,6 +72,7 @@ pub struct PendingJob {
     pub max_fee: u128,
     pub attempt: u32,
     pub tx_hashes: Vec<String>,
+    pub expires_at: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -83,6 +97,13 @@ pub struct QueueStats {
     pub prepared: u64,
     pub pending: u64,
     pub oldest_queued_age_secs: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExternalFulfillmentProbe {
+    pub target: String,
+    pub context: [u8; 32],
+    pub from_block: u64,
 }
 
 #[derive(Debug)]
@@ -173,6 +194,9 @@ impl TxQueue {
                calldata BLOB NOT NULL,
                gas_cap INTEGER NOT NULL,
                gas_margin_bps INTEGER NOT NULL,
+               expected_return BLOB,
+               expires_at INTEGER,
+               admission_block INTEGER,
                status TEXT NOT NULL,
                prepare_failures INTEGER NOT NULL DEFAULT 0,
                broadcast_failures INTEGER NOT NULL DEFAULT 0,
@@ -213,6 +237,24 @@ impl TxQueue {
                owner TEXT NOT NULL,
                expires_at INTEGER NOT NULL
              );",
+        )?;
+
+        // Keep existing queue files usable across the additive privacy-buy rollout. SQLite's
+        // CREATE TABLE IF NOT EXISTS does not add columns to an existing table.
+        ensure_queue_column(
+            &connection,
+            "expected_return",
+            "ALTER TABLE tx_requests ADD COLUMN expected_return BLOB",
+        )?;
+        ensure_queue_column(
+            &connection,
+            "expires_at",
+            "ALTER TABLE tx_requests ADD COLUMN expires_at INTEGER",
+        )?;
+        ensure_queue_column(
+            &connection,
+            "admission_block",
+            "ALTER TABLE tx_requests ADD COLUMN admission_block INTEGER",
         )?;
 
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -302,8 +344,9 @@ impl TxQueue {
         tx.execute(
             "INSERT INTO tx_requests (
                request_id, fingerprint, kind, target, value_wei, calldata,
-               gas_cap, gas_margin_bps, status, created_at, updated_at
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'queued',?9,?9)",
+               gas_cap, gas_margin_bps, expected_return, expires_at, admission_block,
+               status, created_at, updated_at
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'queued',?12,?12)",
             params![
                 request_id,
                 fingerprint,
@@ -313,6 +356,17 @@ impl TxQueue {
                 request.calldata,
                 to_i64(request.gas_cap, "gas cap").map_err(EnqueueError::Storage)?,
                 to_i64(request.gas_margin_bps, "gas margin").map_err(EnqueueError::Storage)?,
+                request.expected_return.map(|word| word.to_vec()),
+                request
+                    .expires_at
+                    .map(|value| to_i64(value, "request expiry"))
+                    .transpose()
+                    .map_err(EnqueueError::Storage)?,
+                request
+                    .admission_block
+                    .map(|value| to_i64(value, "admission block"))
+                    .transpose()
+                    .map_err(EnqueueError::Storage)?,
                 to_i64(now, "timestamp").map_err(EnqueueError::Storage)?,
             ],
         )
@@ -343,6 +397,37 @@ impl TxQueue {
     pub fn request(&self, request_id: &str) -> Result<Option<TxRequestView>> {
         let connection = self.lock()?;
         request_view(&connection, request_id)
+    }
+
+    pub fn external_fulfillment_probe(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<ExternalFulfillmentProbe>> {
+        let connection = self.lock()?;
+        connection
+            .query_row(
+                "SELECT target,expected_return,admission_block FROM tx_requests
+                 WHERE request_id=?1 AND kind='privacy_buy'",
+                params![request_id],
+                |row| {
+                    let context: Option<Vec<u8>> = row.get(1)?;
+                    let from_block: Option<i64> = row.get(2)?;
+                    match (context, from_block) {
+                        (Some(context), Some(from_block)) => Ok(Some(ExternalFulfillmentProbe {
+                            target: row.get(0)?,
+                            context: context.try_into().map_err(|_| {
+                                sql_conversion_error("privacy-buy context is not bytes32")
+                            })?,
+                            from_block: from_i64(from_block, "admission block")
+                                .map_err(sql_conversion_error)?,
+                        })),
+                        _ => Ok(None),
+                    }
+                },
+            )
+            .optional()
+            .map(|value| value.flatten())
+            .map_err(Into::into)
     }
 
     pub fn stats(&self) -> Result<QueueStats> {
@@ -383,7 +468,8 @@ impl TxQueue {
         let connection = self.lock()?;
         connection
             .query_row(
-                "SELECT request_id,kind,target,value_wei,calldata,gas_cap,gas_margin_bps,prepare_failures
+                "SELECT request_id,kind,target,value_wei,calldata,gas_cap,gas_margin_bps,
+                        expected_return,expires_at,admission_block,prepare_failures
                  FROM tx_requests
                  WHERE status = 'queued' AND next_attempt_at <= ?1
                  ORDER BY created_at ASC LIMIT 1",
@@ -398,7 +484,7 @@ impl TxQueue {
         let connection = self.lock()?;
         connection
             .query_row(
-                "SELECT request_id,nonce,raw_tx,tx_hash,broadcast_failures
+                "SELECT request_id,nonce,raw_tx,tx_hash,broadcast_failures,expires_at
                  FROM tx_requests
                  WHERE status = 'prepared' AND next_attempt_at <= ?1
                  ORDER BY updated_at ASC LIMIT 1",
@@ -410,6 +496,12 @@ impl TxQueue {
                         raw_tx: row.get(2)?,
                         tx_hash: row.get(3)?,
                         broadcast_failures: row.get(4)?,
+                        expires_at: row
+                            .get::<_, Option<i64>>(5)?
+                            .map(|value| {
+                                from_i64(value, "request expiry").map_err(sql_conversion_error)
+                            })
+                            .transpose()?,
                     })
                 },
             )
@@ -431,17 +523,26 @@ impl TxQueue {
     {
         let mut connection = self.lock()?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let status: Option<String> = tx
+        let request: Option<(String, Option<u64>)> = tx
             .query_row(
-                "SELECT status FROM tx_requests WHERE request_id = ?1",
+                "SELECT status,expires_at FROM tx_requests WHERE request_id = ?1",
                 params![request_id],
-                |row| row.get(0),
+                |row| {
+                    let expires_at = row
+                        .get::<_, Option<i64>>(1)?
+                        .map(|value| {
+                            from_i64(value, "request expiry").map_err(sql_conversion_error)
+                        })
+                        .transpose()?;
+                    Ok((row.get(0)?, expires_at))
+                },
             )
             .optional()?;
-        if status.as_deref() != Some(STATUS_QUEUED) {
+        if request.as_ref().map(|value| value.0.as_str()) != Some(STATUS_QUEUED) {
             tx.commit()?;
             return Ok(None);
         }
+        let expires_at = request.and_then(|value| value.1);
         let persisted_nonce = meta_u64(&tx, "next_nonce")?.unwrap_or(chain_pending_nonce);
         let nonce = persisted_nonce.max(chain_pending_nonce);
         let raw_tx = build(nonce)?;
@@ -477,6 +578,7 @@ impl TxQueue {
             raw_tx,
             tx_hash,
             broadcast_failures: 0,
+            expires_at,
         }))
     }
 
@@ -577,7 +679,7 @@ impl TxQueue {
         let connection = self.lock()?;
         let mut statement = connection.prepare(
             "SELECT request_id,target,value_wei,calldata,nonce,gas_limit,
-                    max_priority_fee,max_fee,attempt
+                    max_priority_fee,max_fee,attempt,expires_at
              FROM tx_requests WHERE status='pending'
              ORDER BY broadcast_at ASC LIMIT ?1",
         )?;
@@ -601,11 +703,16 @@ impl TxQueue {
         let mut job = connection
             .query_row(
                 "SELECT request_id,target,value_wei,calldata,nonce,gas_limit,
-                        max_priority_fee,max_fee,attempt
+                        max_priority_fee,max_fee,attempt,expires_at
                  FROM tx_requests
                  WHERE status='pending' AND broadcast_at <= ?1 AND attempt < ?2
+                   AND (expires_at IS NULL OR expires_at > ?3)
                  ORDER BY broadcast_at ASC LIMIT 1",
-                params![to_i64(cutoff, "replacement cutoff")?, max_replacements],
+                params![
+                    to_i64(cutoff, "replacement cutoff")?,
+                    max_replacements,
+                    to_i64(now_secs(), "timestamp")?
+                ],
                 pending_job_from_row,
             )
             .optional()?;
@@ -630,7 +737,7 @@ impl TxQueue {
         let mut job = tx
             .query_row(
                 "SELECT request_id,target,value_wei,calldata,nonce,gas_limit,
-                        max_priority_fee,max_fee,attempt
+                        max_priority_fee,max_fee,attempt,expires_at
                  FROM tx_requests WHERE request_id=?1 AND status='pending'",
                 params![request_id],
                 pending_job_from_row,
@@ -673,16 +780,27 @@ impl TxQueue {
             raw_tx,
             tx_hash,
             broadcast_failures: 0,
+            expires_at: job.expires_at,
         }))
     }
 
     pub fn mark_terminal(&self, request_id: &str, status: &str, error: Option<&str>) -> Result<()> {
-        if !matches!(status, STATUS_CONFIRMED | STATUS_REVERTED | STATUS_FAILED) {
+        if !matches!(
+            status,
+            STATUS_CONFIRMED | STATUS_REVERTED | STATUS_FAILED | STATUS_EXPIRED
+        ) {
             return Err(anyhow!("invalid terminal queue status {status}"));
         }
         let mut connection = self.lock()?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = now_secs();
+        let previous_status: Option<String> = tx
+            .query_row(
+                "SELECT status FROM tx_requests WHERE request_id=?1",
+                params![request_id],
+                |row| row.get(0),
+            )
+            .optional()?;
         let changed = tx.execute(
             "UPDATE tx_requests SET status=?2,last_error=?3,updated_at=?4,
              calldata=X'',raw_tx=NULL
@@ -697,12 +815,71 @@ impl TxQueue {
         if changed == 1 {
             decrement_active_count(&tx)?;
         }
-        if changed == 1 && matches!(status, STATUS_REVERTED | STATUS_FAILED) {
+        let release_expired =
+            status == STATUS_EXPIRED && previous_status.as_deref() == Some(STATUS_QUEUED);
+        if changed == 1 && (matches!(status, STATUS_REVERTED | STATUS_FAILED) || release_expired) {
             tx.execute(
                 "DELETE FROM nullifier_reservations WHERE request_id=?1",
                 params![request_id],
             )?;
         }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Expire a signed request only when the caller is still on the uninterrupted path before
+    /// its first `eth_sendRawTransaction` attempt. That live control-flow fact cannot be inferred
+    /// from SQLite after a crash: a `prepared` row may already have been accepted by an RPC and
+    /// lost before `mark_pending`. Recovery must therefore use `mark_terminal`, which keeps the
+    /// nullifiers reserved; this method is deliberately used only by the pre-send path.
+    pub fn mark_definitely_unbroadcast_expired(
+        &self,
+        request_id: &str,
+        error: &str,
+    ) -> Result<bool> {
+        let mut connection = self.lock()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE tx_requests SET status='expired',last_error=?2,updated_at=?3,
+             calldata=X'',raw_tx=NULL
+             WHERE request_id=?1 AND status='prepared' AND broadcast_at IS NULL
+               AND accepted_tx_hash IS NULL",
+            params![
+                request_id,
+                truncate_error(error),
+                to_i64(now_secs(), "timestamp")?
+            ],
+        )?;
+        if changed == 1 {
+            decrement_active_count(&tx)?;
+            tx.execute(
+                "DELETE FROM nullifier_reservations WHERE request_id=?1",
+                params![request_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(changed == 1)
+    }
+
+    pub fn mark_externally_fulfilled(&self, request_id: &str, tx_hash: &str) -> Result<()> {
+        let mut connection = self.lock()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE tx_requests SET status=?2,accepted_tx_hash=?3,last_error=NULL,
+             updated_at=?4,calldata=X'',raw_tx=NULL
+             WHERE request_id=?1 AND status IN ('queued','prepared','pending')",
+            params![
+                request_id,
+                STATUS_EXTERNALLY_FULFILLED,
+                tx_hash,
+                to_i64(now_secs(), "timestamp")?
+            ],
+        )?;
+        if changed == 1 {
+            decrement_active_count(&tx)?;
+        }
+        // External success consumes the quote input. Retain its nullifier reservation exactly as
+        // for a transaction confirmed through this Relayer.
         tx.commit()?;
         Ok(())
     }
@@ -763,6 +940,20 @@ fn bind_identity(tx: &rusqlite::Transaction<'_>, key: &str, expected: &str) -> R
             Ok(())
         }
     }
+}
+
+fn ensure_queue_column(connection: &Connection, column: &str, ddl: &str) -> Result<()> {
+    let mut statement = connection.prepare("PRAGMA table_info(tx_requests)")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(statement);
+    if !columns.iter().any(|existing| existing == column) {
+        connection
+            .execute(ddl, [])
+            .with_context(|| format!("add tx_requests.{column} queue column"))?;
+    }
+    Ok(())
 }
 
 fn set_meta(tx: &rusqlite::Transaction<'_>, key: &str, value: &str) -> Result<()> {
@@ -835,6 +1026,21 @@ fn hashes_for_request(connection: &Connection, request_id: &str) -> Result<Vec<S
 
 fn queue_job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueueJob> {
     let value: String = row.get(3)?;
+    let expected_return = row
+        .get::<_, Option<Vec<u8>>>(7)?
+        .map(|word| {
+            word.try_into()
+                .map_err(|_| sql_conversion_error("expected return is not bytes32"))
+        })
+        .transpose()?;
+    let expires_at = row
+        .get::<_, Option<i64>>(8)?
+        .map(|value| from_i64(value, "request expiry").map_err(sql_conversion_error))
+        .transpose()?;
+    let admission_block = row
+        .get::<_, Option<i64>>(9)?
+        .map(|value| from_i64(value, "admission block").map_err(sql_conversion_error))
+        .transpose()?;
     Ok(QueueJob {
         request_id: row.get(0)?,
         kind: row.get(1)?,
@@ -843,7 +1049,10 @@ fn queue_job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueueJob> {
         calldata: row.get(4)?,
         gas_cap: from_i64(row.get(5)?, "gas cap").map_err(sql_conversion_error)?,
         gas_margin_bps: from_i64(row.get(6)?, "gas margin").map_err(sql_conversion_error)?,
-        prepare_failures: row.get(7)?,
+        expected_return,
+        expires_at,
+        admission_block,
+        prepare_failures: row.get(10)?,
     })
 }
 
@@ -862,6 +1071,10 @@ fn pending_job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PendingJob>
         max_fee: max_fee.parse().map_err(sql_conversion_error)?,
         attempt: row.get(8)?,
         tx_hashes: Vec::new(),
+        expires_at: row
+            .get::<_, Option<i64>>(9)?
+            .map(|value| from_i64(value, "request expiry").map_err(sql_conversion_error))
+            .transpose()?,
     })
 }
 
@@ -927,6 +1140,9 @@ mod tests {
             calldata: vec![byte; 32],
             gas_cap: 5_000_000,
             gas_margin_bps: 200,
+            expected_return: None,
+            expires_at: None,
+            admission_block: None,
             nullifiers: vec![(
                 "0x2222222222222222222222222222222222222222".into(),
                 [byte; 32],
@@ -942,6 +1158,9 @@ mod tests {
             calldata: index.to_be_bytes().to_vec(),
             gas_cap: 5_000_000,
             gas_margin_bps: 200,
+            expected_return: None,
+            expires_at: None,
+            admission_block: None,
             nullifiers: Vec::new(),
         }
     }
@@ -963,6 +1182,48 @@ mod tests {
     }
 
     #[test]
+    fn additive_queue_columns_migrate_existing_sqlite_tables() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute("CREATE TABLE tx_requests(request_id TEXT PRIMARY KEY)", [])
+            .unwrap();
+        ensure_queue_column(
+            &connection,
+            "expected_return",
+            "ALTER TABLE tx_requests ADD COLUMN expected_return BLOB",
+        )
+        .unwrap();
+        ensure_queue_column(
+            &connection,
+            "expires_at",
+            "ALTER TABLE tx_requests ADD COLUMN expires_at INTEGER",
+        )
+        .unwrap();
+        ensure_queue_column(
+            &connection,
+            "admission_block",
+            "ALTER TABLE tx_requests ADD COLUMN admission_block INTEGER",
+        )
+        .unwrap();
+        // Re-running the migration is intentionally idempotent.
+        ensure_queue_column(
+            &connection,
+            "admission_block",
+            "ALTER TABLE tx_requests ADD COLUMN admission_block INTEGER",
+        )
+        .unwrap();
+        let mut statement = connection.prepare("PRAGMA table_info(tx_requests)").unwrap();
+        let columns: Vec<String> = statement
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert!(columns.contains(&"expected_return".into()));
+        assert!(columns.contains(&"expires_at".into()));
+        assert!(columns.contains(&"admission_block".into()));
+    }
+
+    #[test]
     fn terminal_transition_frees_capacity_and_reverted_nullifier_reservation() {
         let queue = TxQueue::in_memory(1, 143, "0xabc").unwrap();
         let first = queue.enqueue(request(1)).unwrap();
@@ -979,6 +1240,101 @@ mod tests {
         let mut retry = request(2);
         retry.nullifiers[0].1 = [1u8; 32];
         assert_eq!(queue.enqueue(retry).unwrap().status, STATUS_QUEUED);
+    }
+
+    #[test]
+    fn privacy_buy_policy_round_trips_and_expiry_releases_reservations() {
+        let queue = TxQueue::in_memory(1, 143, "0xabc").unwrap();
+        let mut first = request(4);
+        first.kind = "privacy_buy".into();
+        first.expected_return = Some([0xabu8; 32]);
+        first.expires_at = Some(1_900_000_000);
+        first.admission_block = Some(12_345);
+        let request_id = queue.enqueue(first).unwrap().request_id;
+        let job = queue.next_queued().unwrap().unwrap();
+        assert_eq!(job.expected_return, Some([0xabu8; 32]));
+        assert_eq!(job.expires_at, Some(1_900_000_000));
+        assert_eq!(job.admission_block, Some(12_345));
+        assert_eq!(
+            queue.external_fulfillment_probe(&request_id).unwrap(),
+            Some(ExternalFulfillmentProbe {
+                target: "0x1111111111111111111111111111111111111111".into(),
+                context: [0xabu8; 32],
+                from_block: 12_345,
+            })
+        );
+
+        queue
+            .mark_terminal(&request_id, STATUS_EXPIRED, Some("deadline elapsed"))
+            .unwrap();
+        let mut retry = request(5);
+        retry.nullifiers[0].1 = [4u8; 32];
+        assert_eq!(queue.enqueue(retry).unwrap().status, STATUS_QUEUED);
+    }
+
+    #[test]
+    fn prepared_expiry_releases_only_when_live_path_proves_no_broadcast_attempt() {
+        let conservative = TxQueue::in_memory(2, 143, "0xabc").unwrap();
+        let conservative_id = conservative.enqueue(request(40)).unwrap().request_id;
+        conservative
+            .prepare(&conservative_id, 0, 100_000, 1, 2, |_| Ok(vec![0x40]))
+            .unwrap()
+            .unwrap();
+        conservative
+            .mark_terminal(
+                &conservative_id,
+                STATUS_EXPIRED,
+                Some("unknown post-crash broadcast state"),
+            )
+            .unwrap();
+        let mut conflicting = request(41);
+        conflicting.nullifiers[0].1 = [40u8; 32];
+        assert!(matches!(
+            conservative.enqueue(conflicting),
+            Err(EnqueueError::NullifierReserved { .. })
+        ));
+
+        let definitely_unbroadcast = TxQueue::in_memory(2, 143, "0xabc").unwrap();
+        let request_id = definitely_unbroadcast
+            .enqueue(request(42))
+            .unwrap()
+            .request_id;
+        definitely_unbroadcast
+            .prepare(&request_id, 0, 100_000, 1, 2, |_| Ok(vec![0x42]))
+            .unwrap()
+            .unwrap();
+        assert!(definitely_unbroadcast
+            .mark_definitely_unbroadcast_expired(&request_id, "expired before first send")
+            .unwrap());
+        let mut retry = request(43);
+        retry.nullifiers[0].1 = [42u8; 32];
+        assert_eq!(
+            definitely_unbroadcast.enqueue(retry).unwrap().status,
+            STATUS_QUEUED
+        );
+    }
+
+    #[test]
+    fn external_fulfillment_is_terminal_and_keeps_nullifier_reserved() {
+        let queue = TxQueue::in_memory(2, 143, "0xabc").unwrap();
+        let mut first = request(6);
+        first.kind = "privacy_buy".into();
+        first.expected_return = Some([0x66; 32]);
+        first.admission_block = Some(99);
+        let request_id = queue.enqueue(first).unwrap().request_id;
+        queue
+            .mark_externally_fulfilled(&request_id, "0xexternal")
+            .unwrap();
+        let view = queue.request(&request_id).unwrap().unwrap();
+        assert_eq!(view.status, STATUS_EXTERNALLY_FULFILLED);
+        assert_eq!(view.tx_hash.as_deref(), Some("0xexternal"));
+
+        let mut conflicting = request(7);
+        conflicting.nullifiers[0].1 = [6u8; 32];
+        assert!(matches!(
+            queue.enqueue(conflicting),
+            Err(EnqueueError::NullifierReserved { .. })
+        ));
     }
 
     #[test]
