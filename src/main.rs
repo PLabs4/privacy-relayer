@@ -32,8 +32,9 @@ use privacy_core::ethereum::{
 // The fee release changed `unshield`'s ABI and added the gateway; privacy-core is pinned to a
 // rev that predates both, so those two calls are encoded locally (see `fee_calldata`).
 use fee_calldata::{
-    encode_native_eth_unshield_calldata, encode_settle_atomic_calldata, encode_swap_cancel_calldata,
-    encode_transfer_calldata,
+    encode_legacy_transfer_with_fee_calldata,
+    encode_legacy_transfer_with_fee_same_asset_calldata, encode_native_eth_unshield_calldata,
+    encode_settle_atomic_calldata, encode_swap_cancel_calldata, encode_transfer_calldata,
     encode_transfer_with_fee_calldata, encode_transfer_with_fee_same_asset_calldata,
     encode_unshield_v2_calldata, pair_sighash_v1,
 };
@@ -573,6 +574,14 @@ impl TxQueueRuntimeConfig {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FeeGatewayVersion {
+    /// Original gateway with one immutable `feePool()` and a three-argument transfer call.
+    V1,
+    /// Multi-fee gateway with pair pricing and a four-argument transfer call.
+    V2,
+}
+
 #[derive(Clone)]
 struct RelayerHttpConfig {
     rpc_url: String,
@@ -589,6 +598,9 @@ struct RelayerHttpConfig {
     /// straight to a pool — that is what makes the protocol fee unavoidable on the sponsored
     /// path (docs/tx_fee_impl.md §4). Required whenever transfer sponsorship is enabled.
     fee_gateway: Option<String>,
+    /// Boot-detected ABI version. `None` means sponsorship is deliberately unavailable because
+    /// the gateway or its fee pool configuration was omitted.
+    fee_gateway_version: Option<FeeGatewayVersion>,
     /// Pools whose notes may PAY the transfer fee. The gateway prices `(fee asset, target pool)`
     /// PAIRS and accepts several fee assets, so this is a list, not a single pool — there is no
     /// `feePool()` getter to cross-check against any more.
@@ -1457,11 +1469,13 @@ async fn run_http_server(
     }
     let fee_gateway = fee_gateway.map(normalize_evm_address).transpose()?;
     let fee_pools = parse_fee_pools(fee_pool)?;
-    match (fee_gateway.as_deref(), fee_pools.is_empty()) {
+    let fee_gateway_version = match (fee_gateway.as_deref(), fee_pools.is_empty()) {
         (Some(gw), false) => {
-            rpc.verify_fee_gateway(gw, &fee_pools, &protocol.pools)
-                .await
-                .with_context(|| format!("fee gateway config check for {gw}"))?;
+            Some(
+                rpc.verify_fee_gateway(gw, &fee_pools, &protocol.pools)
+                    .await
+                    .with_context(|| format!("fee gateway config check for {gw}"))?,
+            )
         }
         (Some(gw), true) => {
             // Without the fee assets we cannot cross-check; say so instead of pretending.
@@ -1469,6 +1483,7 @@ async fn run_http_server(
                 "[relayer] WARNING: fee gateway {gw} configured without --fee-pool; \
                  skipping the fee-asset pricing cross-check."
             );
+            None
         }
         (None, _) => {
             // Fail loudly at boot rather than silently sponsoring fee-free transfers later.
@@ -1476,8 +1491,9 @@ async fn run_http_server(
                 "[relayer] WARNING: no --fee-gateway configured; /transfer/submit will reject \
                  all requests. Set PRIVACYBTC_FEE_GATEWAY_ADDRESS to enable sponsored transfers."
             );
+            None
         }
-    }
+    };
     let native_eth_pool = native_eth_pool.map(normalize_evm_address).transpose()?;
     let native_eth_gateway = native_eth_gateway.map(normalize_evm_address).transpose()?;
     match (native_eth_pool.as_deref(), native_eth_gateway.as_deref()) {
@@ -1633,6 +1649,7 @@ async fn run_http_server(
         gas_limit_transfer,
         gas_limit_margin_bps,
         fee_gateway,
+        fee_gateway_version,
         fee_pools,
         native_eth_pool,
         native_eth_gateway,
@@ -2187,6 +2204,11 @@ async fn http_transfer_submit(
              (set PRIVACYBTC_FEE_GATEWAY_ADDRESS)"
         ))
     })?;
+    let gateway_version = cfg.fee_gateway_version.ok_or_else(|| {
+        http_error(anyhow!(
+            "sponsored transfers are disabled: fee gateway ABI was not boot-verified"
+        ))
+    })?;
     let (calldata, nullifiers) = match req.fee_bundle.as_ref() {
         Some(fee_bundle) => {
             // Two bundles against ONE pool can still be legitimate — a wallet holding two
@@ -2218,15 +2240,20 @@ async fn http_transfer_submit(
             let fee_call = bundle_to_privacy_call(fee_bundle).map_err(http_error)?;
             let mut nullifiers = queue_nullifiers(&contract, &req.bundle);
             nullifiers.extend(queue_nullifiers(fee_pool, fee_bundle));
-            (
-                encode_transfer_with_fee_calldata(
+            let calldata = match gateway_version {
+                FeeGatewayVersion::V1 => encode_legacy_transfer_with_fee_calldata(
+                    &pool_addr,
+                    &op_call,
+                    &fee_call,
+                ),
+                FeeGatewayVersion::V2 => encode_transfer_with_fee_calldata(
                     &fee_pool_addr,
                     &pool_addr,
                     &op_call,
                     &fee_call,
                 ),
-                nullifiers,
-            )
+            };
+            (calldata, nullifiers)
         }
         None => {
             // Fail closed on anything that is not provably a same-asset transfer. A missing
@@ -2254,10 +2281,15 @@ async fn http_transfer_submit(
             let pool_addr = parse_evm_address_hex(&contract)
                 .map_err(|error| http_error(anyhow!("bad pool address: {error}")))?;
             let call = bundle_to_privacy_call(&req.bundle).map_err(http_error)?;
-            (
-                encode_transfer_with_fee_same_asset_calldata(&pool_addr, &call),
-                queue_nullifiers(&contract, &req.bundle),
-            )
+            let calldata = match gateway_version {
+                FeeGatewayVersion::V1 => {
+                    encode_legacy_transfer_with_fee_same_asset_calldata(&pool_addr, &call)
+                }
+                FeeGatewayVersion::V2 => {
+                    encode_transfer_with_fee_same_asset_calldata(&pool_addr, &call)
+                }
+            };
+            (calldata, queue_nullifiers(&contract, &req.bundle))
         }
     };
     enqueue_typed_transaction(
@@ -5523,9 +5555,71 @@ impl EthRpcClient {
         .await
     }
 
-    /// Boot-time guard: the gateway's own `feePool()` must be the pUSDC pool we were configured
-    /// with. A mismatch means fees would be collected from a different pool than operators
-    /// believe, so refuse to start rather than discover it in production accounting.
+    /// Detect and verify the fee-gateway ABI without trusting chain-name assumptions.
+    ///
+    /// V2 is accepted only when every configured fee asset prices at least one sponsorable pool.
+    /// If that ABI is unavailable, V1 is accepted only for exactly one configured fee pool and
+    /// only when the gateway's immutable `feePool()` matches it. If neither proof succeeds, boot
+    /// fails; request-time calldata therefore always uses the same verified ABI as startup.
+    async fn verify_fee_gateway(
+        &self,
+        gateway: &str,
+        fee_pools: &[String],
+        protocol_pools: &HashSet<String>,
+    ) -> Result<FeeGatewayVersion> {
+        match self
+            .verify_fee_gateway_v2(gateway, fee_pools, protocol_pools)
+            .await
+        {
+            Ok(()) => {
+                eprintln!("[relayer] fee gateway {gateway} verified as v2 (multi-fee)");
+                return Ok(FeeGatewayVersion::V2);
+            }
+            Err(v2_error) => {
+                if fee_pools.len() != 1 {
+                    return Err(anyhow!(
+                        "fee gateway v2 verification failed: {v2_error:#}; v1 fallback requires \
+                         exactly one configured fee pool, got {}",
+                        fee_pools.len()
+                    ));
+                }
+                self.verify_fee_gateway_v1(gateway, &fee_pools[0])
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "gateway is neither a valid configured v2 nor v1 gateway; \
+                             v2 verification failed first: {v2_error:#}"
+                        )
+                    })?;
+            }
+        }
+        eprintln!("[relayer] fee gateway {gateway} verified as v1 (single-fee)");
+        Ok(FeeGatewayVersion::V1)
+    }
+
+    /// Boot-time cross-check for the original single-fee-asset gateway.
+    async fn verify_fee_gateway_v1(
+        &self,
+        gateway: &str,
+        expected_fee_pool: &str,
+    ) -> Result<()> {
+        let sel = format!("0x{}", hex::encode(&Keccak256::digest(b"feePool()")[..4]));
+        let raw = self.eth_call(gateway, &sel).await?;
+        let word = strip_0x(&raw);
+        if word.len() < 64 {
+            return Err(anyhow!("feePool() returned a short word: {raw}"));
+        }
+        let actual = format!("0x{}", &word[word.len() - 40..]).to_lowercase();
+        let expected = normalize_evm_address(expected_fee_pool)?;
+        if actual != expected {
+            return Err(anyhow!(
+                "fee gateway {gateway} points at feePool {actual}, but configured fee pool is \
+                 {expected}"
+            ));
+        }
+        Ok(())
+    }
+
     /// Boot-time cross-check for the multi-fee-asset gateway.
     ///
     /// There is no `feePool()` to compare against any more — the gateway prices
@@ -5536,7 +5630,7 @@ impl EthRpcClient {
     /// surface as `FeeNotConfigured` on a user's first sponsored transfer.
     ///
     /// `transferFeeUnits(address,address)` = keccak(sig)[..4] = 0x689bf892.
-    async fn verify_fee_gateway(
+    async fn verify_fee_gateway_v2(
         &self,
         gateway: &str,
         fee_pools: &[String],
@@ -6247,6 +6341,7 @@ mod tests {
             gas_limit_transfer: 5_000_000,
             gas_limit_margin_bps: DEFAULT_GAS_MARGIN_BPS,
             fee_gateway: Some("0x00000000000000000000000000000000000000bb".into()),
+            fee_gateway_version: Some(FeeGatewayVersion::V2),
             // Deliberately one of the `protocol_pools` below: the same-asset transfer path is
             // reached only for the fee pool, so it has to be a pool the relayer serves.
             fee_pools: vec!["0x2222222222222222222222222222222222222222".into()],

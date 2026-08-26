@@ -74,6 +74,10 @@ fn privacy_call_token(call: &PrivacyCallArgs) -> Token {
 
 const UNSHIELD_V2_SIG: &[u8] = b"unshield(uint256,address,bytes32,address,(bytes,uint256[8]))";
 const NATIVE_ETH_UNSHIELD_SIG: &[u8] = b"unshieldETH(uint256,address,(bytes,uint256[8]))";
+/// The original single-fee-asset gateway. The fee pool is immutable on the gateway and is not
+/// part of the calldata; the only address argument is the pool receiving the transfer.
+const LEGACY_TRANSFER_WITH_FEE_SIG: &[u8] =
+    b"transferWithFee(address,(bytes,uint256[8]),(bytes,uint256[8]))";
 /// The multi-fee-asset gateway: `feePool` is the FIRST argument, because the gateway accepts
 /// several fee assets and prices `(fee asset, target pool)` PAIRS. The single-asset form
 /// (`transferWithFee(address,…)`, selector `0x4c4ba93b`) is gone — a relayer built against it
@@ -89,6 +93,10 @@ pub fn unshield_v2_selector() -> [u8; 4] {
 
 pub fn transfer_with_fee_selector() -> [u8; 4] {
     selector(TRANSFER_WITH_FEE_SIG)
+}
+
+pub fn legacy_transfer_with_fee_selector() -> [u8; 4] {
+    selector(LEGACY_TRANSFER_WITH_FEE_SIG)
 }
 
 pub fn native_eth_unshield_selector() -> [u8; 4] {
@@ -188,6 +196,24 @@ pub fn encode_transfer_with_fee_calldata(
     with_selector(transfer_with_fee_selector(), encode(&tokens))
 }
 
+/// Legacy `Perc20FeeGateway.transferWithFee(pool, opCall, feeCall)`.
+///
+/// The fee-paying pool is implicit in the v1 gateway's immutable `feePool()` getter. Callers
+/// must only select this encoding after boot-time verification that `feePool()` matches the
+/// configured fee pool.
+pub fn encode_legacy_transfer_with_fee_calldata(
+    pool: &[u8; 20],
+    op_call: &PrivacyCallArgs,
+    fee_call: &PrivacyCallArgs,
+) -> Vec<u8> {
+    let tokens = vec![
+        Token::Address(ethabi::Address::from(*pool)),
+        privacy_call_token(op_call),
+        privacy_call_token(fee_call),
+    ];
+    with_selector(legacy_transfer_with_fee_selector(), encode(&tokens))
+}
+
 /// `Perc20FeeGateway.transferWithFee(pool, pool, combinedCall, EMPTY)` — the same-asset form,
 /// used when the transferred asset IS the fee asset. Both address arguments are that one pool:
 /// the gateway rejects `pool != feePool` in this mode with `NotFeeAsset` before anything else.
@@ -218,6 +244,24 @@ pub fn encode_transfer_with_fee_same_asset_calldata(
     with_selector(transfer_with_fee_selector(), encode(&tokens))
 }
 
+/// Legacy same-asset form. The single address is both the transferred pool and the gateway's
+/// boot-verified immutable fee pool; an empty fee call selects the combined-bundle path.
+pub fn encode_legacy_transfer_with_fee_same_asset_calldata(
+    pool: &[u8; 20],
+    combined_call: &PrivacyCallArgs,
+) -> Vec<u8> {
+    let empty_call = Token::Tuple(vec![
+        Token::Bytes(Vec::new()),
+        Token::FixedArray(vec![Token::Uint(Uint::zero()); 8]),
+    ]);
+    let tokens = vec![
+        Token::Address(ethabi::Address::from(*pool)),
+        privacy_call_token(combined_call),
+        empty_call,
+    ];
+    with_selector(legacy_transfer_with_fee_selector(), encode(&tokens))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,6 +271,10 @@ mod tests {
     fn selectors_match_signatures() {
         assert_eq!(unshield_v2_selector(), selector(UNSHIELD_V2_SIG));
         assert_eq!(transfer_with_fee_selector(), selector(TRANSFER_WITH_FEE_SIG));
+        assert_eq!(
+            legacy_transfer_with_fee_selector(),
+            selector(LEGACY_TRANSFER_WITH_FEE_SIG)
+        );
         assert_eq!(native_eth_unshield_selector(), selector(NATIVE_ETH_UNSHIELD_SIG));
         // must differ from the legacy 3-arg unshield the contract no longer exposes
         assert_ne!(
@@ -315,9 +363,24 @@ mod tests {
     fn transfer_with_fee_is_the_multi_fee_asset_signature() {
         assert_ne!(
             transfer_with_fee_selector(),
-            selector(b"transferWithFee(address,(bytes,uint256[8]),(bytes,uint256[8]))")
+            legacy_transfer_with_fee_selector()
         );
         assert_eq!(transfer_with_fee_selector(), [0x25, 0x78, 0x4a, 0x2e]);
+        assert_eq!(legacy_transfer_with_fee_selector(), [0x4c, 0x4b, 0xa9, 0x3b]);
+    }
+
+    #[test]
+    fn legacy_transfer_with_fee_has_one_address_and_two_distinct_calls() {
+        let mut fee = empty_call();
+        fee.binding_proof[0] = [0xAB; 32];
+        let cd = encode_legacy_transfer_with_fee_calldata(&[0x44; 20], &empty_call(), &fee);
+        assert_eq!(&cd[..4], &legacy_transfer_with_fee_selector());
+        let body = &cd[4..];
+        assert_eq!(&body[12..32], &[0x44u8; 20]);
+        let off_op = Uint::from_big_endian(&body[32..64]);
+        let off_fee = Uint::from_big_endian(&body[64..96]);
+        assert_ne!(off_op, off_fee);
+        assert!(cd.windows(32).any(|w| w == [0xABu8; 32]));
     }
 
     /// The same-asset form rides the SAME selector; the mode switch is the empty `actions`.
@@ -344,6 +407,25 @@ mod tests {
             Uint::from_big_endian(&fee_tuple[off_actions..off_actions + 32]),
             Uint::zero(),
             "the fee call's actions must be EMPTY bytes — that is the same-asset mode switch",
+        );
+    }
+
+    #[test]
+    fn legacy_same_asset_uses_legacy_selector_and_empty_fee_call() {
+        let mut call = empty_call();
+        call.binding_proof[0] = [0xCD; 32];
+        let cd = encode_legacy_transfer_with_fee_same_asset_calldata(&[0x55; 20], &call);
+        assert_eq!(&cd[..4], &legacy_transfer_with_fee_selector());
+        let body = &cd[4..];
+        assert_eq!(&body[12..32], &[0x55u8; 20]);
+        assert!(cd.windows(32).any(|w| w == [0xCDu8; 32]));
+
+        let off_fee = Uint::from_big_endian(&body[64..96]).as_usize();
+        let fee_tuple = &body[off_fee..];
+        let off_actions = Uint::from_big_endian(&fee_tuple[0..32]).as_usize();
+        assert_eq!(
+            Uint::from_big_endian(&fee_tuple[off_actions..off_actions + 32]),
+            Uint::zero(),
         );
     }
 }
