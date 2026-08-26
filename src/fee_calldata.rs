@@ -81,6 +81,7 @@ const NATIVE_ETH_UNSHIELD_SIG: &[u8] = b"unshieldETH(uint256,address,(bytes,uint
 /// step with `PERC20/contracts/ptoken/Perc20FeeGateway.sol`.
 const TRANSFER_WITH_FEE_SIG: &[u8] =
     b"transferWithFee(address,address,(bytes,uint256[8]),(bytes,uint256[8]))";
+const SWAP_CANCEL_SIG: &[u8] = b"cancel(bytes32)";
 
 pub fn unshield_v2_selector() -> [u8; 4] {
     selector(UNSHIELD_V2_SIG)
@@ -92,6 +93,15 @@ pub fn transfer_with_fee_selector() -> [u8; 4] {
 
 pub fn native_eth_unshield_selector() -> [u8; 4] {
     selector(NATIVE_ETH_UNSHIELD_SIG)
+}
+
+/// `DexGateway.cancel(swapId)`. The relay EOA opened sponsored swaps, so it is the only caller
+/// the gateway accepts after the on-chain deadline.
+pub fn encode_swap_cancel_calldata(swap_id: &[u8; 32]) -> Vec<u8> {
+    with_selector(
+        selector(SWAP_CANCEL_SIG),
+        encode(&[Token::FixedBytes(swap_id.to_vec())]),
+    )
 }
 
 /// `ERC20Shield.unshield(amountUnits, recipient, context, executor, call)`.
@@ -223,6 +233,13 @@ mod tests {
             unshield_v2_selector(),
             selector(b"unshield(uint256,address,(bytes,uint256[8]))")
         );
+    }
+
+    #[test]
+    fn swap_cancel_encodes_one_bytes32_argument() {
+        let cd = encode_swap_cancel_calldata(&[0xAB; 32]);
+        assert_eq!(&cd[..4], &selector(SWAP_CANCEL_SIG));
+        assert_eq!(&cd[4..36], &[0xAB; 32]);
     }
 
     #[test]

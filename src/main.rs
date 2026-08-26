@@ -32,7 +32,8 @@ use privacy_core::ethereum::{
 // The fee release changed `unshield`'s ABI and added the gateway; privacy-core is pinned to a
 // rev that predates both, so those two calls are encoded locally (see `fee_calldata`).
 use fee_calldata::{
-    encode_native_eth_unshield_calldata, encode_settle_atomic_calldata, encode_transfer_calldata,
+    encode_native_eth_unshield_calldata, encode_settle_atomic_calldata, encode_swap_cancel_calldata,
+    encode_transfer_calldata,
     encode_transfer_with_fee_calldata, encode_transfer_with_fee_same_asset_calldata,
     encode_unshield_v2_calldata, pair_sighash_v1,
 };
@@ -650,9 +651,11 @@ struct RelayerHttpConfig {
     submit_raw_trusted_proxy_ips: HashSet<IpAddr>,
     /// Shared secret required to create or refresh LP offers. User accepts remain public.
     lp_offer_token: Option<String>,
-    /// DEX-only: pair-settle is stateless (no LP order lifecycle), so `/swap/settle_atomic`
-    /// cannot be gated on the swap book. Set `PRIVACYBTC_ALLOW_STATELESS_SWAP=1` in the local
-    /// DEX stack to skip the LP-token gate; unset (the default) keeps it required.
+    /// DEX-only: both DEX settlement paths are stateless (no LP order lifecycle), so
+    /// `/swap/settle_atomic` AND the 3-tx `/swap/initiate` + `/swap/settle` cannot be gated on
+    /// the swap book. Set `PRIVACYBTC_ALLOW_STATELESS_SWAP=1` in the local DEX stack to skip the
+    /// LP-token gate and make `request_id` optional on those routes; unset (the default) keeps
+    /// both required. `/swap/join` was never gated.
     allow_stateless_swap: bool,
     /// Every v3 pool this process may target. All entries are checked on-chain at startup.
     protocol_pools: HashSet<String>,
@@ -1717,7 +1720,8 @@ fn build_router(state: Arc<RelayerHttpConfig>) -> Router {
             .route("/swap/initiate", post(http_swap_initiate))
             .route("/swap/join", post(http_swap_join))
             .route("/swap/settle", post(http_swap_settle))
-            // DEX-only NEW route (pair-settle v2). The three routes above keep their
+            .route("/swap/cancel", post(http_swap_cancel))
+            // DEX-only NEW route (pair-settle v2). The four HTLC routes above keep their
             // existing logic. Both DEX surfaces belong to the swap layer, so they ride the
             // same gate: an Ethereum shield-only deployment must not expose them either.
             .route("/swap/settle_atomic", post(http_swap_settle_atomic))
@@ -3279,21 +3283,34 @@ async fn http_swap_initiate(
     Json(req): Json<SwapInitiateRequest>,
 ) -> Result<Json<SwapInitiateResponse>, (StatusCode, Json<HttpErrorResponse>)> {
     async {
-        require_lp_token(&cfg, &headers).map_err(|(_, body)| anyhow!(body.0.error))?;
-        let rid = req.request_id.as_deref().ok_or_else(|| anyhow!("LP initiate requires request_id"))?;
-        let coordinator = resolve_coordinator(&cfg, &req.coordinator)?;
-        let existing = {
-            let mut book = cfg.swap_book.lock().await;
-            if book.prune() { persist_swap_book(&cfg, &book)?; }
-            book.orders.get(rid).cloned().ok_or_else(|| anyhow!("order not found: {rid}"))?
-        };
-        if existing.status != SwapOrderStatus::Accepted
-            || !existing.coordinator.eq_ignore_ascii_case(&coordinator)
-            || !existing.pool_a.eq_ignore_ascii_case(&req.pool_a)
-            || !existing.pool_b.eq_ignore_ascii_case(&req.pool_b)
-        {
-            return Err(anyhow!("initiate request does not match an accepted LP order"));
+        // Stateless (DEX) callers have no LP order to point at: a CLOB match is arranged by the
+        // matcher, not by the offer/accept book, so `request_id` is optional under
+        // `allow_stateless_swap` and the book cross-check is skipped — exactly as
+        // `/swap/settle_atomic` already does. With the gate off (the default) nothing changes:
+        // the LP token and a matching `Accepted` order stay mandatory.
+        if !cfg.allow_stateless_swap {
+            require_lp_token(&cfg, &headers).map_err(|(_, body)| anyhow!(body.0.error))?;
         }
+        let coordinator = resolve_coordinator(&cfg, &req.coordinator)?;
+        let rid = match req.request_id.as_deref() {
+            Some(rid) => {
+                let existing = {
+                    let mut book = cfg.swap_book.lock().await;
+                    if book.prune() { persist_swap_book(&cfg, &book)?; }
+                    book.orders.get(rid).cloned().ok_or_else(|| anyhow!("order not found: {rid}"))?
+                };
+                if existing.status != SwapOrderStatus::Accepted
+                    || !existing.coordinator.eq_ignore_ascii_case(&coordinator)
+                    || !existing.pool_a.eq_ignore_ascii_case(&req.pool_a)
+                    || !existing.pool_b.eq_ignore_ascii_case(&req.pool_b)
+                {
+                    return Err(anyhow!("initiate request does not match an accepted LP order"));
+                }
+                Some(rid)
+            }
+            None if cfg.allow_stateless_swap => None,
+            None => return Err(anyhow!("LP initiate requires request_id")),
+        };
         cfg.ensure_protocol_pool(&req.pool_a)?;
         cfg.ensure_protocol_pool(&req.pool_b)?;
         let pool_a = parse_evm_address_hex(&req.pool_a).map_err(|e| anyhow!("bad pool_a: {e}"))?;
@@ -3323,9 +3340,11 @@ async fn http_swap_initiate(
         )
         .await?;
         let swap_id_hex = format!("0x{}", hex::encode(swap_id));
-        let mut book = cfg.swap_book.lock().await;
-        book.set_initiated_by_request(rid, swap_id_hex.clone(), tx_hash.clone());
-        persist_swap_book(&cfg, &book)?;
+        if let Some(rid) = rid {
+            let mut book = cfg.swap_book.lock().await;
+            book.set_initiated_by_request(rid, swap_id_hex.clone(), tx_hash.clone());
+            persist_swap_book(&cfg, &book)?;
+        }
         println!("[swap/initiate] tx={tx_hash} swap_id={swap_id_hex}");
         Ok::<_, anyhow::Error>(SwapInitiateResponse {
             tx_hash,
@@ -3434,6 +3453,13 @@ struct SwapSettleRequest {
     /// Optional order-book request id; when present, the order is advanced to `Settled`.
     #[serde(default)]
     request_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SwapCancelRequest {
+    #[serde(default)]
+    coordinator: Option<String>,
+    swap_id_hex: String,
 }
 
 #[cfg(test)]
@@ -3663,22 +3689,32 @@ async fn http_swap_settle(
     headers: HeaderMap,
     Json(req): Json<SwapSettleRequest>,
 ) -> Result<Json<HttpTxResponse>, (StatusCode, Json<HttpErrorResponse>)> {
-    require_lp_token(&cfg, &headers)?;
-    let rid = req.request_id.as_deref().ok_or_else(|| http_error(anyhow!("LP settle requires request_id")))?;
-    let coordinator = resolve_coordinator(&cfg, &req.coordinator).map_err(http_error)?;
-    {
-        let mut book = cfg.swap_book.lock().await;
-        if book.prune() { persist_swap_book(&cfg, &book).map_err(http_error)?; }
-        let order = book.orders.get(rid).ok_or_else(|| http_error(anyhow!("order not found: {rid}")))?;
-        if order.status != SwapOrderStatus::Joined
-            || order.swap_id.as_deref() != Some(req.swap_id_hex.as_str())
-            || !order.coordinator.eq_ignore_ascii_case(&coordinator)
-            || req.pool_a.as_deref() != Some(order.pool_a.as_str())
-            || req.pool_b.as_deref() != Some(order.pool_b.as_str())
-        {
-            return Err(http_error(anyhow!("settle request does not match joined LP order")));
-        }
+    // See `http_swap_initiate`: under `allow_stateless_swap` a DEX caller settles a swap that
+    // never had an LP order, so the token gate and the `Joined`-order cross-check are skipped
+    // and `request_id` is optional. The HTLC itself is unchanged — the on-chain `settle` still
+    // requires the secret and both leg commitments to match what the coordinator stored.
+    if !cfg.allow_stateless_swap {
+        require_lp_token(&cfg, &headers)?;
     }
+    let coordinator = resolve_coordinator(&cfg, &req.coordinator).map_err(http_error)?;
+    let rid = match req.request_id.as_deref() {
+        Some(rid) => {
+            let mut book = cfg.swap_book.lock().await;
+            if book.prune() { persist_swap_book(&cfg, &book).map_err(http_error)?; }
+            let order = book.orders.get(rid).ok_or_else(|| http_error(anyhow!("order not found: {rid}")))?;
+            if order.status != SwapOrderStatus::Joined
+                || order.swap_id.as_deref() != Some(req.swap_id_hex.as_str())
+                || !order.coordinator.eq_ignore_ascii_case(&coordinator)
+                || req.pool_a.as_deref() != Some(order.pool_a.as_str())
+                || req.pool_b.as_deref() != Some(order.pool_b.as_str())
+            {
+                return Err(http_error(anyhow!("settle request does not match joined LP order")));
+            }
+            Some(rid.to_owned())
+        }
+        None if cfg.allow_stateless_swap => None,
+        None => return Err(http_error(anyhow!("LP settle requires request_id"))),
+    };
     let swap_id = parse_hex32(&req.swap_id_hex)
         .map_err(|e| http_error(anyhow!("swap_id_hex: {e}")))?;
     let secret = parse_hex32(&req.secret_hex)
@@ -3721,23 +3757,25 @@ async fn http_swap_settle(
     // prematurely reporting "settled" makes the LP bot finalize a phantom change note and shows
     // the user a false success. Instead, watch the receipt in the background and transition to
     // Settled (status=0x1) or Failed (status=0x0 / timeout) based on the on-chain outcome.
+    // The receipt watch itself runs in BOTH modes — a stateless DEX settle can revert for the
+    // same reasons (NullifierSpent, BadAnchor) and that must still reach the log. Only the
+    // swap-book bookkeeping is conditional on there being an order to update.
     {
-        let rid = rid.to_owned();
         let swap_book = Arc::clone(&cfg.swap_book);
         let swap_book_path = cfg.swap_book_path.clone();
         let rpc_url = cfg.rpc_url.clone();
         let tx_hash2 = tx_hash.clone();
-        {
+        if let Some(rid) = rid.as_deref() {
             let mut book = swap_book.lock().await;
-            book.set_settle_tx_by_request(&rid, tx_hash.clone());
+            book.set_settle_tx_by_request(rid, tx_hash.clone());
             persist_swap_book_path(swap_book_path.as_deref(), &book).map_err(http_error)?;
         }
         tokio::spawn(async move {
             let final_status = watch_tx_final_status(&rpc_url, &tx_hash2).await;
             let order_status = settle_order_status(final_status);
-            {
+            if let Some(rid) = rid.as_deref() {
                 let mut book = swap_book.lock().await;
-                book.set_status_by_request(&rid, order_status, None);
+                book.set_status_by_request(rid, order_status, None);
                 if let Err(e) = persist_swap_book_path(swap_book_path.as_deref(), &book) {
                     eprintln!("[swap/settle] failed to persist order status: {e}");
                 }
@@ -3750,6 +3788,38 @@ async fn http_swap_settle(
         });
     }
     println!("[swap/settle] tx={tx_hash} swap_id={} (awaiting receipt)", req.swap_id_hex);
+    Ok(Json(HttpTxResponse { tx_hash }))
+}
+
+/// `DexGateway.cancel(swapId)` — the gateway permits its initiating relayer EOA to release an
+/// expired, unsettled HTLC. The contract is the source of truth for both deadline and state;
+/// this route only authenticates access in LP mode and signs the one-word calldata.
+async fn http_swap_cancel(
+    State(cfg): State<Arc<RelayerHttpConfig>>,
+    headers: HeaderMap,
+    Json(req): Json<SwapCancelRequest>,
+) -> Result<Json<HttpTxResponse>, (StatusCode, Json<HttpErrorResponse>)> {
+    if !cfg.allow_stateless_swap {
+        require_lp_token(&cfg, &headers)?;
+    }
+    let coordinator = resolve_coordinator(&cfg, &req.coordinator).map_err(http_error)?;
+    let swap_id = parse_hex32(&req.swap_id_hex)
+        .map_err(|e| http_error(anyhow!("swap_id_hex: {e}")))?;
+    let tx_hash = send_raw_calldata(
+        &cfg.rpc_url,
+        cfg.chain_id,
+        &cfg.private_key,
+        &coordinator,
+        encode_swap_cancel_calldata(&swap_id),
+        0,
+        cfg.gas_price_gwei,
+        SWAP_INIT_JOIN_GAS_CAP,
+        cfg.gas_limit_margin_bps,
+        &cfg.nonce_cache,
+    )
+    .await
+    .map_err(http_error)?;
+    println!("[swap/cancel] tx={tx_hash} swap_id={}", req.swap_id_hex);
     Ok(Json(HttpTxResponse { tx_hash }))
 }
 
@@ -6664,6 +6734,74 @@ mod tests {
         assert!(body["error"].as_str().unwrap().contains("disabled"));
     }
 
+    /// The DEX's 3-tx HTLC flow (`initiateSwap` → `joinSwap` → `settle`, with timeout
+    /// `cancel`, driven by
+    /// `apps/web/public/dex_3tx.html` in the PERC20 tree) settles a CLOB match, which has no LP
+    /// offer/accept order behind it. `PRIVACYBTC_ALLOW_STATELESS_SWAP=1` therefore has to ungate
+    /// `/swap/initiate`, `/swap/settle`, and `/swap/cancel` the same way it already ungates
+    /// `/swap/settle_atomic`
+    /// — otherwise the maker's first tx dies on "LP initiate requires request_id". With the flag
+    /// off (the default) both routes stay LP-order-only.
+    #[tokio::test]
+    async fn stateless_swap_ungates_the_3tx_and_cancel_routes() {
+        let initiate_body = || {
+            serde_json::json!({
+                "pool_a": "0x1111111111111111111111111111111111111111",
+                "pool_b": "0x2222222222222222222222222222222222222222",
+                "htlc_hash_hex": format!("0x{}", "11".repeat(32)),
+                "deadline": 9_999_999_999u64,
+                "salt_hex": format!("0x{}", "22".repeat(32)),
+                "rk_bx_hex": format!("0x{}", "33".repeat(32)),
+                "rk_by_hex": format!("0x{}", "44".repeat(32)),
+                "bundle_a": test_bundle(),
+            })
+        };
+        let settle_body = || {
+            serde_json::json!({
+                "swap_id_hex": format!("0x{}", "55".repeat(32)),
+                "secret_hex": format!("0x{}", "66".repeat(32)),
+                "bundle_a": test_bundle(),
+                "bundle_b": test_bundle(),
+                "pool_a": "0x1111111111111111111111111111111111111111",
+                "pool_b": "0x2222222222222222222222222222222222222222",
+            })
+        };
+        let cancel_body = || {
+            serde_json::json!({
+                "swap_id_hex": format!("0x{}", "55".repeat(32)),
+            })
+        };
+
+        // Gate ON (default): no request_id ⇒ refused before anything is broadcast.
+        let app = build_router(test_state());
+        for (path, body) in [
+            ("/swap/initiate", initiate_body()),
+            ("/swap/settle", settle_body()),
+        ] {
+            let (_status, body) = call(&app, "POST", path, Some(body)).await;
+            let err = body["error"].as_str().unwrap_or_default().to_string();
+            assert!(err.contains("request_id"), "{path} should stay LP-gated, got: {err}");
+        }
+
+        // Gate OFF: a caller with no LP order and NO token gets past the gate. It still fails —
+        // `test_state`'s rpc_url is a dead port — but never on the LP checks, which is exactly
+        // what proves the swap-book lookup no longer runs.
+        let mut cfg = (*test_state()).clone();
+        cfg.allow_stateless_swap = true;
+        let app = build_router(Arc::new(cfg));
+        for (path, body) in [
+            ("/swap/initiate", initiate_body()),
+            ("/swap/settle", settle_body()),
+            ("/swap/cancel", cancel_body()),
+        ] {
+            let (_status, body) = call_with_token(&app, "POST", path, Some(body), None).await;
+            let err = body["error"].as_str().unwrap_or_default().to_string();
+            for gated in ["request_id", "LP operations disabled", "invalid LP offer token", "order not found"] {
+                assert!(!err.contains(gated), "{path} still LP-gated under allow_stateless_swap: {err}");
+            }
+        }
+    }
+
     #[tokio::test]
     async fn shield_only_router_removes_legacy_sponsored_and_swap_surfaces() {
         let mut cfg = (*test_state()).clone();
@@ -6677,6 +6815,7 @@ mod tests {
             ("POST", "/unshield/submit"),
             ("POST", "/submit_raw"),
             ("POST", "/swap/settle"),
+            ("POST", "/swap/cancel"),
             // The DEX pair-settle surfaces belong to the swap layer and ride the same gate.
             ("POST", "/swap/settle_atomic"),
             ("POST", "/dex/transfer/submit"),
@@ -6685,10 +6824,10 @@ mod tests {
             assert_eq!(status, Sc::NOT_FOUND, "{method} {path} must not be installed");
         }
 
-        // ...and the same two are still served wherever legacy routing is on (the default),
+        // ...and the same DEX routes are still served wherever legacy routing is on (the default),
         // so gating them costs existing DEX deployments nothing.
         let legacy = build_router(test_state());
-        for path in ["/swap/settle_atomic", "/dex/transfer/submit"] {
+        for path in ["/swap/cancel", "/swap/settle_atomic", "/dex/transfer/submit"] {
             let (status, _) = call(&legacy, "POST", path, Some(serde_json::json!({}))).await;
             assert_ne!(status, Sc::NOT_FOUND, "{path} must stay installed for DEX deployments");
         }
