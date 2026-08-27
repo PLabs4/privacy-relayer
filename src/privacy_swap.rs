@@ -598,22 +598,45 @@ pub fn parse_first_abi_uint(value: &str, field: &str) -> Result<Uint> {
 mod tests {
     use super::*;
 
+    const BULL: &str = "0x49bac47750f3dcdba49350b5d74fd399e90f97c6";
+    const BULL_FACTORY: &str = "0x7ed598bcef8bd9edd8c97a195c6d13f40801ec7e";
+    const BULL_HOOK: &str = "0xe5e702641ea86f4ae6cc3cdaed2b886f976be044";
+    const ROBINHOOD_WETH: &str = "0x0bd7d308f8e1639fab988df18a8011f41eacad73";
+
+    fn bull_buy_route() -> Vec<u8> {
+        encode(&[
+            Token::FixedBytes(MARKET_PROFILE_HASH.to_vec()),
+            Token::Address(address(BULL_FACTORY, "factory").unwrap()),
+            Token::Address(address(ROBINHOOD_V4_POOL_MANAGER, "pool_manager").unwrap()),
+            Token::Address(address(BULL_HOOK, "hook").unwrap()),
+            Token::Address(address(BULL, "meme_token").unwrap()),
+            Token::Address(Address::zero()),
+            Token::Address(address(ROBINHOOD_WETH, "input_token").unwrap()),
+            Token::Address(address(BULL, "output_token").unwrap()),
+            Token::Address(Address::zero()),
+            Token::Address(address(BULL, "currency1").unwrap()),
+            Token::Uint(Uint::zero()),
+            Token::Int(Uint::from(200u64)),
+            Token::Bool(true),
+        ])
+    }
+
     fn config() -> PrivacySwapConfig {
-        let route = vec![0x11; ROUTE_DATA_LEN];
+        let route = bull_buy_route();
         PrivacySwapConfig {
             accepting: true,
             route_id: [0x11; 32],
             direction: "buy".into(),
-            asset_symbol: "MEME".into(),
-            asset_name: "Curated Meme".into(),
+            asset_symbol: "BULL".into(),
+            asset_name: "The Bull".into(),
             coordinator: format!("0x{}", "11".repeat(20)),
             registry: format!("0x{}", "22".repeat(20)),
             input_pool: format!("0x{}", "33".repeat(20)),
             output_pool: format!("0x{}", "44".repeat(20)),
             input_verifier_set_id: [0x55; 32],
             output_verifier_set_id: [0x66; 32],
-            input_token: format!("0x{}", "77".repeat(20)),
-            output_token: format!("0x{}", "88".repeat(20)),
+            input_token: ROBINHOOD_WETH.into(),
+            output_token: BULL.into(),
             input_scale: Uint::one(),
             output_scale: Uint::from(10_000_000_000u64),
             input_unshield_fee_units: 10,
@@ -628,15 +651,23 @@ mod tests {
             route_hash: route_hash(&route),
             route_data: route,
             quoter: ROBINHOOD_V4_QUOTER.into(),
-            quoter_runtime_codehash: [0xdd; 32],
-            factory: format!("0x{}", "cc".repeat(20)),
-            factory_runtime_codehash: [0xee; 32],
+            quoter_runtime_codehash: parse_fixed_hex(
+                "d707b1da8cb165e5ea35a3b4450d971eb562ec171e23492aa117036b78a868f6",
+                "quoter_runtime_codehash",
+            )
+            .unwrap(),
+            factory: BULL_FACTORY.into(),
+            factory_runtime_codehash: parse_fixed_hex(
+                "89a27da6f703e0a7cdd4f233e7cb57604ff75b164530962d3ff7cf8483a67d84",
+                "factory_runtime_codehash",
+            )
+            .unwrap(),
             pool_manager: ROBINHOOD_V4_POOL_MANAGER.into(),
-            hook: format!("0x{}", "dd".repeat(20)),
-            weth: format!("0x{}", "ee".repeat(20)),
-            meme_token: format!("0x{}", "88".repeat(20)),
-            pair_token: format!("0x{}", "77".repeat(20)),
-            pool_fee: 10_000,
+            hook: BULL_HOOK.into(),
+            weth: ROBINHOOD_WETH.into(),
+            meme_token: BULL.into(),
+            pair_token: format!("0x{}", "00".repeat(20)),
+            pool_fee: 0,
             tick_spacing: 200,
             zero_for_one: true,
             guardian: format!("0x{}", "ff".repeat(20)),
@@ -691,7 +722,7 @@ mod tests {
         );
         assert_eq!(
             hex::encode(compute_context(4_663, &cfg, &validated.plan, &empty_call()).unwrap()),
-            "9d1c994c65ad4571c4f04cf85601040fc9c143665dd5b7fefa162f4610ae6263"
+            "5d312f9b7ab94c8cd0f464dd6f8919773f5435bf51a7db6bac033d4505d233bc"
         );
     }
 
