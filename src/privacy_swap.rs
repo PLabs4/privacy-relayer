@@ -6,15 +6,22 @@ use sha3::{Digest, Keccak256};
 
 use crate::fee_calldata::privacy_call_token;
 
-pub const ROUTE_DATA_LEN: usize = 13 * 32;
+pub const PONS_V1_ROUTE_DATA_LEN: usize = 10 * 32;
+pub const PONS_V2_ROUTE_DATA_LEN: usize = 15 * 32;
 pub const PROTOCOL_VERSION: u64 = 3;
 pub const APPLICATION_VERSION: u64 = 2;
 pub const ROBINHOOD_CHAIN_ID: u64 = 4_663;
-pub const MARKET_PROFILE: &str = "pons-v2-graduated-v4";
-pub const MARKET_PROFILE_HASH: [u8; 32] = [
-    0xca, 0x70, 0x54, 0x99, 0x53, 0x57, 0xc0, 0x7f, 0xf4, 0x83, 0x2b, 0xab, 0x91, 0xaf, 0xfb, 0x75,
-    0xb2, 0xaa, 0x41, 0x85, 0x21, 0x3b, 0x34, 0x48, 0x5c, 0x4e, 0x62, 0xdc, 0x0e, 0x74, 0xef, 0xc8,
+pub const PONS_V1_MARKET: &str = "pons-v1-v3";
+pub const PONS_V2_MARKET: &str = "pons-v2-graduated-v4";
+pub const PONS_V1_MARKET_PROFILE_HASH: [u8; 32] = [
+    0xd1, 0x12, 0xf8, 0xb0, 0x45, 0x2a, 0x7f, 0x16, 0xed, 0x89, 0xf4, 0xc4, 0x9e, 0xeb, 0x0e, 0x5b,
+    0x90, 0x07, 0xea, 0xbf, 0x04, 0xfe, 0xe3, 0xd2, 0xa8, 0xe4, 0xda, 0xb0, 0x3f, 0xe3, 0x29, 0x37,
 ];
+pub const PONS_V2_MARKET_PROFILE_HASH: [u8; 32] = [
+    0x78, 0x5a, 0xf6, 0x4c, 0x29, 0xa9, 0x1e, 0x87, 0x17, 0x7c, 0xba, 0x03, 0x1b, 0x96, 0x36, 0x0f,
+    0x44, 0xd5, 0x03, 0xa5, 0xec, 0x1b, 0x01, 0x44, 0xbf, 0x42, 0x6a, 0x0d, 0xc5, 0xe3, 0xd4, 0x21,
+];
+pub const ROBINHOOD_V3_QUOTER: &str = "0x33e885ed0ec9bf04ecfb19341582aadcb4c8a9e7";
 pub const ROBINHOOD_V4_POOL_MANAGER: &str = "0x8366a39cc670b4001a1121b8f6a443a643e40951";
 pub const ROBINHOOD_V4_QUOTER: &str = "0x8dc178efb8111bb0973dd9d722ebeff267c98f94";
 const BPS_DENOMINATOR: u64 = 10_000;
@@ -24,11 +31,16 @@ const SWAP_SIG: &[u8] = b"swap((uint64,uint48,uint256,uint64,uint48,uint64,uint2
 const SWAP_CONTEXT_SIG: &[u8] = b"swapContext((uint64,uint48,uint256,uint64,uint48,uint64,uint256,uint256,uint256,uint256,uint16,uint64,bytes32,bytes32),(bytes,uint256[8]))";
 const V4_QUOTE_SIG: &[u8] =
     b"quoteExactOutputSingle(((address,address,uint24,int24,address),bool,uint128,bytes))";
+const V3_QUOTE_SIG: &[u8] = b"quoteExactOutput(bytes,uint256)";
 const GET_LAUNCHED_TOKEN_SIG: &[u8] = b"getLaunchedToken(address)";
+const GRADUATION_STATUS_SIG: &[u8] = b"graduationStatus(address)";
+const GET_POOL_SIG: &[u8] = b"getPool(address,address,uint24)";
+const HOOK_LAUNCH_SIG: &[u8] = b"launches(bytes32)";
 
 #[derive(Clone, Debug)]
 pub struct PrivacySwapConfig {
     pub accepting: bool,
+    pub market: String,
     pub route_id: [u8; 32],
     pub direction: String,
     pub asset_symbol: String,
@@ -61,11 +73,17 @@ pub struct PrivacySwapConfig {
     pub pool_manager: String,
     pub hook: String,
     pub weth: String,
+    pub v3_factory: String,
+    pub v3_factory_runtime_codehash: [u8; 32],
+    pub pool: String,
+    pub pool_runtime_codehash: [u8; 32],
     pub meme_token: String,
     pub pair_token: String,
     pub pool_fee: u32,
     pub tick_spacing: i32,
     pub zero_for_one: bool,
+    pub hook_fee_bps: u16,
+    pub creator_tax_bps: u16,
     pub guardian: String,
     pub gas_limit: u64,
     pub min_broadcast_window_seconds: u64,
@@ -92,6 +110,8 @@ pub struct SwapPlanJson {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct QuoteEvidenceJson {
+    pub market: String,
+    pub market_version: u8,
     pub chain_id: u64,
     pub route_id: String,
     pub block_number: u64,
@@ -101,6 +121,9 @@ pub struct QuoteEvidenceJson {
     pub factory: String,
     pub factory_runtime_codehash: String,
     pub launch_phase: u8,
+    pub pool_fee: u32,
+    pub hook_fee_bps: u16,
+    pub creator_tax_bps: u16,
     pub want_output_wei: String,
     pub amount_in_wei: String,
 }
@@ -225,8 +248,10 @@ pub fn parse_route_data(value: &str) -> Result<Vec<u8>> {
             .unwrap_or(value),
     )
     .context("route_data must be hex")?;
-    if route.len() != ROUTE_DATA_LEN {
-        return Err(anyhow!("route_data must be {ROUTE_DATA_LEN} bytes"));
+    if !matches!(route.len(), PONS_V1_ROUTE_DATA_LEN | PONS_V2_ROUTE_DATA_LEN) {
+        return Err(anyhow!(
+            "route_data must be a canonical Pons v1 ({PONS_V1_ROUTE_DATA_LEN} byte) or v2 ({PONS_V2_ROUTE_DATA_LEN} byte) route"
+        ));
     }
     Ok(route)
 }
@@ -348,7 +373,7 @@ pub fn validate_plan_value(
         .ok_or_else(|| anyhow!("privacy-swap output amount exceeds uint256"))?;
     if want_output_wei >= (Uint::one() << 127) {
         return Err(anyhow!(
-            "privacy-swap exact output exceeds V4 signed delta domain"
+            "privacy-swap exact output exceeds the admitted adapter signed amount domain"
         ));
     }
     Ok(ValidatedPlan {
@@ -362,10 +387,17 @@ pub fn validate_quote_evidence(
     config: &PrivacySwapConfig,
     validated: &ValidatedPlan,
 ) -> Result<()> {
+    let expected_version = if config.market == PONS_V1_MARKET { 1 } else { 2 };
+    let expected_phase = if config.market == PONS_V1_MARKET { 0 } else { 2 };
     if evidence.block_number == 0
         || evidence.chain_id != ROBINHOOD_CHAIN_ID
+        || evidence.market != config.market
+        || evidence.market_version != expected_version
         || parse_fixed_hex::<32>(&evidence.route_id, "quote route_id")? != config.route_id
-        || evidence.launch_phase != 2
+        || evidence.launch_phase != expected_phase
+        || evidence.pool_fee != config.pool_fee
+        || evidence.hook_fee_bps != config.hook_fee_bps
+        || evidence.creator_tax_bps != config.creator_tax_bps
         || !evidence.quoter.eq_ignore_ascii_case(&config.quoter)
         || parse_fixed_hex::<32>(&evidence.quoter_runtime_codehash, "quote quoter codehash")?
             != config.quoter_runtime_codehash
@@ -389,7 +421,7 @@ pub fn validate_current_quote(validated: &ValidatedPlan, current_quote: Uint) ->
     let plan = &validated.plan;
     if current_quote.is_zero() || current_quote > plan.amount_in_maximum_wei {
         return Err(anyhow!(
-            "current V4 exact-output quote exceeds maximum input"
+            "current market exact-output quote exceeds maximum input"
         ));
     }
     if current_quote > plan.quoted_input_wei {
@@ -399,11 +431,11 @@ pub fn validate_current_quote(validated: &ValidatedPlan, current_quote: Uint) ->
             .ok_or_else(|| anyhow!("current quote slippage multiplication overflow"))?
             / Uint::from(BPS_DENOMINATOR);
         if current_quote - plan.quoted_input_wei > maximum_increase {
-            return Err(anyhow!("current V4 quote exceeds wallet slippage"));
+            return Err(anyhow!("current market quote exceeds wallet slippage"));
         }
     }
     if plan.amount_in_maximum_wei - current_quote > plan.max_input_surplus_wei {
-        return Err(anyhow!("current V4 quote would exceed the surplus cap"));
+        return Err(anyhow!("current market quote would exceed the surplus cap"));
     }
     Ok(())
 }
@@ -499,6 +531,56 @@ pub fn encode_v4_quote_calldata(config: &PrivacySwapConfig, amount_out: Uint) ->
     ))
 }
 
+pub fn v3_exact_output_path(config: &PrivacySwapConfig) -> Result<Vec<u8>> {
+    let mut path = Vec::with_capacity(43);
+    path.extend_from_slice(address(&config.output_token, "output_token")?.as_bytes());
+    path.extend_from_slice(&config.pool_fee.to_be_bytes()[1..]);
+    path.extend_from_slice(address(&config.input_token, "input_token")?.as_bytes());
+    Ok(path)
+}
+
+pub fn encode_v3_quote_calldata(config: &PrivacySwapConfig, amount_out: Uint) -> Result<Vec<u8>> {
+    if amount_out.is_zero() {
+        return Err(anyhow!("V3 exact output must be positive"));
+    }
+    Ok(with_selector(
+        V3_QUOTE_SIG,
+        &[Token::Bytes(v3_exact_output_path(config)?), Token::Uint(amount_out)],
+    ))
+}
+
+pub fn encode_v3_get_pool_calldata(config: &PrivacySwapConfig) -> Result<Vec<u8>> {
+    Ok(with_selector(
+        GET_POOL_SIG,
+        &[
+            Token::Address(address(&config.meme_token, "meme_token")?),
+            Token::Address(address(&config.pair_token, "pair_token")?),
+            Token::Uint(Uint::from(config.pool_fee)),
+        ],
+    ))
+}
+
+pub fn pons_v2_pool_id(config: &PrivacySwapConfig) -> Result<[u8; 32]> {
+    let pair = address(&config.pair_token, "pair_token")?;
+    let meme = address(&config.meme_token, "meme_token")?;
+    let (currency0, currency1) = if pair < meme { (pair, meme) } else { (meme, pair) };
+    Ok(Keccak256::digest(encode(&[
+        Token::Address(currency0),
+        Token::Address(currency1),
+        Token::Uint(Uint::from(config.pool_fee)),
+        Token::Int(int_to_uint(config.tick_spacing as i64)),
+        Token::Address(address(&config.hook, "hook")?),
+    ]))
+    .into())
+}
+
+pub fn encode_hook_launch_calldata(config: &PrivacySwapConfig) -> Result<Vec<u8>> {
+    Ok(with_selector(
+        HOOK_LAUNCH_SIG,
+        &[Token::FixedBytes(pons_v2_pool_id(config)?.to_vec())],
+    ))
+}
+
 fn int_to_uint(value: i64) -> Uint {
     if value >= 0 {
         Uint::from(value as u64)
@@ -514,6 +596,13 @@ pub fn encode_get_launch_calldata(meme_token: &str) -> Result<Vec<u8>> {
     ))
 }
 
+pub fn encode_v1_graduation_status_calldata(meme_token: &str) -> Result<Vec<u8>> {
+    Ok(with_selector(
+        GRADUATION_STATUS_SIG,
+        &[Token::Address(address(meme_token, "meme_token")?)],
+    ))
+}
+
 pub fn validate_launch_result(value: &str, config: &PrivacySwapConfig) -> Result<()> {
     let raw = hex::decode(value.strip_prefix("0x").unwrap_or(value))
         .context("Pons launch record must be ABI hex")?;
@@ -525,12 +614,72 @@ pub fn validate_launch_result(value: &str, config: &PrivacySwapConfig) -> Result
         || word(4)[12..] != parse_fixed_hex::<20>(&config.pair_token, "pair_token")?
         || Uint::from_big_endian(word(6)) != Uint::from(config.pool_fee)
         || Uint::from_big_endian(word(7)) != int_to_uint(config.tick_spacing as i64)
+        || Uint::from_big_endian(word(8)) != Uint::from(config.creator_tax_bps)
         || Uint::from_big_endian(word(10)) != Uint::from(2)
         || Uint::from_big_endian(word(14)) != Uint::from(1)
     {
         return Err(anyhow!(
             "Pons launch is not the admitted PoolCreated market"
         ));
+    }
+    Ok(())
+}
+
+pub fn validate_v1_launch_result(value: &str, config: &PrivacySwapConfig) -> Result<()> {
+    let raw = hex::decode(value.strip_prefix("0x").unwrap_or(value))
+        .context("Pons v1 launch record must be ABI hex")?;
+    if raw.len() < 13 * 32 {
+        return Err(anyhow!("Pons v1 launch record is incomplete"));
+    }
+    let word = |index: usize| -> &[u8] { &raw[index * 32..(index + 1) * 32] };
+    if word(0)[12..] != parse_fixed_hex::<20>(&config.meme_token, "meme_token")?
+        || word(2)[12..] != parse_fixed_hex::<20>(&config.pair_token, "pair_token")?
+        || Uint::from_big_endian(word(10)) != Uint::from(config.pool_fee)
+        || Uint::from_big_endian(word(11)) != Uint::from(1)
+    {
+        return Err(anyhow!("Pons v1 launch is not the admitted V3 market"));
+    }
+    Ok(())
+}
+
+pub fn validate_v1_graduation_result(value: &str) -> Result<()> {
+    let raw = hex::decode(value.strip_prefix("0x").unwrap_or(value))
+        .context("Pons v1 graduation status must be ABI hex")?;
+    if raw.len() < 3 * 32 || Uint::from_big_endian(&raw[2 * 32..3 * 32]) != Uint::one() {
+        return Err(anyhow!("Pons v1 token has not reached its factory graduation threshold"));
+    }
+    Ok(())
+}
+
+pub fn validate_v3_pool_result(value: &str, config: &PrivacySwapConfig) -> Result<()> {
+    let raw = hex::decode(value.strip_prefix("0x").unwrap_or(value))
+        .context("V3 getPool result must be ABI hex")?;
+    if raw.len() < 32 || raw[..12] != [0u8; 12]
+        || raw[12..32] != parse_fixed_hex::<20>(&config.pool, "pool")?
+    {
+        return Err(anyhow!("V3 factory getPool differs from the admitted pool"));
+    }
+    Ok(())
+}
+
+pub fn validate_hook_fee_result(value: &str, config: &PrivacySwapConfig) -> Result<()> {
+    let raw = hex::decode(value.strip_prefix("0x").unwrap_or(value))
+        .context("Pons v2 hook launch record must be ABI hex")?;
+    if raw.len() < 13 * 32 {
+        return Err(anyhow!("Pons v2 hook launch record is incomplete"));
+    }
+    let word = |index: usize| -> &[u8] { &raw[index * 32..(index + 1) * 32] };
+    let pair = address(&config.pair_token, "pair_token")?;
+    let meme = address(&config.meme_token, "meme_token")?;
+    let meme_is_currency0 = meme < pair;
+    if Uint::from_big_endian(word(0)) != Uint::from(1)
+        || Uint::from_big_endian(word(1)) != Uint::from(u8::from(meme_is_currency0))
+        || word(2)[12..] != parse_fixed_hex::<20>(&config.meme_token, "meme_token")?
+        || word(3)[12..] != parse_fixed_hex::<20>(&config.pair_token, "pair_token")?
+        || Uint::from_big_endian(word(7)) != Uint::from(config.creator_tax_bps)
+        || Uint::from_big_endian(word(10)) != Uint::from(config.hook_fee_bps)
+    {
+        return Err(anyhow!("Pons v2 hook fee policy differs from the admitted route"));
     }
     Ok(())
 }
@@ -605,7 +754,7 @@ mod tests {
 
     fn bull_buy_route() -> Vec<u8> {
         encode(&[
-            Token::FixedBytes(MARKET_PROFILE_HASH.to_vec()),
+            Token::FixedBytes(PONS_V2_MARKET_PROFILE_HASH.to_vec()),
             Token::Address(address(BULL_FACTORY, "factory").unwrap()),
             Token::Address(address(ROBINHOOD_V4_POOL_MANAGER, "pool_manager").unwrap()),
             Token::Address(address(BULL_HOOK, "hook").unwrap()),
@@ -618,6 +767,8 @@ mod tests {
             Token::Uint(Uint::zero()),
             Token::Int(Uint::from(200u64)),
             Token::Bool(true),
+            Token::Uint(Uint::from(100u64)),
+            Token::Uint(Uint::zero()),
         ])
     }
 
@@ -625,6 +776,7 @@ mod tests {
         let route = bull_buy_route();
         PrivacySwapConfig {
             accepting: true,
+            market: PONS_V2_MARKET.into(),
             route_id: [0x11; 32],
             direction: "buy".into(),
             asset_symbol: "BULL".into(),
@@ -643,7 +795,7 @@ mod tests {
             output_shield_fee_units: 2,
             adapter: format!("0x{}", "99".repeat(20)),
             adapter_runtime_codehash: [0xaa; 32],
-            market_profile: MARKET_PROFILE_HASH,
+            market_profile: PONS_V2_MARKET_PROFILE_HASH,
             fee_collector: format!("0x{}", "bb".repeat(20)),
             swap_fee_units: 5,
             max_ttl_seconds: 900,
@@ -665,11 +817,17 @@ mod tests {
             pool_manager: ROBINHOOD_V4_POOL_MANAGER.into(),
             hook: BULL_HOOK.into(),
             weth: ROBINHOOD_WETH.into(),
+            v3_factory: format!("0x{}", "00".repeat(20)),
+            v3_factory_runtime_codehash: [0u8; 32],
+            pool: format!("0x{}", "00".repeat(20)),
+            pool_runtime_codehash: [0u8; 32],
             meme_token: BULL.into(),
             pair_token: format!("0x{}", "00".repeat(20)),
             pool_fee: 0,
             tick_spacing: 200,
             zero_for_one: true,
+            hook_fee_bps: 100,
+            creator_tax_bps: 0,
             guardian: format!("0x{}", "ff".repeat(20)),
             gas_limit: 12_000_000,
             min_broadcast_window_seconds: 30,
@@ -722,7 +880,7 @@ mod tests {
         );
         assert_eq!(
             hex::encode(compute_context(4_663, &cfg, &validated.plan, &empty_call()).unwrap()),
-            "5d312f9b7ab94c8cd0f464dd6f8919773f5435bf51a7db6bac033d4505d233bc"
+            "44cff9b3c5fef1beee8bc5b12443e1e8caca24b0c6d44ce700e8c79ec6042f38"
         );
     }
 
@@ -733,5 +891,59 @@ mod tests {
         assert_eq!(&quote[..4], &[0x58, 0x73, 0x30, 0x73]);
         let launch = encode_get_launch_calldata(&cfg.meme_token).unwrap();
         assert_eq!(&launch[..4], &[0x3c, 0xf2, 0x8b, 0x5a]);
+    }
+
+    #[test]
+    fn v1_quote_launch_and_pool_checks_use_the_single_v3_fee_tier() {
+        let mut cfg = config();
+        cfg.market = PONS_V1_MARKET.into();
+        cfg.market_profile = PONS_V1_MARKET_PROFILE_HASH;
+        cfg.input_token = ROBINHOOD_WETH.into();
+        cfg.output_token = BULL.into();
+        cfg.pair_token = ROBINHOOD_WETH.into();
+        cfg.pool_fee = 3_000;
+        cfg.hook_fee_bps = 0;
+        cfg.creator_tax_bps = 0;
+        cfg.v3_factory = format!("0x{}", "77".repeat(20));
+        cfg.pool = format!("0x{}", "88".repeat(20));
+
+        let quote = encode_v3_quote_calldata(&cfg, Uint::from(1_000)).unwrap();
+        assert_eq!(&quote[..4], &selector(V3_QUOTE_SIG));
+        assert_eq!(
+            v3_exact_output_path(&cfg).unwrap(),
+            [
+                address(BULL, "meme").unwrap().as_bytes(),
+                &[0x00, 0x0b, 0xb8],
+                address(ROBINHOOD_WETH, "pair").unwrap().as_bytes(),
+            ]
+            .concat()
+        );
+
+        let launch = encode(&[
+            Token::Address(address(BULL, "meme").unwrap()),
+            Token::Address(Address::repeat_byte(1)),
+            Token::Address(address(ROBINHOOD_WETH, "pair").unwrap()),
+            Token::Address(Address::repeat_byte(2)),
+            Token::Uint(Uint::one()),
+            Token::Uint(Uint::zero()),
+            Token::Uint(Uint::zero()),
+            Token::Uint(Uint::from(10)),
+            Token::Uint(Uint::from(1_000_000)),
+            Token::Bool(false),
+            Token::Uint(Uint::from(3_000)),
+            Token::Bool(true),
+            Token::Uint(Uint::zero()),
+        ]);
+        validate_v1_launch_result(&format!("0x{}", hex::encode(launch)), &cfg).unwrap();
+        let graduation = encode(&[
+            Token::Uint(Uint::from(2)),
+            Token::Uint(Uint::one()),
+            Token::Bool(true),
+        ]);
+        validate_v1_graduation_result(&format!("0x{}", hex::encode(graduation))).unwrap();
+        let graduation_call = encode_v1_graduation_status_calldata(BULL).unwrap();
+        assert_eq!(&graduation_call[..4], &selector(GRADUATION_STATUS_SIG));
+        let pool = encode(&[Token::Address(address(&cfg.pool, "pool").unwrap())]);
+        validate_v3_pool_result(&format!("0x{}", hex::encode(pool)), &cfg).unwrap();
     }
 }
