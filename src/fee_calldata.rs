@@ -86,6 +86,135 @@ const LEGACY_TRANSFER_WITH_FEE_SIG: &[u8] =
 const TRANSFER_WITH_FEE_SIG: &[u8] =
     b"transferWithFee(address,address,(bytes,uint256[8]),(bytes,uint256[8]))";
 const SWAP_CANCEL_SIG: &[u8] = b"cancel(bytes32)";
+const SWAP_INITIATE_V2_SIG: &[u8] = b"initiateSwap(address,address,(bytes,uint256[8]),(bytes32,address,bytes32,bytes32,uint256,uint256,uint64,bytes32,(bytes32,uint256,uint256),(bytes32,uint256,uint256),address,uint256),bytes,uint256[3])";
+const SWAP_SETTLE_V2_SIG: &[u8] = b"settle(bytes32,bytes32,(bytes,uint256[8]),(bytes,uint256[8]),((bytes,uint256[8]),uint256[3]),((bytes,uint256[8]),uint256[3]))";
+
+#[derive(Clone, Debug)]
+pub struct OrderRefArgs {
+    pub terms_hash: [u8; 32],
+    pub auth_key_x: [u8; 32],
+    pub auth_key_y: [u8; 32],
+}
+
+#[derive(Clone, Debug)]
+pub struct MatchPermitArgs {
+    pub permit_nonce: [u8; 32],
+    pub expected_initiator: [u8; 20],
+    pub expected_commit_b: [u8; 32],
+    pub htlc_hash: [u8; 32],
+    pub rk_bx: [u8; 32],
+    pub rk_by: [u8; 32],
+    pub deadline: u64,
+    pub salt: [u8; 32],
+    pub maker: OrderRefArgs,
+    pub taker: OrderRefArgs,
+    pub fee_pool: [u8; 20],
+    pub fee_units: [u8; 32],
+}
+
+#[derive(Clone, Debug)]
+pub struct OrderFeeAuthArgs {
+    pub fee_call: Option<PrivacyCallArgs>,
+    pub exempt_sig: [[u8; 32]; 3],
+}
+
+fn order_ref_token(order: &OrderRefArgs) -> Token {
+    Token::Tuple(vec![
+        Token::FixedBytes(order.terms_hash.to_vec()),
+        Token::Uint(Uint::from_big_endian(&order.auth_key_x)),
+        Token::Uint(Uint::from_big_endian(&order.auth_key_y)),
+    ])
+}
+
+fn match_permit_token(permit: &MatchPermitArgs) -> Token {
+    Token::Tuple(vec![
+        Token::FixedBytes(permit.permit_nonce.to_vec()),
+        Token::Address(ethabi::Address::from(permit.expected_initiator)),
+        Token::FixedBytes(permit.expected_commit_b.to_vec()),
+        Token::FixedBytes(permit.htlc_hash.to_vec()),
+        Token::Uint(Uint::from_big_endian(&permit.rk_bx)),
+        Token::Uint(Uint::from_big_endian(&permit.rk_by)),
+        Token::Uint(Uint::from(permit.deadline)),
+        Token::FixedBytes(permit.salt.to_vec()),
+        order_ref_token(&permit.maker),
+        order_ref_token(&permit.taker),
+        Token::Address(ethabi::Address::from(permit.fee_pool)),
+        Token::Uint(Uint::from_big_endian(&permit.fee_units)),
+    ])
+}
+
+fn empty_privacy_call_token() -> Token {
+    Token::Tuple(vec![
+        Token::Bytes(Vec::new()),
+        Token::FixedArray((0..8).map(|_| Token::Uint(Uint::zero())).collect()),
+    ])
+}
+
+/// A Baby JubJub Schnorr signature `[Rx, Ry, s]` as the ABI's `uint256[3]`.
+fn sig3_token(signature: &[[u8; 32]; 3]) -> Token {
+    Token::FixedArray(
+        signature
+            .iter()
+            .map(|value| Token::Uint(Uint::from_big_endian(value)))
+            .collect(),
+    )
+}
+
+fn order_fee_auth_token(auth: &OrderFeeAuthArgs) -> Token {
+    Token::Tuple(vec![
+        auth.fee_call
+            .as_ref()
+            .map(privacy_call_token)
+            .unwrap_or_else(empty_privacy_call_token),
+        sig3_token(&auth.exempt_sig),
+    ])
+}
+
+/// Fee-v2 `DexGateway.initiateSwap`: the exact matcher permit and signature are relayed without
+/// interpretation after the HTTP layer has parsed their fixed-width fields.
+pub fn encode_swap_initiate_v2_calldata(
+    pool_a: &[u8; 20],
+    pool_b: &[u8; 20],
+    call_a: &PrivacyCallArgs,
+    permit: &MatchPermitArgs,
+    matcher_signature: &[u8],
+    initiator_sig: &[[u8; 32]; 3],
+) -> Vec<u8> {
+    with_selector(
+        selector(SWAP_INITIATE_V2_SIG),
+        encode(&[
+            Token::Address(ethabi::Address::from(*pool_a)),
+            Token::Address(ethabi::Address::from(*pool_b)),
+            privacy_call_token(call_a),
+            match_permit_token(permit),
+            Token::Bytes(matcher_signature.to_vec()),
+            sig3_token(initiator_sig),
+        ]),
+    )
+}
+
+/// Fee-v2 three-stage settlement. Principal calls stay value-neutral; each order contributes an
+/// independent fee call on first fill or a BabyJubJub exemption signature on later fills.
+pub fn encode_swap_settle_v2_calldata(
+    swap_id: &[u8; 32],
+    secret: &[u8; 32],
+    call_a: &PrivacyCallArgs,
+    call_b: &PrivacyCallArgs,
+    maker_fee: &OrderFeeAuthArgs,
+    taker_fee: &OrderFeeAuthArgs,
+) -> Vec<u8> {
+    with_selector(
+        selector(SWAP_SETTLE_V2_SIG),
+        encode(&[
+            Token::FixedBytes(swap_id.to_vec()),
+            Token::FixedBytes(secret.to_vec()),
+            privacy_call_token(call_a),
+            privacy_call_token(call_b),
+            order_fee_auth_token(maker_fee),
+            order_fee_auth_token(taker_fee),
+        ]),
+    )
+}
 
 pub fn unshield_v2_selector() -> [u8; 4] {
     selector(UNSHIELD_V2_SIG)
@@ -426,156 +555,6 @@ mod tests {
         assert_eq!(
             Uint::from_big_endian(&fee_tuple[off_actions..off_actions + 32]),
             Uint::zero(),
-        );
-    }
-}
-
-// ── Pair-settle v2 (DexGateway / SwapCoordinator `settleAtomic`) ──────────────────────────────
-//
-// DEX-only, and encoded here for the same reason as the fee calls above: `privacy-core` is
-// pinned to a rev that predates `settleAtomic`. Protocol 3, so both `PrivacyCall`s carry a
-// `uint256[8]` Binding Groth16 proof — the selector below differs from defi_dir's `uint256[3]`
-// form. The two `uint256[3]` tails are SpendAuth Schnorr signatures, which the binding
-// migration does NOT touch.
-
-const SETTLE_ATOMIC_SIG: &[u8] =
-    b"settleAtomic(address,address,(bytes,uint256[8]),(bytes,uint256[8]),uint64,bytes32,uint256[3],uint256[3])";
-
-pub fn settle_atomic_selector() -> [u8; 4] {
-    selector(SETTLE_ATOMIC_SIG)
-}
-
-/// `settleAtomic(poolA, poolB, callA, callB, deadline, salt, sigA, sigB)`.
-#[allow(clippy::too_many_arguments)]
-pub fn encode_settle_atomic_calldata(
-    pool_a: &[u8; 20],
-    pool_b: &[u8; 20],
-    call_a: &PrivacyCallArgs,
-    call_b: &PrivacyCallArgs,
-    deadline: u64,
-    salt: &[u8; 32],
-    sig_a: &[[u8; 32]; 3],
-    sig_b: &[[u8; 32]; 3],
-) -> Vec<u8> {
-    let sig_tok = |s: &[[u8; 32]; 3]| {
-        Token::FixedArray(
-            s.iter()
-                .map(|b| Token::Uint(Uint::from_big_endian(b)))
-                .collect(),
-        )
-    };
-    let tokens = vec![
-        Token::Address(ethabi::Address::from(*pool_a)),
-        Token::Address(ethabi::Address::from(*pool_b)),
-        privacy_call_token(call_a),
-        privacy_call_token(call_b),
-        Token::Uint(Uint::from(deadline)),
-        Token::FixedBytes(salt.to_vec()),
-        sig_tok(sig_a),
-        sig_tok(sig_b),
-    ];
-    let mut out = settle_atomic_selector().to_vec();
-    out.extend_from_slice(&encode(&tokens));
-    out
-}
-
-/// The `SwapCoordinator.pair.v1` sighash both parties co-sign — must byte-match
-/// `DexGateway.pairSighash` (and `dex_new.html:pairSighashOf`).
-///
-/// NOTE the packed widths: chainId 32 bytes, addresses 20, commits/rks 32, deadline **8**
-/// (uint64), salt 32. The domain tag deliberately keeps the historical
-/// `SwapCoordinator.pair.v1` string.
-#[allow(clippy::too_many_arguments)]
-pub fn pair_sighash_v1(
-    chain_id: u64,
-    coordinator: &[u8; 20],
-    pool_a: &[u8; 20],
-    pool_b: &[u8; 20],
-    commit_a: &[u8; 32],
-    commit_b: &[u8; 32],
-    rk_ax: &[u8; 32],
-    rk_ay: &[u8; 32],
-    rk_bx: &[u8; 32],
-    rk_by: &[u8; 32],
-    deadline: u64,
-    salt: &[u8; 32],
-) -> [u8; 32] {
-    let mut m = Vec::with_capacity(23 + 32 + 20 * 3 + 32 * 6 + 8 + 32);
-    m.extend_from_slice(b"SwapCoordinator.pair.v1");
-    let mut cid = [0u8; 32];
-    cid[24..].copy_from_slice(&chain_id.to_be_bytes());
-    m.extend_from_slice(&cid);
-    m.extend_from_slice(coordinator);
-    m.extend_from_slice(pool_a);
-    m.extend_from_slice(pool_b);
-    m.extend_from_slice(commit_a);
-    m.extend_from_slice(commit_b);
-    m.extend_from_slice(rk_ax);
-    m.extend_from_slice(rk_ay);
-    m.extend_from_slice(rk_bx);
-    m.extend_from_slice(rk_by);
-    m.extend_from_slice(&deadline.to_be_bytes());
-    m.extend_from_slice(salt);
-    Keccak256::digest(&m).into()
-}
-
-
-#[cfg(test)]
-mod pair_settle_tests {
-    use super::*;
-
-    fn a20(h: &str) -> [u8; 20] {
-        let mut o = [0u8; 20];
-        o.copy_from_slice(&hex::decode(h.trim_start_matches("0x")).unwrap());
-        o
-    }
-    fn w32(n: u64) -> [u8; 32] {
-        let mut o = [0u8; 32];
-        o[24..].copy_from_slice(&n.to_be_bytes());
-        o
-    }
-    fn b32(h: &str) -> [u8; 32] {
-        let mut o = [0u8; 32];
-        o.copy_from_slice(&hex::decode(h.trim_start_matches("0x")).unwrap());
-        o
-    }
-
-    /// Pins `pair_sighash_v1` against a value read from a LIVE `DexGateway.pairSighash(...)`
-    /// call on anvil (chainId 31337). If the Rust packing ever drifts from the Solidity one,
-    /// every `settleAtomic` would revert with BadMakerSig — this catches it in CI instead.
-    #[test]
-    fn pair_sighash_matches_dexgateway_oncchain_vector() {
-        let got = pair_sighash_v1(
-            31337,
-            &a20("0x4ed7c70F96B99c776995fB64377f0d4aB3B0e1C1"),
-            &a20("0x3dE2Da43d4c1B137E385F36b400507c1A24401f8"),
-            &a20("0xddEA3d67503164326F90F53CFD1705b90Ed1312D"),
-            &b32("0x1111111111111111111111111111111111111111111111111111111111111111"),
-            &b32("0x2222222222222222222222222222222222222222222222222222222222222222"),
-            &w32(7),
-            &w32(9),
-            &w32(11),
-            &w32(13),
-            1_893_456_000,
-            &b32("0x3333333333333333333333333333333333333333333333333333333333333333"),
-        );
-        assert_eq!(
-            hex::encode(got),
-            "9d747d884d7c59a4f04a7037f7c83a432f78a53118c386162a1a93ccb02fa16e",
-            "pair sighash packing drifted from DexGateway.pairSighash"
-        );
-    }
-
-    /// The selector must carry protocol 3's `uint256[8]` PrivacyCall — defi_dir's `uint256[3]`
-    /// form would be silently accepted by the ABI encoder and rejected by the chain.
-    #[test]
-    fn settle_atomic_selector_is_protocol3() {
-        assert_eq!(hex::encode(settle_atomic_selector()), hex::encode(selector(SETTLE_ATOMIC_SIG)));
-        assert_ne!(
-            hex::encode(settle_atomic_selector()),
-            hex::encode(selector(
-                b"settleAtomic(address,address,(bytes,uint256[3]),(bytes,uint256[3]),uint64,bytes32,uint256[3],uint256[3])"
-            )),
         );
     }
 }

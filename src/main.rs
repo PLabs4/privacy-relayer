@@ -27,8 +27,7 @@ use privacy_core::ethereum::{
     bundle_value_balance_be, evm_address_to_recipient_meta, parse_evm_address_hex,
     BundleActionArgs, BundleCalldataArgs, FinalizeWithdrawCalldataArgs,
     // WS-6: WrappedPERC20 + SwapCoordinator calldata (privacy-core 0.1.2).
-    compute_swap_id, encode_swap_initiate_calldata, encode_swap_join_calldata,
-    encode_swap_settle_calldata, encode_wrapped_shield_calldata,
+    compute_swap_id, encode_swap_join_calldata, encode_wrapped_shield_calldata,
     privacy_call_commit, PrivacyCallArgs,
 };
 // The fee release changed `unshield`'s ABI and added the gateway; privacy-core is pinned to a
@@ -36,9 +35,10 @@ use privacy_core::ethereum::{
 use fee_calldata::{
     encode_legacy_transfer_with_fee_calldata,
     encode_legacy_transfer_with_fee_same_asset_calldata, encode_native_eth_unshield_calldata,
-    encode_settle_atomic_calldata, encode_swap_cancel_calldata, encode_transfer_calldata,
+    encode_swap_cancel_calldata, encode_swap_initiate_v2_calldata,
+    encode_swap_settle_v2_calldata, encode_transfer_calldata,
     encode_transfer_with_fee_calldata, encode_transfer_with_fee_same_asset_calldata,
-    encode_unshield_v2_calldata, pair_sighash_v1,
+    encode_unshield_v2_calldata, MatchPermitArgs, OrderFeeAuthArgs, OrderRefArgs,
 };
 use reqwest::Client;
 use serde::de::DeserializeOwned;
@@ -665,11 +665,11 @@ struct RelayerHttpConfig {
     submit_raw_trusted_proxy_ips: HashSet<IpAddr>,
     /// Shared secret required to create or refresh LP offers. User accepts remain public.
     lp_offer_token: Option<String>,
-    /// DEX-only: both DEX settlement paths are stateless (no LP order lifecycle), so
-    /// `/swap/settle_atomic` AND the 3-tx `/swap/initiate` + `/swap/settle` cannot be gated on
+    /// DEX-only: the three-stage DEX settlement path is stateless (no LP order lifecycle), so
+    /// `/swap/initiate` + `/swap/settle` cannot be gated on
     /// the swap book. Set `PRIVACYBTC_ALLOW_STATELESS_SWAP=1` in the local DEX stack to skip the
     /// LP-token gate and make `request_id` optional on those routes; unset (the default) keeps
-    /// both required. `/swap/join` was never gated.
+    /// them required. `/swap/join` was never gated.
     allow_stateless_swap: bool,
     /// Every v3 pool this process may target. All entries are checked on-chain at startup.
     protocol_pools: HashSet<String>,
@@ -2500,10 +2500,6 @@ fn build_router(state: Arc<RelayerHttpConfig>) -> Router {
             .route("/swap/join", post(http_swap_join))
             .route("/swap/settle", post(http_swap_settle))
             .route("/swap/cancel", post(http_swap_cancel))
-            // DEX-only NEW route (pair-settle v2). The four HTLC routes above keep their
-            // existing logic. Both DEX surfaces belong to the swap layer, so they ride the
-            // same gate: an Ethereum shield-only deployment must not expose them either.
-            .route("/swap/settle_atomic", post(http_swap_settle_atomic))
             .route("/dex/transfer/submit", post(http_dex_transfer_submit))
             // ── LP swap order book (matching layer; see docs/lp-swap-design.md) ──
             .route("/swap/offers", get(http_swap_offer_list).post(http_swap_offer_post))
@@ -3731,6 +3727,47 @@ fn parse_hex32(s: &str) -> Result<[u8; 32]> {
         .map_err(|_| anyhow!("expected 32 bytes, got {}", s.len() / 2))
 }
 
+fn parse_uint256_word(s: &str) -> Result<[u8; 32]> {
+    let value = if s.trim().starts_with("0x") {
+        ethabi::Uint::from_str_radix(strip_0x(s.trim()), 16)
+            .map_err(|error| anyhow!("invalid uint256 hex: {error}"))?
+    } else {
+        ethabi::Uint::from_dec_str(s.trim())
+            .map_err(|error| anyhow!("invalid uint256 decimal: {error}"))?
+    };
+    let mut word = [0u8; 32];
+    value.to_big_endian(&mut word);
+    Ok(word)
+}
+
+fn parse_order_ref(req: &MatchOrderRefRequest) -> Result<OrderRefArgs> {
+    Ok(OrderRefArgs {
+        terms_hash: parse_hex32(&req.terms_hash).context("terms_hash")?,
+        auth_key_x: parse_uint256_word(&req.auth_key_x).context("auth_key_x")?,
+        auth_key_y: parse_uint256_word(&req.auth_key_y).context("auth_key_y")?,
+    })
+}
+
+fn parse_match_permit(req: &MatchPermitRequest) -> Result<MatchPermitArgs> {
+    Ok(MatchPermitArgs {
+        permit_nonce: parse_hex32(&req.permit_nonce).context("permit_nonce")?,
+        expected_initiator: parse_evm_address_hex(&req.expected_initiator)
+            .map_err(|error| anyhow!("expected_initiator: {error}"))?,
+        expected_commit_b: parse_hex32(&req.expected_commit_b)
+            .context("expected_commit_b")?,
+        htlc_hash: parse_hex32(&req.htlc_hash).context("permit htlc_hash")?,
+        rk_bx: parse_uint256_word(&req.rk_bx).context("permit rk_bx")?,
+        rk_by: parse_uint256_word(&req.rk_by).context("permit rk_by")?,
+        deadline: req.deadline,
+        salt: parse_hex32(&req.salt).context("permit salt")?,
+        maker: parse_order_ref(&req.maker).context("maker order ref")?,
+        taker: parse_order_ref(&req.taker).context("taker order ref")?,
+        fee_pool: parse_evm_address_hex(&req.fee_pool)
+            .map_err(|error| anyhow!("fee_pool: {error}"))?,
+        fee_units: parse_uint256_word(&req.fee_units).context("fee_units")?,
+    })
+}
+
 /// Extract `Vec<BundleActionArgs>` from a proved `OrchardStoredBundle`.
 fn bundle_to_action_args(bundle: &OrchardStoredBundle) -> Result<Vec<BundleActionArgs>> {
     let mut out = Vec::with_capacity(bundle.actions.len());
@@ -3784,9 +3821,22 @@ fn bundle_binding_proof(bundle: &OrchardStoredBundle) -> Result<[[u8; 32]; 8]> {
 // without custody risk. The relayer only forwards already-proved bundles
 // (v3 sighash, executor bound by the Binding proof).
 
-/// `initiateSwap`/`joinSwap` only store state (+ verify the joiner's Schnorr); keep them well
-/// under the heavy `settle` budget.
-const SWAP_INIT_JOIN_GAS_CAP: u64 = 1_500_000;
+/// Gas ceiling for `initiateSwap`/`joinSwap`/`cancel`, which are not priced like `settle`.
+///
+/// This used to be 1_500_000 on the reasoning that these calls "only store state (+ verify the
+/// joiner's Schnorr)". That stopped being true twice over: plan-A data availability puts the
+/// WHOLE proved leg in the `initiateSwap`/`joinSwap` calldata (~1.6 KB per leg here, at 16 gas
+/// a byte), and CON-01b added the initiator's Baby JubJub Schnorr check to `initiateSwap` — two
+/// pure-Solidity scalar multiplications. PERC20's own suite measures `initiateSwap` at up to
+/// 1_512_228 gas, already over the old ceiling before the margin is applied.
+///
+/// The symptom was maximally unhelpful: `gas_limit_with_margin` refuses before the "[relayer] gas
+/// policy" line is printed, so a settlement died with a bare 400 and left NOTHING in the relayer
+/// log, no transaction on chain, and a matcher session that looked perfectly healthy.
+///
+/// 4_000_000 keeps ~2.6x headroom over that measurement and still sits well under the `settle`
+/// budget (`--gas-limit-swap`, 12M by default), which is what the original constant was for.
+const SWAP_INIT_JOIN_GAS_CAP: u64 = 4_000_000;
 
 /// Build a `PrivacyCall` (actions + Binding proof) from a proved bundle.
 fn bundle_to_privacy_call(bundle: &OrchardStoredBundle) -> Result<PrivacyCallArgs> {
@@ -3830,6 +3880,53 @@ fn parse_sig96_hex(s: &str) -> Result<[[u8; 32]; 3]> {
         bytes[32..64].try_into().unwrap(),
         bytes[64..96].try_into().unwrap(),
     ])
+}
+
+fn parse_sig3_hex(signature: &[String; 3], role: &str) -> Result<[[u8; 32]; 3]> {
+    let mut out = [[0u8; 32]; 3];
+    for (index, value) in signature.iter().enumerate() {
+        out[index] = parse_hex32(value)
+            .with_context(|| format!("{role} exempt_sig_hex[{index}]"))?;
+    }
+    Ok(out)
+}
+
+/// Relay one `DexGateway.OrderFeeAuth` without deciding what it means.
+///
+/// The struct's two halves are NOT mutually exclusive. `DexGateway` reads them as:
+///
+/// * `fee_bundle` alone — a later fill's exemption is impossible, so this is the taker's first
+///   fill (its `joinerSig` already binds it to the swap).
+/// * `fee_bundle` + signature — the MAKER's first fill. The signature is its swap-level
+///   authorization (`orderFirstFillSighash`), the counterpart of the joiner's `joinerSig`: the
+///   initiator's leg otherwise carries no user signature at all, and `expectedInitiator` is an
+///   address the matcher chooses. Rejecting this combination here — as this function used to —
+///   would make that authorization unreachable and every first fill revert.
+/// * signature alone — a later fill, exempt from a second fee bundle.
+fn parse_order_fee_auth(req: &SwapOrderFeeAuthRequest, role: &str) -> Result<OrderFeeAuthArgs> {
+    match (&req.fee_bundle, &req.exempt_sig_hex) {
+        (Some(bundle), signature) => {
+            let fee_call = bundle_to_privacy_call(bundle)
+                .with_context(|| format!("{role} fee_bundle"))?;
+            if fee_call.actions.is_empty() {
+                return Err(anyhow!("{role} fee_bundle has no actions"));
+            }
+            Ok(OrderFeeAuthArgs {
+                fee_call: Some(fee_call),
+                exempt_sig: match signature {
+                    Some(signature) => parse_sig3_hex(signature, role)?,
+                    None => [[0u8; 32]; 3],
+                },
+            })
+        }
+        (None, Some(signature)) => Ok(OrderFeeAuthArgs {
+            fee_call: None,
+            exempt_sig: parse_sig3_hex(signature, role)?,
+        }),
+        (None, None) => Err(anyhow!(
+            "{role} fee auth is missing both fee_bundle and exemption signature"
+        )),
+    }
 }
 
 /// Plan A (call-on-chain): the proved bundle is REQUIRED — the full `PrivacyCall` rides in the
@@ -4526,6 +4623,29 @@ async fn http_swap_order(
 }
 
 #[derive(Debug, Deserialize)]
+struct MatchOrderRefRequest {
+    terms_hash: String,
+    auth_key_x: String,
+    auth_key_y: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct MatchPermitRequest {
+    permit_nonce: String,
+    expected_initiator: String,
+    expected_commit_b: String,
+    htlc_hash: String,
+    rk_bx: String,
+    rk_by: String,
+    deadline: u64,
+    salt: String,
+    maker: MatchOrderRefRequest,
+    taker: MatchOrderRefRequest,
+    fee_pool: String,
+    fee_units: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct SwapInitiateRequest {
     #[serde(default)]
     coordinator: Option<String>,
@@ -4547,6 +4667,15 @@ struct SwapInitiateRequest {
     /// the `initiateSwap` tx calldata so the joiner can trial-decrypt it from chain.
     #[serde(default)]
     bundle_a: Option<OrchardStoredBundle>,
+    /// Matcher authorization for this exact real-order pair and both principal commitments.
+    match_permit: MatchPermitRequest,
+    /// Raw secp256k1 `r || s || v` signature (65 bytes) over the gateway permit digest.
+    matcher_signature_hex: String,
+    /// The initiator's Baby JubJub Schnorr signature over `DexGateway.initiateSighash` (96-byte
+    /// hex), made under `bundle_a`'s OWN randomised spend-auth key. The mirror of
+    /// `joiner_sig_hex`: it is what proves the caller holds the leg it is opening the swap with,
+    /// and the gateway rejects `initiateSwap` without it.
+    initiator_sig_hex: String,
     /// Optional order-book request id; when present, the order is advanced to `Initiated`
     /// and its `swap_id` recorded so the user can poll `/swap/order` to join.
     #[serde(default)]
@@ -4571,8 +4700,7 @@ async fn http_swap_initiate(
     async {
         // Stateless (DEX) callers have no LP order to point at: a CLOB match is arranged by the
         // matcher, not by the offer/accept book, so `request_id` is optional under
-        // `allow_stateless_swap` and the book cross-check is skipped — exactly as
-        // `/swap/settle_atomic` already does. With the gate off (the default) nothing changes:
+        // `allow_stateless_swap` and the book cross-check is skipped. With the gate off (the default) nothing changes:
         // the LP token and a matching `Accepted` order stay mandatory.
         if !cfg.allow_stateless_swap {
             require_lp_token(&cfg, &headers).map_err(|(_, body)| anyhow!(body.0.error))?;
@@ -4605,12 +4733,45 @@ async fn http_swap_initiate(
         let salt = parse_hex32(&req.salt_hex).context("salt_hex")?;
         let rk_bx = parse_hex32(&req.rk_bx_hex).context("rk_bx_hex")?;
         let rk_by = parse_hex32(&req.rk_by_hex).context("rk_by_hex")?;
+        // Parsed with the other request bytes, before the permit cross-check: a malformed
+        // signature is the caller's own field to fix, and should say so rather than surface as
+        // whatever check happens to run first.
+        let initiator_sig = parse_sig96_hex(&req.initiator_sig_hex).context("initiator_sig_hex")?;
         let (call_a, commit_a) = leg_call_and_commit("bundle_a", &req.bundle_a, &req.commit_a_hex)?;
         let initiator = relayer_address20(&cfg.private_key)?;
+        let permit = parse_match_permit(&req.match_permit)?;
+        if permit.expected_initiator != initiator
+            || permit.htlc_hash != htlc_hash
+            || permit.rk_bx != rk_bx
+            || permit.rk_by != rk_by
+            || permit.deadline != req.deadline
+            || permit.salt != salt
+        {
+            return Err(anyhow!(
+                "top-level initiate fields do not exactly match the matcher permit"
+            ));
+        }
+        if permit.fee_pool != pool_a && permit.fee_pool != pool_b {
+            return Err(anyhow!("matcher permit fee_pool is not one of the settlement pools"));
+        }
+        cfg.ensure_protocol_pool(&format!("0x{}", hex::encode(permit.fee_pool)))?;
+        let matcher_signature =
+            hex::decode(strip_0x(&req.matcher_signature_hex)).context("matcher_signature_hex")?;
+        if matcher_signature.len() != 65 {
+            return Err(anyhow!(
+                "matcher_signature_hex must be 65 bytes, got {}",
+                matcher_signature.len()
+            ));
+        }
         let swap_id =
             compute_swap_id(&initiator, &pool_a, &pool_b, &htlc_hash, &commit_a, &rk_bx, &rk_by, &salt);
-        let calldata = encode_swap_initiate_calldata(
-            &pool_a, &pool_b, &call_a, &htlc_hash, &rk_bx, &rk_by, req.deadline, &salt,
+        let calldata = encode_swap_initiate_v2_calldata(
+            &pool_a,
+            &pool_b,
+            &call_a,
+            &permit,
+            &matcher_signature,
+            &initiator_sig,
         );
         let tx_hash = send_raw_calldata(
             &cfg.rpc_url,
@@ -4722,6 +4883,16 @@ async fn http_swap_join(
 }
 
 #[derive(Debug, Deserialize)]
+struct SwapOrderFeeAuthRequest {
+    /// Present only on this order's first successful fill.
+    #[serde(default)]
+    fee_bundle: Option<OrchardStoredBundle>,
+    /// Present only after the order's on-chain `feePaid` bit is already true.
+    #[serde(default)]
+    exempt_sig_hex: Option<[String; 3]>,
+}
+
+#[derive(Debug, Deserialize)]
 struct SwapSettleRequest {
     #[serde(default)]
     coordinator: Option<String>,
@@ -4731,6 +4902,9 @@ struct SwapSettleRequest {
     /// Proved leg-A and leg-B bundles (executor = coordinator, bound by the prover).
     bundle_a: OrchardStoredBundle,
     bundle_b: OrchardStoredBundle,
+    fee_pool: String,
+    maker_fee: SwapOrderFeeAuthRequest,
+    taker_fee: SwapOrderFeeAuthRequest,
     /// Optional pool addresses to notify the indexer of the broadcast tx.
     #[serde(default)]
     pool_a: Option<String>,
@@ -4756,7 +4930,8 @@ mod dex_leg_commit_tests {
     /// `privacybtc_ethereum::perc20_privacy_call_commit`; the relayer derives the `commit_a` /
     /// `commit_b` that go into the on-chain `pairId` with `privacy_core::ethereum::
     /// privacy_call_commit` over `bundle_to_privacy_call` — a DIFFERENT crate and a different
-    /// decoder. If they ever disagree by one field, every `settleAtomic` reverts `BadMakerSig`
+    /// decoder. If they ever disagree by one field, matcher-permitted initiate/join rejects the
+    /// commitment
     /// and nothing else in the test suite would notice.
     ///
     /// The fixture is a real 2-action transfer leg proved by `POST /dex/prove_note` against the
@@ -4789,129 +4964,6 @@ mod dex_leg_commit_tests {
             assert_eq!(a.anchor, a.pub_fields[0], "action[{i}] anchor must be pubFields[0]");
         }
     }
-}
-
-#[derive(Debug, Deserialize)]
-struct SwapSettleAtomicRequest {
-    #[serde(default)]
-    coordinator: Option<String>,
-    pool_a: String,
-    pool_b: String,
-    deadline: u64,
-    salt_hex: String,
-    /// Maker signature [Rx, Ry, s] under leg-A's rk over the pair sighash (32-byte hex each).
-    sig_a_hex: [String; 3],
-    /// Taker signature under leg-B's rk.
-    sig_b_hex: [String; 3],
-    bundle_a: OrchardStoredBundle,
-    bundle_b: OrchardStoredBundle,
-}
-
-#[derive(Debug, serde::Serialize)]
-struct SwapSettleAtomicResponse {
-    tx_hash: String,
-    /// The pair sighash == the `PairSettled` event's `pairId` (re-derived server-side as a
-    /// cross-check; the client signed this exact value or the tx will revert).
-    pair_id: String,
-    commit_a: String,
-    commit_b: String,
-}
-
-/// `settleAtomic(...)` — pair-settle v2: ONE relayer-signed tx executes both co-signed legs.
-///
-/// DEX-only NEW route (this tree had no `/swap/settle_atomic`); the existing `/swap/initiate`,
-/// `/swap/join` and `/swap/settle` are untouched. Unlike `/swap/settle`, there is no LP order to
-/// match against — pair-settle carries its whole authorisation in the two signatures — so the
-/// swap-book check is replaced by the `allow_stateless_swap` / LP-token gate.
-async fn http_swap_settle_atomic(
-    State(cfg): State<Arc<RelayerHttpConfig>>,
-    headers: HeaderMap,
-    Json(req): Json<SwapSettleAtomicRequest>,
-) -> Result<Json<SwapSettleAtomicResponse>, (StatusCode, Json<HttpErrorResponse>)> {
-    if !cfg.allow_stateless_swap {
-        require_lp_token(&cfg, &headers)?;
-    }
-    let coordinator = resolve_coordinator(&cfg, &req.coordinator).map_err(http_error)?;
-    let coord20 = parse_evm_address_hex(&coordinator)
-        .map_err(|e| http_error(anyhow!("bad coordinator: {e}")))?;
-    cfg.ensure_protocol_pool(&req.pool_a).map_err(http_error)?;
-    cfg.ensure_protocol_pool(&req.pool_b).map_err(http_error)?;
-    let pool_a =
-        parse_evm_address_hex(&req.pool_a).map_err(|e| http_error(anyhow!("bad pool_a: {e}")))?;
-    let pool_b =
-        parse_evm_address_hex(&req.pool_b).map_err(|e| http_error(anyhow!("bad pool_b: {e}")))?;
-    let salt = parse_hex32(&req.salt_hex).map_err(|e| http_error(anyhow!("salt_hex: {e}")))?;
-    let mut sig_a = [[0u8; 32]; 3];
-    let mut sig_b = [[0u8; 32]; 3];
-    for i in 0..3 {
-        sig_a[i] = parse_hex32(&req.sig_a_hex[i])
-            .map_err(|e| http_error(anyhow!("sig_a_hex[{i}]: {e}")))?;
-        sig_b[i] = parse_hex32(&req.sig_b_hex[i])
-            .map_err(|e| http_error(anyhow!("sig_b_hex[{i}]: {e}")))?;
-    }
-    // Frozen-compliance preflight on both legs (the on-chain settle would otherwise revert late).
-    enforce_frozen_compliance(&cfg.rpc_url, &req.pool_a, &req.bundle_a)
-        .await
-        .map_err(http_error)?;
-    enforce_frozen_compliance(&cfg.rpc_url, &req.pool_b, &req.bundle_b)
-        .await
-        .map_err(http_error)?;
-
-    let call_a = bundle_to_privacy_call(&req.bundle_a).map_err(http_error)?;
-    let call_b = bundle_to_privacy_call(&req.bundle_b).map_err(http_error)?;
-    let act_a = call_a
-        .actions
-        .first()
-        .ok_or_else(|| http_error(anyhow!("bundle_a has no actions")))?;
-    let act_b = call_b
-        .actions
-        .first()
-        .ok_or_else(|| http_error(anyhow!("bundle_b has no actions")))?;
-    let commit_a = privacy_call_commit(&call_a);
-    let commit_b = privacy_call_commit(&call_b);
-    // Re-derived, never trusted from the client: if it differs from what the parties signed the
-    // tx reverts with BadMakerSig/BadTakerSig, so returning it makes the mismatch debuggable.
-    let pair_id = pair_sighash_v1(
-        cfg.chain_id,
-        &coord20,
-        &pool_a,
-        &pool_b,
-        &commit_a,
-        &commit_b,
-        &act_a.pub_fields[4],
-        &act_a.pub_fields[5],
-        &act_b.pub_fields[4],
-        &act_b.pub_fields[5],
-        req.deadline,
-        &salt,
-    );
-    let calldata = encode_settle_atomic_calldata(
-        &pool_a, &pool_b, &call_a, &call_b, req.deadline, &salt, &sig_a, &sig_b,
-    );
-    let tx_hash = send_raw_calldata(
-        &cfg.rpc_url,
-        cfg.chain_id,
-        &cfg.private_key,
-        &coordinator,
-        calldata,
-        0,
-        cfg.gas_price_gwei,
-        cfg.gas_limit_swap,
-        cfg.gas_limit_margin_bps,
-        &cfg.nonce_cache,
-    )
-    .await
-    .map_err(http_error)?;
-    for pool in [req.pool_a.clone(), req.pool_b.clone()] {
-        tokio::spawn(notify_pending_tx(cfg.indexer_url.clone(), tx_hash.clone(), pool));
-    }
-    println!("[swap/settle_atomic] tx={tx_hash} pair_id=0x{}", hex::encode(pair_id));
-    Ok(Json(SwapSettleAtomicResponse {
-        tx_hash,
-        pair_id: format!("0x{}", hex::encode(pair_id)),
-        commit_a: format!("0x{}", hex::encode(commit_a)),
-        commit_b: format!("0x{}", hex::encode(commit_b)),
-    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -5018,9 +5070,30 @@ async fn http_swap_settle(
             .await
             .map_err(http_error)?;
     }
+    let fee_pool = cfg.ensure_protocol_pool(&req.fee_pool).map_err(http_error)?;
+    for fee_bundle in [
+        req.maker_fee.fee_bundle.as_ref(),
+        req.taker_fee.fee_bundle.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        enforce_frozen_compliance(&cfg.rpc_url, &fee_pool, fee_bundle)
+            .await
+            .map_err(http_error)?;
+    }
     let call_a = bundle_to_privacy_call(&req.bundle_a).map_err(http_error)?;
     let call_b = bundle_to_privacy_call(&req.bundle_b).map_err(http_error)?;
-    let calldata = encode_swap_settle_calldata(&swap_id, &secret, &call_a, &call_b);
+    let maker_fee = parse_order_fee_auth(&req.maker_fee, "maker").map_err(http_error)?;
+    let taker_fee = parse_order_fee_auth(&req.taker_fee, "taker").map_err(http_error)?;
+    let calldata = encode_swap_settle_v2_calldata(
+        &swap_id,
+        &secret,
+        &call_a,
+        &call_b,
+        &maker_fee,
+        &taker_fee,
+    );
     let tx_hash = send_raw_calldata(
         &cfg.rpc_url,
         cfg.chain_id,
@@ -5035,7 +5108,10 @@ async fn http_swap_settle(
     )
     .await
     .map_err(http_error)?;
-    for pool in [req.pool_a.clone(), req.pool_b.clone()].into_iter().flatten() {
+    for pool in [req.pool_a.clone(), req.pool_b.clone(), Some(req.fee_pool.clone())]
+        .into_iter()
+        .flatten()
+    {
         tokio::spawn(notify_pending_tx(cfg.indexer_url.clone(), tx_hash.clone(), pool));
     }
     // Do NOT mark the order Settled here: the tx is only broadcast, not yet mined. A settle
@@ -7956,6 +8032,42 @@ fn rlp_list(items: Vec<Vec<u8>>) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    /// `DexGateway` needs BOTH halves of `OrderFeeAuth` on a maker's first fill: the fee bundle,
+    /// and the swap-level authorization its order signs (`orderFirstFillSighash`) — the
+    /// counterpart of the joiner's `joinerSig`. This parser used to reject that pair outright,
+    /// which would have made the authorization unreachable and every first fill revert.
+    #[test]
+    fn a_first_fill_may_carry_both_a_fee_bundle_and_an_authorization() {
+        // `parse_hex32` is length-exact — these are full 32-byte words, not trimmed ids.
+        let signature = [
+            format!("0x{}", "11".repeat(32)),
+            format!("0x{}", "12".repeat(32)),
+            format!("0x{}", "13".repeat(32)),
+        ];
+
+        // Signature alone: a later fill's exemption.
+        let exempt = parse_order_fee_auth(
+            &SwapOrderFeeAuthRequest { fee_bundle: None, exempt_sig_hex: Some(signature.clone()) },
+            "maker",
+        )
+        .expect("exemption alone is valid");
+        assert!(exempt.fee_call.is_none());
+        assert_eq!(exempt.exempt_sig[0], [0x11u8; 32]);
+
+        // Neither: nothing to relay, and the gateway would revert with a less obvious error.
+        assert!(parse_order_fee_auth(
+            &SwapOrderFeeAuthRequest { fee_bundle: None, exempt_sig_hex: None },
+            "maker",
+        )
+        .is_err());
+
+        // The pair is relayed verbatim — see `parse_order_fee_auth`. A bundle fixture is more
+        // machinery than this is worth, so the combination is covered end-to-end by PERC20's
+        // `test_first_fill_requires_the_makers_own_swap_authorization`; what is pinned here is
+        // that the signature is no longer DROPPED when it arrives beside a bundle.
+        assert_eq!(exempt.exempt_sig, parse_sig3_hex(&signature, "maker").unwrap());
+    }
+
     #[test]
     fn bundle_path_sibling() {
         let p = PathBuf::from("/a/deposit-1.json");
@@ -8805,9 +8917,8 @@ mod tests {
     /// `cancel`, driven by
     /// `apps/web/public/dex_3tx.html` in the PERC20 tree) settles a CLOB match, which has no LP
     /// offer/accept order behind it. `PRIVACYBTC_ALLOW_STATELESS_SWAP=1` therefore has to ungate
-    /// `/swap/initiate`, `/swap/settle`, and `/swap/cancel` the same way it already ungates
-    /// `/swap/settle_atomic`
-    /// — otherwise the maker's first tx dies on "LP initiate requires request_id". With the flag
+    /// `/swap/initiate`, `/swap/settle`, and `/swap/cancel`; otherwise the maker's first tx dies
+    /// on "LP initiate requires request_id". With the flag
     /// off (the default) both routes stay LP-order-only.
     #[tokio::test]
     async fn stateless_swap_ungates_the_3tx_and_cancel_routes() {
@@ -8821,6 +8932,30 @@ mod tests {
                 "rk_bx_hex": format!("0x{}", "33".repeat(32)),
                 "rk_by_hex": format!("0x{}", "44".repeat(32)),
                 "bundle_a": test_bundle(),
+                "matcher_signature_hex": format!("0x{}", "55".repeat(65)),
+                "initiator_sig_hex": format!("0x{}", "66".repeat(96)),
+                "match_permit": {
+                    "permit_nonce": format!("0x{}", "10".repeat(32)),
+                    "expected_initiator": "0x3333333333333333333333333333333333333333",
+                    "expected_commit_b": format!("0x{}", "77".repeat(32)),
+                    "htlc_hash": format!("0x{}", "11".repeat(32)),
+                    "rk_bx": format!("0x{}", "33".repeat(32)),
+                    "rk_by": format!("0x{}", "44".repeat(32)),
+                    "deadline": 9_999_999_999u64,
+                    "salt": format!("0x{}", "22".repeat(32)),
+                    "maker": {
+                        "terms_hash": format!("0x{}", "81".repeat(32)),
+                        "auth_key_x": format!("0x{}", "82".repeat(32)),
+                        "auth_key_y": format!("0x{}", "83".repeat(32))
+                    },
+                    "taker": {
+                        "terms_hash": format!("0x{}", "91".repeat(32)),
+                        "auth_key_x": format!("0x{}", "92".repeat(32)),
+                        "auth_key_y": format!("0x{}", "93".repeat(32))
+                    },
+                    "fee_pool": "0x2222222222222222222222222222222222222222",
+                    "fee_units": "500000"
+                }
             })
         };
         let settle_body = || {
@@ -8831,6 +8966,9 @@ mod tests {
                 "bundle_b": test_bundle(),
                 "pool_a": "0x1111111111111111111111111111111111111111",
                 "pool_b": "0x2222222222222222222222222222222222222222",
+                "fee_pool": "0x2222222222222222222222222222222222222222",
+                "maker_fee": { "fee_bundle": test_bundle() },
+                "taker_fee": { "fee_bundle": test_bundle() },
             })
         };
         let cancel_body = || {
@@ -8867,6 +9005,20 @@ mod tests {
                 assert!(!err.contains(gated), "{path} still LP-gated under allow_stateless_swap: {err}");
             }
         }
+
+        // CON-01b: `initiator_sig_hex` is REQUIRED. Were it `#[serde(default)]`, a caller that
+        // omitted it would have a zero signature relayed on its behalf and every initiate would
+        // die on chain as `BadInitiatorSig`, with nothing here saying what was missing.
+        let mut missing = initiate_body();
+        missing.as_object_mut().unwrap().remove("initiator_sig_hex");
+        let (status, _body) = call_with_token(&app, "POST", "/swap/initiate", Some(missing), None).await;
+        assert_eq!(status, 422, "a request with no initiator signature must be rejected outright");
+
+        let mut short = initiate_body();
+        short["initiator_sig_hex"] = serde_json::json!("0x1234");
+        let (_status, body) = call_with_token(&app, "POST", "/swap/initiate", Some(short), None).await;
+        let err = body["error"].as_str().unwrap_or_default().to_string();
+        assert!(err.contains("initiator_sig_hex"), "a malformed one must name the field: {err}");
     }
 
     #[tokio::test]
@@ -8883,7 +9035,6 @@ mod tests {
             ("POST", "/submit_raw"),
             ("POST", "/swap/settle"),
             ("POST", "/swap/cancel"),
-            // The DEX pair-settle surfaces belong to the swap layer and ride the same gate.
             ("POST", "/swap/settle_atomic"),
             ("POST", "/dex/transfer/submit"),
         ] {
@@ -8894,10 +9045,18 @@ mod tests {
         // ...and the same DEX routes are still served wherever legacy routing is on (the default),
         // so gating them costs existing DEX deployments nothing.
         let legacy = build_router(test_state());
-        for path in ["/swap/cancel", "/swap/settle_atomic", "/dex/transfer/submit"] {
+        for path in ["/swap/cancel", "/dex/transfer/submit"] {
             let (status, _) = call(&legacy, "POST", path, Some(serde_json::json!({}))).await;
             assert_ne!(status, Sc::NOT_FOUND, "{path} must stay installed for DEX deployments");
         }
+        let (status, _) = call(
+            &legacy,
+            "POST",
+            "/swap/settle_atomic",
+            Some(serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(status, Sc::NOT_FOUND, "atomic settlement is permanently disabled");
 
         let (status, _) = call(
             &app,
@@ -9644,17 +9803,47 @@ mod tests {
 
     #[test]
     fn swap_initiate_join_calldata_carries_full_leg() {
-        use privacy_core::ethereum::{decode_swap_initiate_calldata, decode_swap_join_calldata};
+        use privacy_core::ethereum::decode_swap_join_calldata;
         let bundle = Some(test_bundle());
         let (call, commit) = leg_call_and_commit("bundle_a", &bundle, &None).unwrap();
 
-        let cd = encode_swap_initiate_calldata(
-            &[0xA1u8; 20], &[0xB2u8; 20], &call, &[0x11u8; 32], &[0x22u8; 32], &[0x33u8; 32],
-            1_800_000_000, &[0x44u8; 32],
+        let permit = MatchPermitArgs {
+            permit_nonce: [0x10; 32],
+            expected_initiator: [0x20; 20],
+            expected_commit_b: [0x21; 32],
+            htlc_hash: [0x11; 32],
+            rk_bx: [0x22; 32],
+            rk_by: [0x33; 32],
+            deadline: 1_800_000_000,
+            salt: [0x44; 32],
+            maker: OrderRefArgs {
+                terms_hash: [0x31; 32],
+                auth_key_x: [0x32; 32],
+                auth_key_y: [0x33; 32],
+            },
+            taker: OrderRefArgs {
+                terms_hash: [0x41; 32],
+                auth_key_x: [0x42; 32],
+                auth_key_y: [0x43; 32],
+            },
+            fee_pool: [0xB2; 20],
+            fee_units: [0x05; 32],
+        };
+        let cd = encode_swap_initiate_v2_calldata(
+            &[0xA1u8; 20],
+            &[0xB2u8; 20],
+            &call,
+            &permit,
+            &[0x55; 65],
+            &[[0x66u8; 32], [0x77u8; 32], [0x88u8; 32]],
         );
-        let dec = decode_swap_initiate_calldata(&cd).expect("initiate calldata decodes");
-        assert_eq!(dec.commit_a(), commit, "on-chain commit == relayer-derived commit");
-        assert_eq!(dec.call_a.actions[0].enc_ciphertext, vec![0xCCu8; 580]);
+        assert!(cd.windows(580).any(|word| word == [0xCCu8; 580]));
+        assert!(cd.windows(65).any(|word| word == [0x55u8; 65]));
+        // CON-01b: the initiator's own leg signature has to reach the gateway, or `initiateSwap`
+        // reverts `BadInitiatorSig` for every swap. Three consecutive uint256 words, in order.
+        let initiator_sig: Vec<u8> =
+            [[0x66u8; 32], [0x77u8; 32], [0x88u8; 32]].concat();
+        assert!(cd.windows(96).any(|window| window == initiator_sig.as_slice()));
 
         let jd = encode_swap_join_calldata(&[0x99u8; 32], &call, &[[0x55u8; 32]; 3]);
         let dej = decode_swap_join_calldata(&jd).expect("join calldata decodes");
