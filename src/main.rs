@@ -212,10 +212,31 @@ enum Command {
         /// each request may also override it per-call.
         #[arg(long, env = "PRIVACYBTC_SWAP_COORDINATOR_ADDRESS")]
         swap_coordinator: Option<String>,
-        /// Gas cap for `settle` (two Groth16 verifies + two transfers — the heaviest call).
-        /// `initiateSwap`/`joinSwap` use a smaller cap and are also dynamically estimated.
-        #[arg(long, env = "PRIVACYBTC_GAS_LIMIT_SWAP", default_value_t = 12_000_000)]
+        /// Gas cap for `settle` — by far the heaviest call the relayer signs.
+        ///
+        /// A DEX pair-settle carries BOTH legs AND both sides' fee bundles. Measured on a real
+        /// 1+2+1+1-action settle: maker leg 2_527_841, taker leg 3_150_151, maker fee 2_593_796,
+        /// taker fee 2_593_796 — 10_865_584 for the bundles alone, ~11_862_127 once `DexGateway`
+        /// orchestration (maker first-fill signature check, `feePaid` write) is included, and
+        /// ~12_099_370 after the 2% margin. The former 12_000_000 default sat *just* under that,
+        /// so genuine settles were refused before broadcast and the matcher hung in `settling`
+        /// with no tx and no log. 20_000_000 is what every e2e and restart script already
+        /// exports, and stays under the block gas limit of every deploy target.
+        ///
+        /// `initiateSwap`/`joinSwap`/`cancel` use `--gas-limit-swap-init-join`.
+        #[arg(long, env = "PRIVACYBTC_GAS_LIMIT_SWAP", default_value_t = 20_000_000)]
         gas_limit_swap: u64,
+        /// Gas cap for `initiateSwap` / `joinSwap` / `cancel` — one bundle, no fee legs, so far
+        /// cheaper than `settle` (PERC20 measures `initiateSwap` at up to ~1.9M).
+        ///
+        /// Configurable rather than hardcoded so a heavier coordinator never again needs a
+        /// relayer rebuild to unblock swaps; see [`SWAP_INIT_JOIN_GAS_CAP`] for the default.
+        #[arg(
+            long,
+            env = "PRIVACYBTC_GAS_LIMIT_SWAP_INIT_JOIN",
+            default_value_t = SWAP_INIT_JOIN_GAS_CAP
+        )]
+        gas_limit_swap_init_join: u64,
         /// Optional: enable automatic shield submit from Bitcoin deposits.
         #[arg(long, env = "PRIVACYBTC_BTC_RPC_URL")]
         btc_rpc_url: Option<String>,
@@ -339,6 +360,7 @@ async fn main() -> Result<()> {
             native_eth_gateway,
             swap_coordinator,
             gas_limit_swap,
+            gas_limit_swap_init_join,
             btc_rpc_url,
             deposit_address,
             intent_dir,
@@ -367,6 +389,7 @@ async fn main() -> Result<()> {
                 native_eth_gateway.as_deref(),
                 swap_coordinator.as_deref(),
                 gas_limit_swap,
+                gas_limit_swap_init_join,
                 btc_rpc_url.as_deref(),
                 deposit_address.as_deref(),
                 intent_dir.as_deref(),
@@ -430,7 +453,13 @@ fn validate_gas_policy_config(margin_bps: u64, caps: &[(&str, u64)]) -> Result<(
     Ok(())
 }
 
-fn gas_limit_with_margin(estimated: u64, margin_bps: u64, cap: u64) -> Result<u64> {
+/// The gas limit an estimate needs once the safety margin is applied, BEFORE any cap.
+///
+/// Split out of [`gas_limit_with_margin`] so a caller can log what a transaction actually
+/// requires even when that is over its cap. The over-cap refusal used to be invisible: the
+/// error was raised before anything was printed, so an under-sized cap produced a bare HTTP
+/// error, no log line, and no transaction — see the comment on [`SWAP_INIT_JOIN_GAS_CAP`].
+fn padded_gas_limit(estimated: u64, margin_bps: u64) -> Result<u64> {
     if estimated == 0 {
         return Err(anyhow!("eth_estimateGas returned zero"));
     }
@@ -439,25 +468,85 @@ fn gas_limit_with_margin(estimated: u64, margin_bps: u64, cap: u64) -> Result<u6
             "gas margin must be <= {MAX_GAS_MARGIN_BPS} bps (got {margin_bps})"
         ));
     }
-    if cap == 0 {
-        return Err(anyhow!("gas cap must be greater than zero"));
-    }
     let multiplier = GAS_BPS_DENOMINATOR
         .checked_add(margin_bps)
         .ok_or_else(|| anyhow!("gas margin overflow"))?;
     let numerator = estimated
         .checked_mul(multiplier)
         .ok_or_else(|| anyhow!("gas estimate overflow"))?;
-    let padded = numerator
+    Ok(numerator
         .checked_add(GAS_BPS_DENOMINATOR - 1)
         .ok_or_else(|| anyhow!("gas estimate rounding overflow"))?
-        / GAS_BPS_DENOMINATOR;
+        / GAS_BPS_DENOMINATOR)
+}
+
+/// `knob` names the operation AND the setting that raises its cap, so an over-cap refusal is
+/// self-describing. Without it the operator sees only "above configured cap" and has to guess
+/// which of the five independent caps was the one that fired.
+fn gas_limit_with_margin(knob: &str, estimated: u64, margin_bps: u64, cap: u64) -> Result<u64> {
+    if cap == 0 {
+        return Err(anyhow!("gas cap must be greater than zero"));
+    }
+    let padded = padded_gas_limit(estimated, margin_bps)?;
     if padded > cap {
         return Err(anyhow!(
-            "estimated gas {estimated} with {margin_bps} bps margin requires {padded}, above configured cap {cap}"
+            "{knob}: estimated gas {estimated} with {margin_bps} bps margin requires {padded}, \
+             above configured cap {cap} (short by {shortfall})",
+            shortfall = padded - cap
         ));
     }
     Ok(padded)
+}
+
+/// Cap knob behind each durable-queue request kind, for the same self-describing refusal.
+fn gas_knob_for_kind(kind: &str) -> &'static str {
+    match kind {
+        "transfer" => "transfer (PRIVACYBTC_GAS_LIMIT_TRANSFER)",
+        "wrapped_unshield" | "native_eth_unshield" => "unshield (PRIVACYBTC_GAS_LIMIT_UNSHIELD)",
+        _ => "queued transaction",
+    }
+}
+
+/// Refuse to boot with a gas cap the chain can never mine.
+///
+/// The counterpart to the too-small cap that the gas-policy logging exists to surface: raising
+/// a knob past the block gas limit to "fix" an over-cap refusal just moves the failure later
+/// and makes it less legible — the transaction is signed, broadcast, and never included. A cap
+/// above the block gas limit is always a misconfiguration, so fail closed here. When the limit
+/// cannot be read (odd RPC, non-standard chain) warn and continue: an unknown limit is not
+/// evidence of a bad cap, and refusing to boot on it would be worse than the problem.
+async fn validate_gas_caps_against_chain(
+    rpc: &EthRpcClient,
+    caps: &[(&str, u64)],
+) -> Result<()> {
+    let block_gas_limit = match rpc.block_gas_limit().await {
+        Ok(limit) if limit > 0 => limit,
+        Ok(_) => {
+            eprintln!("[relayer] latest block reports gasLimit=0; skipping gas cap sanity check");
+            return Ok(());
+        }
+        Err(error) => {
+            eprintln!(
+                "[relayer] block gas limit unavailable ({error:#}); skipping gas cap sanity check"
+            );
+            return Ok(());
+        }
+    };
+    for (operation, cap) in caps {
+        if *cap > block_gas_limit {
+            return Err(anyhow!(
+                "gas cap for {operation} is {cap}, above the chain's block gas limit \
+                 {block_gas_limit}; a transaction signed at that limit can never be mined"
+            ));
+        }
+    }
+    let rendered = caps
+        .iter()
+        .map(|(operation, cap)| format!("{operation}={cap}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    eprintln!("[relayer] gas caps within block gas limit {block_gas_limit}: {rendered}");
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -620,6 +709,8 @@ struct RelayerHttpConfig {
     swap_coordinator: Option<String>,
     /// Gas limit for `settle` (heaviest swap call).
     gas_limit_swap: u64,
+    /// Gas limit for `initiateSwap` / `joinSwap` / `cancel`.
+    gas_limit_swap_init_join: u64,
     auto_shield: Option<AutoShieldConfig>,
     auto_transfer: Option<AutoTransferConfig>,
     /// WIF-encoded secp256k1 private key for the federation payout wallet.
@@ -1441,6 +1532,7 @@ async fn run_http_server(
     native_eth_gateway: Option<&str>,
     swap_coordinator: Option<&str>,
     gas_limit_swap: u64,
+    gas_limit_swap_init_join: u64,
     btc_rpc_url: Option<&str>,
     deposit_address: Option<&str>,
     intent_dir: Option<&Path>,
@@ -1451,17 +1543,17 @@ async fn run_http_server(
     btc_payout_evm_confirmations: u64,
     indexer_url: Option<String>,
 ) -> Result<()> {
-    validate_gas_policy_config(
-        gas_limit_margin_bps,
-        &[
-            ("shield", gas_limit_shield),
-            ("unshield", gas_limit_unshield),
-            ("transfer", gas_limit_transfer),
-            ("swap", gas_limit_swap),
-        ],
-    )?;
+    let gas_caps = [
+        ("shield", gas_limit_shield),
+        ("unshield", gas_limit_unshield),
+        ("transfer", gas_limit_transfer),
+        ("swap settle", gas_limit_swap),
+        ("swap initiate/join", gas_limit_swap_init_join),
+    ];
+    validate_gas_policy_config(gas_limit_margin_bps, &gas_caps)?;
     let protocol = protocol_expectation_from_env(contract)?;
     let rpc = EthRpcClient::new(rpc_url.to_string());
+    validate_gas_caps_against_chain(&rpc, &gas_caps).await?;
     for pool in &protocol.pools {
         rpc.verify_pool_protocol(pool, protocol.version, &protocol.verifier_set_id)
             .await
@@ -1655,6 +1747,7 @@ async fn run_http_server(
         native_eth_gateway,
         swap_coordinator,
         gas_limit_swap,
+        gas_limit_swap_init_join,
         auto_shield,
         auto_transfer,
         btc_payout_wif: btc_payout_wif.map(|s| s.to_string()),
@@ -2362,6 +2455,7 @@ async fn http_submit_raw(
         value,
         cfg.gas_price_gwei,
         policy.max_gas,
+        "submit_raw policy max_gas (PRIVACYBTC_SUBMIT_RAW_POLICIES)",
         cfg.gas_limit_margin_bps,
         &cfg.nonce_cache,
     )
@@ -2596,7 +2690,13 @@ fn bundle_binding_proof(bundle: &OrchardStoredBundle) -> Result<[[u8; 32]; 8]> {
 /// log, no transaction on chain, and a matcher session that looked perfectly healthy.
 ///
 /// 4_000_000 keeps ~2.6x headroom over that measurement and still sits well under the `settle`
-/// budget (`--gas-limit-swap`, 12M by default), which is what the original constant was for.
+/// budget (`--gas-limit-swap`, 20M by default), which is what the original constant was for.
+///
+/// It is now only the DEFAULT for `--gas-limit-swap-init-join`
+/// (`PRIVACYBTC_GAS_LIMIT_SWAP_INIT_JOIN`). Leaving it hardcoded meant the one cap this comment
+/// warns about could only be raised by rebuilding the relayer — and the identical failure then
+/// recurred on the *settle* cap, which was configurable but shipped too low. Both are now
+/// settings, both are validated at boot, and both print `required=` before they refuse.
 const SWAP_INIT_JOIN_GAS_CAP: u64 = 4_000_000;
 
 /// Build a `PrivacyCall` (actions + Binding proof) from a proved bundle.
@@ -3527,7 +3627,8 @@ async fn http_swap_initiate(
             calldata,
             0,
             cfg.gas_price_gwei,
-            SWAP_INIT_JOIN_GAS_CAP,
+            cfg.gas_limit_swap_init_join,
+            "swap initiate/join (PRIVACYBTC_GAS_LIMIT_SWAP_INIT_JOIN)",
             cfg.gas_limit_margin_bps,
             &cfg.nonce_cache,
         )
@@ -3610,7 +3711,8 @@ async fn http_swap_join(
             calldata,
             0,
             cfg.gas_price_gwei,
-            SWAP_INIT_JOIN_GAS_CAP,
+            cfg.gas_limit_swap_init_join,
+            "swap initiate/join (PRIVACYBTC_GAS_LIMIT_SWAP_INIT_JOIN)",
             cfg.gas_limit_margin_bps,
             &cfg.nonce_cache,
         )
@@ -3750,6 +3852,7 @@ async fn http_dex_transfer_submit(
         0,
         cfg.gas_price_gwei,
         cfg.gas_limit_transfer,
+        "transfer (PRIVACYBTC_GAS_LIMIT_TRANSFER)",
         cfg.gas_limit_margin_bps,
         &cfg.nonce_cache,
     )
@@ -3849,6 +3952,7 @@ async fn http_swap_settle(
         0,
         cfg.gas_price_gwei,
         cfg.gas_limit_swap,
+        "swap settle (PRIVACYBTC_GAS_LIMIT_SWAP)",
         cfg.gas_limit_margin_bps,
         &cfg.nonce_cache,
     )
@@ -3921,7 +4025,8 @@ async fn http_swap_cancel(
         encode_swap_cancel_calldata(&swap_id),
         0,
         cfg.gas_price_gwei,
-        SWAP_INIT_JOIN_GAS_CAP,
+        cfg.gas_limit_swap_init_join,
+        "swap cancel (PRIVACYBTC_GAS_LIMIT_SWAP_INIT_JOIN)",
         cfg.gas_limit_margin_bps,
         &cfg.nonce_cache,
     )
@@ -4077,6 +4182,7 @@ async fn prepare_and_broadcast_queue_job(
             .estimate_gas(sender_hex, &job.target, &job.calldata, job.value)
             .await?;
         let gas_limit = gas_limit_with_margin(
+            gas_knob_for_kind(&job.kind),
             estimated,
             job.gas_margin_bps,
             job.gas_cap,
@@ -4548,6 +4654,9 @@ async fn send_raw_calldata(
     value: u64,
     gas_price_gwei: f64,
     gas_limit_cap: u64,
+    // Operation name plus the setting that raises `gas_limit_cap`, echoed into both the gas
+    // policy log line and the over-cap error.
+    gas_knob: &str,
     gas_limit_margin_bps: u64,
     nonce_cache: &Arc<Mutex<Option<u64>>>,
 ) -> Result<String> {
@@ -4559,14 +4668,20 @@ async fn send_raw_calldata(
     let estimated = client
         .estimate_gas(&sender_hex, &contract, &calldata, value)
         .await?;
-    let gas_limit = gas_limit_with_margin(estimated, gas_limit_margin_bps, gas_limit_cap)?;
     let selector = calldata
         .get(..4)
         .map(hex::encode)
         .unwrap_or_else(|| "short".to_string());
+    // Log BEFORE enforcing the cap. This line used to sit after `gas_limit_with_margin`, which
+    // returns an error on an over-cap estimate — so a cap that was merely too small produced a
+    // bare HTTP error, NOTHING in the relayer log, and no transaction on chain. That is exactly
+    // how a 12M `settle` cap against an ~12.1M requirement presented: both parties stuck in
+    // `settling`, no settle tx, no clue. `required` is what the transaction actually needs.
+    let required = padded_gas_limit(estimated, gas_limit_margin_bps)?;
     eprintln!(
-        "[relayer] gas policy selector=0x{selector} estimate={estimated} margin_bps={gas_limit_margin_bps} signed_limit={gas_limit} cap={gas_limit_cap}"
+        "[relayer] gas policy op=\"{gas_knob}\" selector=0x{selector} estimate={estimated} margin_bps={gas_limit_margin_bps} required={required} cap={gas_limit_cap}"
     );
+    let gas_limit = gas_limit_with_margin(gas_knob, estimated, gas_limit_margin_bps, gas_limit_cap)?;
     // Dynamic EIP-1559 (type-2) fees: pay ~baseFee+tip, cap maxFee at baseFee*2+tip.
     let (max_priority_fee, max_fee) = client.suggest_eip1559_fees(gas_price_gwei).await;
     let _signer_lane = EVM_SIGNER_LANE.lock().await;
@@ -4968,6 +5083,7 @@ async fn submit_shield_bundle(
         0,
         gas_price_gwei,
         gas_limit_cap,
+        "shield (PRIVACYBTC_GAS_LIMIT_SHIELD / --gas-limit)",
         gas_limit_margin_bps,
         nonce_cache,
     )
@@ -5011,6 +5127,7 @@ async fn submit_transfer_bundle(
         0,
         gas_price_gwei,
         gas_limit_cap,
+        "transfer (PRIVACYBTC_GAS_LIMIT_TRANSFER)",
         gas_limit_margin_bps,
         nonce_cache,
     )
@@ -5144,6 +5261,7 @@ async fn submit_unshield_bundle(
         0,
         gas_price_gwei,
         gas_limit_cap,
+        "unshield (PRIVACYBTC_GAS_LIMIT_UNSHIELD)",
         gas_limit_margin_bps,
         nonce_cache,
     )
@@ -5181,6 +5299,7 @@ async fn unshield_finalize_submit(
         0,
         gas_price_gwei,
         gas_limit_cap,
+        "unshield finalize (PRIVACYBTC_GAS_LIMIT_UNSHIELD / --gas-limit)",
         gas_limit_margin_bps,
         nonce_cache,
     )
@@ -5866,6 +5985,19 @@ impl EthRpcClient {
         parse_hex_u64(bf)
     }
 
+    /// `gasLimit` of the latest block — the hard ceiling on any single transaction. Used at
+    /// boot to reject a configured gas cap the chain could never mine.
+    async fn block_gas_limit(&self) -> Result<u64> {
+        let block: Value = self
+            .rpc_call("eth_getBlockByNumber", serde_json::json!(["latest", false]))
+            .await?;
+        let raw = block
+            .get("gasLimit")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("gasLimit missing from latest block"))?;
+        parse_hex_u64(raw)
+    }
+
     /// Suggest dynamic EIP-1559 fees `(maxPriorityFeePerGas, maxFeePerGas)` in wei.
     ///
     /// Pays ~`baseFee + tip` (cheap when the network is quiet) while capping `maxFee`
@@ -6460,7 +6592,8 @@ mod tests {
             native_eth_pool: Some("0x1111111111111111111111111111111111111111".into()),
             native_eth_gateway: Some("0x3333333333333333333333333333333333333333".into()),
             swap_coordinator: Some("0xc".into()),
-            gas_limit_swap: 12_000_000,
+            gas_limit_swap: 20_000_000,
+            gas_limit_swap_init_join: SWAP_INIT_JOIN_GAS_CAP,
             auto_shield: None,
             auto_transfer: None,
             btc_payout_wif: None,
@@ -6523,14 +6656,59 @@ mod tests {
 
     #[test]
     fn dynamic_gas_policy_rounds_up_and_enforces_cap() {
+        let knob = "transfer (PRIVACYBTC_GAS_LIMIT_TRANSFER)";
         assert_eq!(
-            gas_limit_with_margin(4_000_000, DEFAULT_GAS_MARGIN_BPS, 5_000_000).unwrap(),
+            gas_limit_with_margin(knob, 4_000_000, DEFAULT_GAS_MARGIN_BPS, 5_000_000).unwrap(),
             4_080_000
         );
-        assert_eq!(gas_limit_with_margin(1, 1, 2).unwrap(), 2);
-        assert!(gas_limit_with_margin(4_000_000, DEFAULT_GAS_MARGIN_BPS, 4_079_999).is_err());
-        assert!(gas_limit_with_margin(0, DEFAULT_GAS_MARGIN_BPS, 5_000_000).is_err());
-        assert!(gas_limit_with_margin(1, MAX_GAS_MARGIN_BPS + 1, 2).is_err());
+        assert_eq!(gas_limit_with_margin(knob, 1, 1, 2).unwrap(), 2);
+        assert!(gas_limit_with_margin(knob, 4_000_000, DEFAULT_GAS_MARGIN_BPS, 4_079_999).is_err());
+        assert!(gas_limit_with_margin(knob, 0, DEFAULT_GAS_MARGIN_BPS, 5_000_000).is_err());
+        assert!(gas_limit_with_margin(knob, 1, MAX_GAS_MARGIN_BPS + 1, 2).is_err());
+    }
+
+    /// An over-cap refusal must name the setting to raise and the exact shortfall. Both are
+    /// what the 12M `settle` cap incident had to be reverse-engineered from RPC replays.
+    #[test]
+    fn over_cap_refusal_names_the_knob_and_the_shortfall() {
+        let error = gas_limit_with_margin(
+            "swap settle (PRIVACYBTC_GAS_LIMIT_SWAP)",
+            11_862_127,
+            DEFAULT_GAS_MARGIN_BPS,
+            12_000_000,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("PRIVACYBTC_GAS_LIMIT_SWAP"), "{error}");
+        assert!(error.contains("above configured cap 12000000"), "{error}");
+        assert!(error.contains("short by 99370"), "{error}");
+    }
+
+    /// The settle measured in that incident must fit the shipped default with room to spare.
+    /// `test_state` mirrors the `--gas-limit-swap` default, so this pins both together.
+    #[test]
+    fn shipped_settle_cap_covers_a_full_pair_settle_with_both_fee_bundles() {
+        let shipped_default = test_state().gas_limit_swap;
+        assert_eq!(
+            gas_limit_with_margin(
+                "swap settle (PRIVACYBTC_GAS_LIMIT_SWAP)",
+                11_862_127,
+                DEFAULT_GAS_MARGIN_BPS,
+                shipped_default,
+            )
+            .unwrap(),
+            12_099_370
+        );
+    }
+
+    #[test]
+    fn queue_kinds_map_to_their_cap_setting() {
+        assert!(gas_knob_for_kind("transfer").contains("PRIVACYBTC_GAS_LIMIT_TRANSFER"));
+        assert!(gas_knob_for_kind("wrapped_unshield").contains("PRIVACYBTC_GAS_LIMIT_UNSHIELD"));
+        assert!(
+            gas_knob_for_kind("native_eth_unshield").contains("PRIVACYBTC_GAS_LIMIT_UNSHIELD")
+        );
+        assert_eq!(gas_knob_for_kind("something_new"), "queued transaction");
     }
 
     #[test]
@@ -6541,6 +6719,11 @@ mod tests {
         )
         .is_ok());
         assert!(validate_gas_policy_config(DEFAULT_GAS_MARGIN_BPS, &[("transfer", 0)]).is_err());
+        assert!(validate_gas_policy_config(
+            DEFAULT_GAS_MARGIN_BPS,
+            &[("swap settle", 20_000_000), ("swap initiate/join", SWAP_INIT_JOIN_GAS_CAP)]
+        )
+        .is_ok());
         assert!(
             validate_gas_policy_config(MAX_GAS_MARGIN_BPS + 1, &[("transfer", 5_000_000)])
                 .is_err()
