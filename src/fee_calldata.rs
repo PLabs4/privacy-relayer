@@ -86,7 +86,7 @@ const LEGACY_TRANSFER_WITH_FEE_SIG: &[u8] =
 const TRANSFER_WITH_FEE_SIG: &[u8] =
     b"transferWithFee(address,address,(bytes,uint256[8]),(bytes,uint256[8]))";
 const SWAP_CANCEL_SIG: &[u8] = b"cancel(bytes32)";
-const SWAP_INITIATE_V2_SIG: &[u8] = b"initiateSwap(address,address,(bytes,uint256[8]),(bytes32,address,bytes32,bytes32,uint256,uint256,uint64,bytes32,(bytes32,uint256,uint256),(bytes32,uint256,uint256),address,uint256),bytes)";
+const SWAP_INITIATE_V2_SIG: &[u8] = b"initiateSwap(address,address,(bytes,uint256[8]),(bytes32,address,bytes32,bytes32,uint256,uint256,uint64,bytes32,(bytes32,uint256,uint256),(bytes32,uint256,uint256),address,uint256),bytes,uint256[3])";
 const SWAP_SETTLE_V2_SIG: &[u8] = b"settle(bytes32,bytes32,(bytes,uint256[8]),(bytes,uint256[8]),((bytes,uint256[8]),uint256[3]),((bytes,uint256[8]),uint256[3]))";
 
 #[derive(Clone, Debug)]
@@ -150,18 +150,23 @@ fn empty_privacy_call_token() -> Token {
     ])
 }
 
+/// A Baby JubJub Schnorr signature `[Rx, Ry, s]` as the ABI's `uint256[3]`.
+fn sig3_token(signature: &[[u8; 32]; 3]) -> Token {
+    Token::FixedArray(
+        signature
+            .iter()
+            .map(|value| Token::Uint(Uint::from_big_endian(value)))
+            .collect(),
+    )
+}
+
 fn order_fee_auth_token(auth: &OrderFeeAuthArgs) -> Token {
     Token::Tuple(vec![
         auth.fee_call
             .as_ref()
             .map(privacy_call_token)
             .unwrap_or_else(empty_privacy_call_token),
-        Token::FixedArray(
-            auth.exempt_sig
-                .iter()
-                .map(|value| Token::Uint(Uint::from_big_endian(value)))
-                .collect(),
-        ),
+        sig3_token(&auth.exempt_sig),
     ])
 }
 
@@ -173,6 +178,7 @@ pub fn encode_swap_initiate_v2_calldata(
     call_a: &PrivacyCallArgs,
     permit: &MatchPermitArgs,
     matcher_signature: &[u8],
+    initiator_sig: &[[u8; 32]; 3],
 ) -> Vec<u8> {
     with_selector(
         selector(SWAP_INITIATE_V2_SIG),
@@ -182,6 +188,7 @@ pub fn encode_swap_initiate_v2_calldata(
             privacy_call_token(call_a),
             match_permit_token(permit),
             Token::Bytes(matcher_signature.to_vec()),
+            sig3_token(initiator_sig),
         ]),
     )
 }

@@ -2582,9 +2582,22 @@ fn bundle_binding_proof(bundle: &OrchardStoredBundle) -> Result<[[u8; 32]; 8]> {
 // without custody risk. The relayer only forwards already-proved bundles
 // (v3 sighash, executor bound by the Binding proof).
 
-/// `initiateSwap`/`joinSwap` only store state (+ verify the joiner's Schnorr); keep them well
-/// under the heavy `settle` budget.
-const SWAP_INIT_JOIN_GAS_CAP: u64 = 1_500_000;
+/// Gas ceiling for `initiateSwap`/`joinSwap`/`cancel`, which are not priced like `settle`.
+///
+/// This used to be 1_500_000 on the reasoning that these calls "only store state (+ verify the
+/// joiner's Schnorr)". That stopped being true twice over: plan-A data availability puts the
+/// WHOLE proved leg in the `initiateSwap`/`joinSwap` calldata (~1.6 KB per leg here, at 16 gas
+/// a byte), and CON-01b added the initiator's Baby JubJub Schnorr check to `initiateSwap` — two
+/// pure-Solidity scalar multiplications. PERC20's own suite measures `initiateSwap` at up to
+/// 1_512_228 gas, already over the old ceiling before the margin is applied.
+///
+/// The symptom was maximally unhelpful: `gas_limit_with_margin` refuses before the "[relayer] gas
+/// policy" line is printed, so a settlement died with a bare 400 and left NOTHING in the relayer
+/// log, no transaction on chain, and a matcher session that looked perfectly healthy.
+///
+/// 4_000_000 keeps ~2.6x headroom over that measurement and still sits well under the `settle`
+/// budget (`--gas-limit-swap`, 12M by default), which is what the original constant was for.
+const SWAP_INIT_JOIN_GAS_CAP: u64 = 4_000_000;
 
 /// Build a `PrivacyCall` (actions + Binding proof) from a proved bundle.
 fn bundle_to_privacy_call(bundle: &OrchardStoredBundle) -> Result<PrivacyCallArgs> {
@@ -2630,9 +2643,30 @@ fn parse_sig96_hex(s: &str) -> Result<[[u8; 32]; 3]> {
     ])
 }
 
+fn parse_sig3_hex(signature: &[String; 3], role: &str) -> Result<[[u8; 32]; 3]> {
+    let mut out = [[0u8; 32]; 3];
+    for (index, value) in signature.iter().enumerate() {
+        out[index] = parse_hex32(value)
+            .with_context(|| format!("{role} exempt_sig_hex[{index}]"))?;
+    }
+    Ok(out)
+}
+
+/// Relay one `DexGateway.OrderFeeAuth` without deciding what it means.
+///
+/// The struct's two halves are NOT mutually exclusive. `DexGateway` reads them as:
+///
+/// * `fee_bundle` alone — a later fill's exemption is impossible, so this is the taker's first
+///   fill (its `joinerSig` already binds it to the swap).
+/// * `fee_bundle` + signature — the MAKER's first fill. The signature is its swap-level
+///   authorization (`orderFirstFillSighash`), the counterpart of the joiner's `joinerSig`: the
+///   initiator's leg otherwise carries no user signature at all, and `expectedInitiator` is an
+///   address the matcher chooses. Rejecting this combination here — as this function used to —
+///   would make that authorization unreachable and every first fill revert.
+/// * signature alone — a later fill, exempt from a second fee bundle.
 fn parse_order_fee_auth(req: &SwapOrderFeeAuthRequest, role: &str) -> Result<OrderFeeAuthArgs> {
     match (&req.fee_bundle, &req.exempt_sig_hex) {
-        (Some(bundle), None) => {
+        (Some(bundle), signature) => {
             let fee_call = bundle_to_privacy_call(bundle)
                 .with_context(|| format!("{role} fee_bundle"))?;
             if fee_call.actions.is_empty() {
@@ -2640,23 +2674,16 @@ fn parse_order_fee_auth(req: &SwapOrderFeeAuthRequest, role: &str) -> Result<Ord
             }
             Ok(OrderFeeAuthArgs {
                 fee_call: Some(fee_call),
-                exempt_sig: [[0u8; 32]; 3],
+                exempt_sig: match signature {
+                    Some(signature) => parse_sig3_hex(signature, role)?,
+                    None => [[0u8; 32]; 3],
+                },
             })
         }
-        (None, Some(signature)) => {
-            let mut exempt_sig = [[0u8; 32]; 3];
-            for (index, value) in signature.iter().enumerate() {
-                exempt_sig[index] = parse_hex32(value)
-                    .with_context(|| format!("{role} exempt_sig_hex[{index}]"))?;
-            }
-            Ok(OrderFeeAuthArgs {
-                fee_call: None,
-                exempt_sig,
-            })
-        }
-        (Some(_), Some(_)) => Err(anyhow!(
-            "{role} fee auth must carry a fee_bundle or an exemption signature, not both"
-        )),
+        (None, Some(signature)) => Ok(OrderFeeAuthArgs {
+            fee_call: None,
+            exempt_sig: parse_sig3_hex(signature, role)?,
+        }),
         (None, None) => Err(anyhow!(
             "{role} fee auth is missing both fee_bundle and exemption signature"
         )),
@@ -3390,6 +3417,11 @@ struct SwapInitiateRequest {
     match_permit: MatchPermitRequest,
     /// Raw secp256k1 `r || s || v` signature (65 bytes) over the gateway permit digest.
     matcher_signature_hex: String,
+    /// The initiator's Baby JubJub Schnorr signature over `DexGateway.initiateSighash` (96-byte
+    /// hex), made under `bundle_a`'s OWN randomised spend-auth key. The mirror of
+    /// `joiner_sig_hex`: it is what proves the caller holds the leg it is opening the swap with,
+    /// and the gateway rejects `initiateSwap` without it.
+    initiator_sig_hex: String,
     /// Optional order-book request id; when present, the order is advanced to `Initiated`
     /// and its `swap_id` recorded so the user can poll `/swap/order` to join.
     #[serde(default)]
@@ -3447,6 +3479,10 @@ async fn http_swap_initiate(
         let salt = parse_hex32(&req.salt_hex).context("salt_hex")?;
         let rk_bx = parse_hex32(&req.rk_bx_hex).context("rk_bx_hex")?;
         let rk_by = parse_hex32(&req.rk_by_hex).context("rk_by_hex")?;
+        // Parsed with the other request bytes, before the permit cross-check: a malformed
+        // signature is the caller's own field to fix, and should say so rather than surface as
+        // whatever check happens to run first.
+        let initiator_sig = parse_sig96_hex(&req.initiator_sig_hex).context("initiator_sig_hex")?;
         let (call_a, commit_a) = leg_call_and_commit("bundle_a", &req.bundle_a, &req.commit_a_hex)?;
         let initiator = relayer_address20(&cfg.private_key)?;
         let permit = parse_match_permit(&req.match_permit)?;
@@ -3481,6 +3517,7 @@ async fn http_swap_initiate(
             &call_a,
             &permit,
             &matcher_signature,
+            &initiator_sig,
         );
         let tx_hash = send_raw_calldata(
             &cfg.rpc_url,
@@ -6223,6 +6260,42 @@ fn rlp_list(items: Vec<Vec<u8>>) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    /// `DexGateway` needs BOTH halves of `OrderFeeAuth` on a maker's first fill: the fee bundle,
+    /// and the swap-level authorization its order signs (`orderFirstFillSighash`) — the
+    /// counterpart of the joiner's `joinerSig`. This parser used to reject that pair outright,
+    /// which would have made the authorization unreachable and every first fill revert.
+    #[test]
+    fn a_first_fill_may_carry_both_a_fee_bundle_and_an_authorization() {
+        // `parse_hex32` is length-exact — these are full 32-byte words, not trimmed ids.
+        let signature = [
+            format!("0x{}", "11".repeat(32)),
+            format!("0x{}", "12".repeat(32)),
+            format!("0x{}", "13".repeat(32)),
+        ];
+
+        // Signature alone: a later fill's exemption.
+        let exempt = parse_order_fee_auth(
+            &SwapOrderFeeAuthRequest { fee_bundle: None, exempt_sig_hex: Some(signature.clone()) },
+            "maker",
+        )
+        .expect("exemption alone is valid");
+        assert!(exempt.fee_call.is_none());
+        assert_eq!(exempt.exempt_sig[0], [0x11u8; 32]);
+
+        // Neither: nothing to relay, and the gateway would revert with a less obvious error.
+        assert!(parse_order_fee_auth(
+            &SwapOrderFeeAuthRequest { fee_bundle: None, exempt_sig_hex: None },
+            "maker",
+        )
+        .is_err());
+
+        // The pair is relayed verbatim — see `parse_order_fee_auth`. A bundle fixture is more
+        // machinery than this is worth, so the combination is covered end-to-end by PERC20's
+        // `test_first_fill_requires_the_makers_own_swap_authorization`; what is pinned here is
+        // that the signature is no longer DROPPED when it arrives beside a bundle.
+        assert_eq!(exempt.exempt_sig, parse_sig3_hex(&signature, "maker").unwrap());
+    }
+
     #[test]
     fn bundle_path_sibling() {
         let p = PathBuf::from("/a/deposit-1.json");
@@ -6888,6 +6961,7 @@ mod tests {
                 "rk_by_hex": format!("0x{}", "44".repeat(32)),
                 "bundle_a": test_bundle(),
                 "matcher_signature_hex": format!("0x{}", "55".repeat(65)),
+                "initiator_sig_hex": format!("0x{}", "66".repeat(96)),
                 "match_permit": {
                     "permit_nonce": format!("0x{}", "10".repeat(32)),
                     "expected_initiator": "0x3333333333333333333333333333333333333333",
@@ -6959,6 +7033,20 @@ mod tests {
                 assert!(!err.contains(gated), "{path} still LP-gated under allow_stateless_swap: {err}");
             }
         }
+
+        // CON-01b: `initiator_sig_hex` is REQUIRED. Were it `#[serde(default)]`, a caller that
+        // omitted it would have a zero signature relayed on its behalf and every initiate would
+        // die on chain as `BadInitiatorSig`, with nothing here saying what was missing.
+        let mut missing = initiate_body();
+        missing.as_object_mut().unwrap().remove("initiator_sig_hex");
+        let (status, _body) = call_with_token(&app, "POST", "/swap/initiate", Some(missing), None).await;
+        assert_eq!(status, 422, "a request with no initiator signature must be rejected outright");
+
+        let mut short = initiate_body();
+        short["initiator_sig_hex"] = serde_json::json!("0x1234");
+        let (_status, body) = call_with_token(&app, "POST", "/swap/initiate", Some(short), None).await;
+        let err = body["error"].as_str().unwrap_or_default().to_string();
+        assert!(err.contains("initiator_sig_hex"), "a malformed one must name the field: {err}");
     }
 
     #[tokio::test]
@@ -7739,9 +7827,15 @@ mod tests {
             &call,
             &permit,
             &[0x55; 65],
+            &[[0x66u8; 32], [0x77u8; 32], [0x88u8; 32]],
         );
         assert!(cd.windows(580).any(|word| word == [0xCCu8; 580]));
         assert!(cd.windows(65).any(|word| word == [0x55u8; 65]));
+        // CON-01b: the initiator's own leg signature has to reach the gateway, or `initiateSwap`
+        // reverts `BadInitiatorSig` for every swap. Three consecutive uint256 words, in order.
+        let initiator_sig: Vec<u8> =
+            [[0x66u8; 32], [0x77u8; 32], [0x88u8; 32]].concat();
+        assert!(cd.windows(96).any(|window| window == initiator_sig.as_slice()));
 
         let jd = encode_swap_join_calldata(&[0x99u8; 32], &call, &[[0x55u8; 32]; 3]);
         let dej = decode_swap_join_calldata(&jd).expect("join calldata decodes");
