@@ -505,6 +505,8 @@ fn gas_knob_for_kind(kind: &str) -> &'static str {
     match kind {
         "transfer" => "transfer (PRIVACYBTC_GAS_LIMIT_TRANSFER)",
         "wrapped_unshield" | "native_eth_unshield" => "unshield (PRIVACYBTC_GAS_LIMIT_UNSHIELD)",
+        "privacy_buy" => "privacy buy (PRIVACYBTC_GAS_LIMIT_PRIVACY_BUY)",
+        "privacy_swap" => "privacy swap (PRIVACYBTC_GAS_LIMIT_PRIVACY_SWAP)",
         _ => "queued transaction",
     }
 }
@@ -3368,9 +3370,13 @@ async fn http_privacy_buy(
         .estimate_gas(&sender, &config.coordinator, &calldata, 0)
         .await
         .map_err(http_error)?;
-    let _signed_gas_limit =
-        gas_limit_with_margin(estimated, cfg.gas_limit_margin_bps, config.gas_limit)
-            .map_err(http_error)?;
+    let _signed_gas_limit = gas_limit_with_margin(
+        gas_knob_for_kind("privacy_buy"),
+        estimated,
+        cfg.gas_limit_margin_bps,
+        config.gas_limit,
+    )
+    .map_err(http_error)?;
     let nullifiers = privacy_buy_nullifiers(&config, &req.unshield_bundle, &req.shield_bundle)
         .map_err(http_error)?;
     let admission_block = client
@@ -3606,8 +3612,13 @@ async fn http_privacy_swap(
         .estimate_gas(&sender, &config.coordinator, &calldata, 0)
         .await
         .map_err(http_error)?;
-    gas_limit_with_margin(estimated, cfg.gas_limit_margin_bps, config.gas_limit)
-        .map_err(http_error)?;
+    gas_limit_with_margin(
+        gas_knob_for_kind("privacy_swap"),
+        estimated,
+        cfg.gas_limit_margin_bps,
+        config.gas_limit,
+    )
+    .map_err(http_error)?;
     let nullifiers =
         privacy_swap_nullifiers(&config, &req.unshield_bundle, &req.shield_bundle)
             .map_err(http_error)?;
@@ -8665,6 +8676,8 @@ mod tests {
         assert!(
             gas_knob_for_kind("native_eth_unshield").contains("PRIVACYBTC_GAS_LIMIT_UNSHIELD")
         );
+        assert!(gas_knob_for_kind("privacy_buy").contains("PRIVACYBTC_GAS_LIMIT_PRIVACY_BUY"));
+        assert!(gas_knob_for_kind("privacy_swap").contains("PRIVACYBTC_GAS_LIMIT_PRIVACY_SWAP"));
         assert_eq!(gas_knob_for_kind("something_new"), "queued transaction");
     }
 
