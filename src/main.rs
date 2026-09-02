@@ -732,7 +732,7 @@ struct RelayerHttpConfig {
     tx_queue_notify: Arc<Notify>,
     /// Bounds RPC-heavy frozen-root/screening validation before a request reaches the queue.
     tx_validation_slots: Arc<Semaphore>,
-    /// Rolling request/gas budget for `/transfer/submit` and `/wrapped/unshield/submit`.
+    /// Rolling request/gas budget for supported typed endpoints and DEX gas sponsorship.
     tx_queue_limiter: Arc<Mutex<SubmitRawLimiter>>,
     tx_queue_trusted_proxy_ips: HashSet<IpAddr>,
     http_body_limit_bytes: usize,
@@ -3540,9 +3540,22 @@ struct SwapInitiateResponse {
 /// so the caller can drive `joinSwap`/`settle` without parsing the receipt.
 async fn http_swap_initiate(
     State(cfg): State<Arc<RelayerHttpConfig>>,
+    peer: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     Json(req): Json<SwapInitiateRequest>,
 ) -> Result<Json<SwapInitiateResponse>, (StatusCode, Json<HttpErrorResponse>)> {
+    reserve_typed_request_budget(
+        &cfg,
+        &headers,
+        peer.map(|ConnectInfo(address)| address),
+        cfg.gas_limit_swap_init_join,
+    )
+    .await?;
+    let _validation_permit = cfg
+        .tx_validation_slots
+        .acquire()
+        .await
+        .map_err(|_| http_error(anyhow!("transaction validation pool is closed")))?;
     async {
         // Stateless (DEX) callers have no LP order to point at: a CLOB match is arranged by the
         // matcher, not by the offer/accept book, so `request_id` is optional under
@@ -3683,8 +3696,22 @@ struct SwapJoinRequest {
 /// independent of `msg.sender`.
 async fn http_swap_join(
     State(cfg): State<Arc<RelayerHttpConfig>>,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
     Json(req): Json<SwapJoinRequest>,
 ) -> Result<Json<HttpTxResponse>, (StatusCode, Json<HttpErrorResponse>)> {
+    reserve_typed_request_budget(
+        &cfg,
+        &headers,
+        peer.map(|ConnectInfo(address)| address),
+        cfg.gas_limit_swap_init_join,
+    )
+    .await?;
+    let _validation_permit = cfg
+        .tx_validation_slots
+        .acquire()
+        .await
+        .map_err(|_| http_error(anyhow!("transaction validation pool is closed")))?;
     async {
         let coordinator = resolve_coordinator(&cfg, &req.coordinator)?;
         let swap_id = parse_hex32(&req.swap_id_hex).context("swap_id_hex")?;
@@ -3827,16 +3854,31 @@ struct DexTransferSubmitRequest {
 /// DEX-only NEW route. It is NOT a variant of `/transfer/submit`, which is the wallet's
 /// **sponsored** path: that one requires a `Perc20FeeGateway` plus a pUSDC fee bundle so the user
 /// pays for their own gas. The DEX's balanceOf/order bundles have no fee leg — the relayer eats
-/// the gas on a dev stack — so they need the plain pool entrypoint. Keeping them apart means the
-/// wallet's fee accounting cannot be bypassed by posting to the DEX route: this one is reachable
-/// only for pools in `PROTOCOL_POOLS`, and it never touches the gateway.
+/// the gas under the bounded DEX admission budget — so they need the plain pool entrypoint.
+/// Keeping them apart means the wallet's fee accounting cannot be bypassed by posting to the DEX
+/// route: this one is reachable only for pools in `PROTOCOL_POOLS`, and it never touches the
+/// gateway.
 ///
 /// Compliance parity with `/transfer/submit`: same `ensure_protocol_pool` + `enforce_frozen_compliance`
 /// preflight, so this is not a weaker door standing next to a stronger one.
 async fn http_dex_transfer_submit(
     State(cfg): State<Arc<RelayerHttpConfig>>,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
     Json(req): Json<DexTransferSubmitRequest>,
 ) -> Result<Json<HttpTxResponse>, (StatusCode, Json<HttpErrorResponse>)> {
+    reserve_typed_request_budget(
+        &cfg,
+        &headers,
+        peer.map(|ConnectInfo(address)| address),
+        cfg.gas_limit_transfer,
+    )
+    .await?;
+    let _validation_permit = cfg
+        .tx_validation_slots
+        .acquire()
+        .await
+        .map_err(|_| http_error(anyhow!("transaction validation pool is closed")))?;
     let contract = cfg.ensure_protocol_pool(&req.contract).map_err(http_error)?;
     enforce_frozen_compliance(&cfg.rpc_url, &contract, &req.bundle)
         .await
@@ -3873,9 +3915,22 @@ async fn http_dex_transfer_submit(
 /// `settle(swapId, secret, callA, callB)` — relayer-signed; atomically executes both legs.
 async fn http_swap_settle(
     State(cfg): State<Arc<RelayerHttpConfig>>,
+    peer: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     Json(req): Json<SwapSettleRequest>,
 ) -> Result<Json<HttpTxResponse>, (StatusCode, Json<HttpErrorResponse>)> {
+    reserve_typed_request_budget(
+        &cfg,
+        &headers,
+        peer.map(|ConnectInfo(address)| address),
+        cfg.gas_limit_swap,
+    )
+    .await?;
+    let _validation_permit = cfg
+        .tx_validation_slots
+        .acquire()
+        .await
+        .map_err(|_| http_error(anyhow!("transaction validation pool is closed")))?;
     // See `http_swap_initiate`: under `allow_stateless_swap` a DEX caller settles a swap that
     // never had an LP order, so the token gate and the `Joined`-order cross-check are skipped
     // and `request_id` is optional. The HTLC itself is unchanged — the on-chain `settle` still
@@ -4008,9 +4063,22 @@ async fn http_swap_settle(
 /// this route only authenticates access in LP mode and signs the one-word calldata.
 async fn http_swap_cancel(
     State(cfg): State<Arc<RelayerHttpConfig>>,
+    peer: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     Json(req): Json<SwapCancelRequest>,
 ) -> Result<Json<HttpTxResponse>, (StatusCode, Json<HttpErrorResponse>)> {
+    reserve_typed_request_budget(
+        &cfg,
+        &headers,
+        peer.map(|ConnectInfo(address)| address),
+        cfg.gas_limit_swap_init_join,
+    )
+    .await?;
+    let _validation_permit = cfg
+        .tx_validation_slots
+        .acquire()
+        .await
+        .map_err(|_| http_error(anyhow!("transaction validation pool is closed")))?;
     if !cfg.allow_stateless_swap {
         require_lp_token(&cfg, &headers)?;
     }
@@ -7122,6 +7190,75 @@ mod tests {
         .await;
         assert_eq!(status, Sc::BAD_REQUEST);
         assert!(body["error"].as_str().unwrap().contains("disabled"));
+    }
+
+    #[tokio::test]
+    async fn dex_write_routes_answer_browser_preflight_for_the_configured_origin() {
+        let app = build_router(test_state());
+        for path in [
+            "/dex/transfer/submit",
+            "/swap/initiate",
+            "/swap/join",
+            "/swap/settle",
+            "/swap/cancel",
+        ] {
+            let request = Request::builder()
+                .method("OPTIONS")
+                .uri(path)
+                .header("origin", "http://localhost:5173")
+                .header("access-control-request-method", "POST")
+                .header("access-control-request-headers", "content-type")
+                .body(Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), Sc::OK, "preflight failed for {path}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get("access-control-allow-origin")
+                    .and_then(|value| value.to_str().ok()),
+                Some("http://localhost:5173"),
+                "preflight origin missing for {path}"
+            );
+            assert!(
+                response
+                    .headers()
+                    .get("access-control-allow-methods")
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|value| value.contains("POST")),
+                "preflight method missing for {path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn dex_write_route_reserves_budget_before_rpc_or_broadcast() {
+        let mut cfg = (*test_state()).clone();
+        cfg.tx_queue_limiter = Arc::new(Mutex::new(SubmitRawLimiter::new_scoped(
+            SubmitRawLimitConfig {
+                window_secs: 3_600,
+                global_max_requests: 1,
+                client_max_requests: 1,
+                global_max_gas: 1,
+                client_max_gas: 1,
+            },
+            "typed transaction queue",
+        )));
+        let app = build_router(Arc::new(cfg));
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/swap/cancel",
+            Some(serde_json::json!({
+                "swap_id_hex": format!("0x{}", "55".repeat(32)),
+            })),
+        )
+        .await;
+        assert_eq!(status, Sc::TOO_MANY_REQUESTS);
+        assert_eq!(body["code"], "SUBMIT_RAW_RATE_LIMITED");
+        assert!(body["error"]
+            .as_str()
+            .is_some_and(|value| value.contains("rolling budget exhausted")));
     }
 
     /// The DEX's 3-tx HTLC flow (`initiateSwap` → `joinSwap` → `settle`, with timeout
