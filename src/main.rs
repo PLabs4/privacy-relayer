@@ -6695,7 +6695,7 @@ mod tests {
             ))),
             tx_queue_trusted_proxy_ips: HashSet::new(),
             http_body_limit_bytes: 2 * 1024 * 1024,
-            screening: Arc::new(screening::ScreeningConfig::from_env()),
+            screening: Arc::new(screening::ScreeningConfig::disabled_for_tests()),
             swap_book: Arc::new(Mutex::new(SwapBook::default())),
             swap_book_path: None,
             submit_raw_allowlist: SubmitRawAllowlist::default(),
