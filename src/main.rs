@@ -2058,6 +2058,31 @@ fn enforce_eip1559_fee_cap(
     Ok((priority_fee, max_fee))
 }
 
+fn eip1559_fee_quote(
+    chain_id: u64,
+    base_fee: Option<u64>,
+    fallback_gwei: f64,
+) -> Result<(u128, u128)> {
+    if chain_id == 4663 {
+        // Robinhood's sequencer does not need Ethereum's fixed 1 gwei tip.
+        // Keep a positive one-wei tip for the queue's existing envelope guard,
+        // and 10% integer-rounded headroom. The configured absolute cap still
+        // rejects a spike; unavailable live fees must never trigger a fallback.
+        let base = u128::from(base_fee.context("Robinhood requires a live base fee")?);
+        let maximum = (base * 11_000 + 9_999) / 10_000 + 1;
+        return Ok((1, maximum));
+    }
+    // Preserve the existing pricing policy on every other chain.
+    const TIP_WEI: u128 = 1_000_000_000;
+    Ok(match base_fee {
+        Some(base) => (TIP_WEI, u128::from(base) * 2 + TIP_WEI),
+        None => {
+            let flat = (fallback_gwei * 1_000_000_000.0) as u128;
+            (TIP_WEI.min(flat.max(1)), flat.max(TIP_WEI))
+        }
+    })
+}
+
 fn tx_queue_limit_config_from_env() -> Result<SubmitRawLimitConfig> {
     let cfg = SubmitRawLimitConfig {
         window_secs: positive_env_u64("PRIVACYBTC_TX_QUEUE_WINDOW_SECS", 60)?,
@@ -5726,7 +5751,18 @@ async fn prepare_and_broadcast_queue_job(
         );
         return true;
     }
-    let suggested_fees = client.suggest_eip1559_fees(cfg.gas_price_gwei).await;
+    let suggested_fees = match client
+        .suggest_eip1559_fees(cfg.chain_id, cfg.gas_price_gwei)
+        .await
+    {
+        Ok(fees) => fees,
+        Err(_) => {
+            // No signature or prepare-attempt consumption on an unavailable
+            // live fee quote. The durable queued request remains retryable.
+            eprintln!("[tx-queue] live fee quote unavailable request={}", job.request_id);
+            return false;
+        }
+    };
     let (max_priority_fee, max_fee) = match enforce_eip1559_fee_cap(
         suggested_fees.0,
         suggested_fees.1,
@@ -6272,8 +6308,16 @@ async fn replace_pending_job(
         }
     }
 
-    let (suggested_priority, suggested_max) =
-        client.suggest_eip1559_fees(cfg.gas_price_gwei).await;
+    let (suggested_priority, suggested_max) = match client
+        .suggest_eip1559_fees(cfg.chain_id, cfg.gas_price_gwei)
+        .await
+    {
+        Ok(fees) => fees,
+        Err(_) => {
+            eprintln!("[tx-queue] replacement live fee quote unavailable request={}", pending.request_id);
+            return false;
+        }
+    };
     let bumped_priority = bump_eip1559_fee(pending.max_priority_fee).max(suggested_priority);
     let bumped_max = bump_eip1559_fee(pending.max_fee)
         .max(suggested_max)
@@ -6438,8 +6482,10 @@ async fn send_raw_calldata(
         "[relayer] gas policy op=\"{gas_knob}\" selector=0x{selector} estimate={estimated} margin_bps={gas_limit_margin_bps} required={required} cap={gas_limit_cap}"
     );
     let gas_limit = gas_limit_with_margin(gas_knob, estimated, gas_limit_margin_bps, gas_limit_cap)?;
-    // Dynamic EIP-1559 (type-2) fees: pay ~baseFee+tip, cap maxFee at baseFee*2+tip.
-    let (max_priority_fee, max_fee) = client.suggest_eip1559_fees(gas_price_gwei).await;
+    // Use the same chain-aware EIP-1559 quote as the durable queue.
+    let (max_priority_fee, max_fee) = client
+        .suggest_eip1559_fees(chain_id, gas_price_gwei)
+        .await?;
     let _signer_lane = EVM_SIGNER_LANE.lock().await;
     send_raw_with_nonce_retry(&client, &sender_hex, nonce_cache, |nonce| {
         build_and_sign_eip1559_tx(
@@ -7979,22 +8025,10 @@ impl EthRpcClient {
 
     /// Suggest dynamic EIP-1559 fees `(maxPriorityFeePerGas, maxFeePerGas)` in wei.
     ///
-    /// Pays ~`baseFee + tip` (cheap when the network is quiet) while capping `maxFee`
-    /// at `baseFee*2 + tip` so the tx still lands if the base fee rises a bit before
-    /// inclusion. If the base fee can't be read, falls back to a flat `fallback_gwei`.
-    async fn suggest_eip1559_fees(&self, fallback_gwei: f64) -> (u128, u128) {
-        const TIP_WEI: u128 = 1_000_000_000; // 1 gwei priority fee
-        match self.base_fee_per_gas().await {
-            Ok(base) => {
-                let base = base as u128;
-                (TIP_WEI, base * 2 + TIP_WEI)
-            }
-            Err(e) => {
-                let flat = (fallback_gwei * 1_000_000_000.0) as u128;
-                eprintln!("[relayer] base fee unavailable ({e}); EIP-1559 fallback maxFee={fallback_gwei} gwei");
-                (TIP_WEI.min(flat.max(1)), flat.max(TIP_WEI))
-            }
-        }
+    /// Robinhood uses one wei priority and 10% headroom with no stale fallback.
+    /// Other chains preserve their existing 1 gwei tip / 2x-base policy.
+    async fn suggest_eip1559_fees(&self, chain_id: u64, fallback_gwei: f64) -> Result<(u128, u128)> {
+        eip1559_fee_quote(chain_id, self.base_fee_per_gas().await.ok(), fallback_gwei)
     }
 
     /// 查询 tx receipt。返回 None 表示还在 pending；Some(true) 成功；Some(false) revert。
@@ -8739,6 +8773,31 @@ mod tests {
         assert!(enforce_eip1559_fee_cap(21, 21, Some(20)).is_err());
         assert!(enforce_eip1559_fee_cap(0, 20, Some(20)).is_err());
         assert!(enforce_eip1559_fee_cap(2, 1, None).is_err());
+    }
+
+    #[test]
+    fn robinhood_live_fee_quote_fits_the_reviewed_cap_without_a_gwei_tip() {
+        let fees = eip1559_fee_quote(4663, Some(464_194_000), 1.0).unwrap();
+        assert_eq!(fees, (1, 510_613_401));
+        assert_eq!(enforce_eip1559_fee_cap(fees.0, fees.1, Some(600_000_000)).unwrap(), fees);
+        assert_eq!(eip1559_fee_quote(4663, Some(1), 1.0).unwrap(), (1, 3));
+        assert_eq!(eip1559_fee_quote(4663, Some(0), 1.0).unwrap(), (1, 1));
+    }
+
+    #[test]
+    fn robinhood_missing_base_fee_or_price_spike_cannot_bypass_the_cap() {
+        assert!(eip1559_fee_quote(4663, None, 0.01).is_err());
+        let (priority, maximum) = eip1559_fee_quote(4663, Some(600_000_000), 0.01).unwrap();
+        assert!(enforce_eip1559_fee_cap(priority, maximum, Some(600_000_000)).is_err());
+        assert!(eip1559_fee_quote(4663, Some(u64::MAX), 0.01).is_ok());
+    }
+
+    #[test]
+    fn other_chains_keep_the_existing_eip1559_fee_policy() {
+        for chain in [1, 143, 11155111, 46630] {
+            assert_eq!(eip1559_fee_quote(chain, Some(10), 0.5).unwrap(), (1_000_000_000, 1_000_000_020));
+            assert_eq!(eip1559_fee_quote(chain, None, 0.5).unwrap(), (500_000_000, 1_000_000_000));
+        }
     }
 
     async fn call_with_token(
