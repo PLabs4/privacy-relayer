@@ -1686,44 +1686,7 @@ async fn privacy_swap_configs_from_env(
         let (Some(buy), Some(sell)) = (buy, sell) else {
             return Err(anyhow!("each admitted meme requires both directions"));
         };
-        if buy.market != sell.market
-            || buy.asset_symbol != sell.asset_symbol
-            || buy.asset_name != sell.asset_name
-            || buy.input_pool != sell.output_pool
-            || buy.output_pool != sell.input_pool
-            || buy.input_scale != sell.output_scale
-            || buy.output_scale != sell.input_scale
-            || buy.input_verifier_set_id != sell.output_verifier_set_id
-            || buy.output_verifier_set_id != sell.input_verifier_set_id
-            || buy.input_token != sell.output_token
-            || buy.output_token != sell.input_token
-            || buy.registry != sell.registry
-            || buy.market_profile != sell.market_profile
-            || buy.factory != sell.factory
-            || buy.factory_runtime_codehash != sell.factory_runtime_codehash
-            || buy.pool_manager != sell.pool_manager
-            || buy.hook != sell.hook
-            || buy.weth != sell.weth
-            || buy.v3_factory != sell.v3_factory
-            || buy.v3_factory_runtime_codehash != sell.v3_factory_runtime_codehash
-            || buy.pool != sell.pool
-            || buy.pool_runtime_codehash != sell.pool_runtime_codehash
-            || buy.pair_token != sell.pair_token
-            || buy.pool_fee != sell.pool_fee
-            || buy.tick_spacing != sell.tick_spacing
-            || buy.hook_fee_bps != sell.hook_fee_bps
-            || buy.creator_tax_bps != sell.creator_tax_bps
-            || buy.zero_for_one == sell.zero_for_one
-            || buy.fee_collector != sell.fee_collector
-            || buy.guardian != sell.guardian
-            || buy.swap_fee_units != sell.swap_fee_units
-            || buy.max_ttl_seconds != sell.max_ttl_seconds
-            || buy.max_market_slippage_bps_cap != sell.max_market_slippage_bps_cap
-            || buy.quoter != sell.quoter
-            || buy.quoter_runtime_codehash != sell.quoter_runtime_codehash
-        {
-            return Err(anyhow!("privacy-swap buy/sell routes are not exact reverses"));
-        }
+        privacy_swap::validate_reverse_pair(buy, sell)?;
     }
     Ok(routes)
 }

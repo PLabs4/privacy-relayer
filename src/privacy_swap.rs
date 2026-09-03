@@ -90,6 +90,53 @@ pub struct PrivacySwapConfig {
     pub event_getlogs_max_span: u64,
 }
 
+/// Individual route admission pins each fee to its immutable Coordinator.
+/// The reverse pair shares its market and safety policy, but swap_fee_units
+/// uses a different input-note denomination in each direction (ETH vs meme).
+pub fn validate_reverse_pair(buy: &PrivacySwapConfig, sell: &PrivacySwapConfig) -> Result<()> {
+    if buy.direction != "buy"
+        || sell.direction != "sell"
+        || buy.market != sell.market
+        || buy.meme_token != sell.meme_token
+        || buy.asset_symbol != sell.asset_symbol
+        || buy.asset_name != sell.asset_name
+        || buy.input_pool != sell.output_pool
+        || buy.output_pool != sell.input_pool
+        || buy.input_scale != sell.output_scale
+        || buy.output_scale != sell.input_scale
+        || buy.input_verifier_set_id != sell.output_verifier_set_id
+        || buy.output_verifier_set_id != sell.input_verifier_set_id
+        || buy.input_token != sell.output_token
+        || buy.output_token != sell.input_token
+        || buy.registry != sell.registry
+        || buy.market_profile != sell.market_profile
+        || buy.factory != sell.factory
+        || buy.factory_runtime_codehash != sell.factory_runtime_codehash
+        || buy.pool_manager != sell.pool_manager
+        || buy.hook != sell.hook
+        || buy.weth != sell.weth
+        || buy.v3_factory != sell.v3_factory
+        || buy.v3_factory_runtime_codehash != sell.v3_factory_runtime_codehash
+        || buy.pool != sell.pool
+        || buy.pool_runtime_codehash != sell.pool_runtime_codehash
+        || buy.pair_token != sell.pair_token
+        || buy.pool_fee != sell.pool_fee
+        || buy.tick_spacing != sell.tick_spacing
+        || buy.hook_fee_bps != sell.hook_fee_bps
+        || buy.creator_tax_bps != sell.creator_tax_bps
+        || buy.zero_for_one == sell.zero_for_one
+        || buy.fee_collector != sell.fee_collector
+        || buy.guardian != sell.guardian
+        || buy.max_ttl_seconds != sell.max_ttl_seconds
+        || buy.max_market_slippage_bps_cap != sell.max_market_slippage_bps_cap
+        || buy.quoter != sell.quoter
+        || buy.quoter_runtime_codehash != sell.quoter_runtime_codehash
+    {
+        return Err(anyhow!("privacy-swap buy/sell routes are not exact reverses"));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct SwapPlanJson {
     pub gross_input_units: String,
@@ -833,6 +880,50 @@ mod tests {
             min_broadcast_window_seconds: 30,
             event_getlogs_max_span: 101,
         }
+    }
+
+    fn reverse_config(buy: &PrivacySwapConfig) -> PrivacySwapConfig {
+        let mut sell = buy.clone();
+        sell.direction = "sell".into();
+        std::mem::swap(&mut sell.input_pool, &mut sell.output_pool);
+        std::mem::swap(&mut sell.input_token, &mut sell.output_token);
+        std::mem::swap(&mut sell.input_scale, &mut sell.output_scale);
+        std::mem::swap(&mut sell.input_verifier_set_id, &mut sell.output_verifier_set_id);
+        sell.zero_for_one = !buy.zero_for_one;
+        sell.swap_fee_units = 17_000;
+        sell
+    }
+
+    #[test]
+    fn reverse_pair_allows_independently_denominated_fees() {
+        let buy = config();
+        let sell = reverse_config(&buy);
+        assert_ne!(buy.swap_fee_units, sell.swap_fee_units);
+        validate_reverse_pair(&buy, &sell).unwrap();
+        let mut same_numeric_fee = sell;
+        same_numeric_fee.swap_fee_units = buy.swap_fee_units;
+        validate_reverse_pair(&buy, &same_numeric_fee).unwrap();
+    }
+
+    #[test]
+    fn reverse_pair_preserves_market_scale_fee_recipient_and_safety_pins() {
+        let buy = config();
+        let original = reverse_config(&buy);
+        let mut sell = original.clone();
+        sell.fee_collector = sell.guardian.clone();
+        assert!(validate_reverse_pair(&buy, &sell).is_err());
+        sell = original.clone();
+        sell.creator_tax_bps += 1;
+        assert!(validate_reverse_pair(&buy, &sell).is_err());
+        sell = original.clone();
+        sell.input_scale += Uint::one();
+        assert!(validate_reverse_pair(&buy, &sell).is_err());
+        sell = original.clone();
+        sell.max_ttl_seconds += 1;
+        assert!(validate_reverse_pair(&buy, &sell).is_err());
+        sell = original;
+        sell.direction = "buy".into();
+        assert!(validate_reverse_pair(&buy, &sell).is_err());
     }
 
     fn plan_json() -> SwapPlanJson {
