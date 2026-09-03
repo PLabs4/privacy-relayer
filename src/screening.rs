@@ -203,6 +203,23 @@ pub struct ScreeningConfig {
 }
 
 impl ScreeningConfig {
+    #[cfg(test)]
+    pub fn disabled_for_tests() -> Self {
+        Self {
+            enabled: false,
+            mode: ScreeningMode::Union,
+            fail_closed: true,
+            trm_api_key: None,
+            chainalysis_api_key: None,
+            trm_url: String::new(),
+            chainalysis_url: String::new(),
+            timeout: Duration::from_millis(1),
+            cache_ttl: Duration::from_secs(1),
+            cache: Arc::new(Mutex::new(HashMap::new())),
+            client: reqwest::Client::builder().no_proxy().build().unwrap_or_default(),
+        }
+    }
+
     /// Build from environment. All keys are optional; safe (disabled) by default.
     ///
     /// * `SCREENING_ENABLED`        — `true`/`false` (default `false`)
