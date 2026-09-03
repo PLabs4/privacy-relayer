@@ -505,6 +505,8 @@ fn gas_knob_for_kind(kind: &str) -> &'static str {
     match kind {
         "transfer" => "transfer (PRIVACYBTC_GAS_LIMIT_TRANSFER)",
         "wrapped_unshield" | "native_eth_unshield" => "unshield (PRIVACYBTC_GAS_LIMIT_UNSHIELD)",
+        "privacy_buy" => "privacy buy (PRIVACYBTC_GAS_LIMIT_PRIVACY_BUY)",
+        "privacy_swap" => "privacy swap (PRIVACYBTC_GAS_LIMIT_PRIVACY_SWAP)",
         _ => "queued transaction",
     }
 }
@@ -1222,13 +1224,19 @@ struct PrivacySwapRouteEnv {
     market_profile: String,
     factory: String,
     factory_runtime_codehash: String,
-    pool_manager: String,
-    hook: String,
-    weth: String,
+    pool_manager: Option<String>,
+    hook: Option<String>,
+    weth: Option<String>,
+    v3_factory: Option<String>,
+    v3_factory_runtime_codehash: Option<String>,
+    pool: Option<String>,
+    pool_runtime_codehash: Option<String>,
     meme_token: String,
     pair_token: String,
     pool_fee: u32,
-    tick_spacing: i32,
+    tick_spacing: Option<i32>,
+    hook_fee_bps: Option<u16>,
+    creator_tax_bps: Option<u16>,
     zero_for_one: bool,
     fee_collector: String,
     guardian: String,
@@ -1256,7 +1264,7 @@ async fn privacy_swap_configs_from_env(
         return Ok(HashMap::new());
     }
     if chain_id != privacy_swap::ROBINHOOD_CHAIN_ID {
-        return Err(anyhow!("privacy-swap v2 is pinned to Robinhood chain 4663"));
+        return Err(anyhow!("privacy-swap Pons v1/v2 is pinned to Robinhood chain 4663"));
     }
     let raw_routes: Vec<PrivacySwapRouteEnv> = serde_json::from_str(&required_env(
         "PRIVACYBTC_PRIVACY_SWAP_ROUTES_JSON",
@@ -1278,8 +1286,10 @@ async fn privacy_swap_configs_from_env(
 
     let mut routes = HashMap::new();
     for raw in raw_routes {
+        let is_v1 = raw.market == privacy_swap::PONS_V1_MARKET;
+        let is_v2 = raw.market == privacy_swap::PONS_V2_MARKET;
         if raw.schema != "perc20-privacy-swap/v2"
-            || raw.market != privacy_swap::MARKET_PROFILE
+            || (!is_v1 && !is_v2)
             || !matches!(raw.direction.as_str(), "buy" | "sell")
         {
             return Err(anyhow!("unsupported privacy-swap schema/market/direction"));
@@ -1291,11 +1301,46 @@ async fn privacy_swap_configs_from_env(
         {
             return Err(anyhow!("privacy-swap asset display metadata is invalid"));
         }
-        if raw.pool_fee >= (1 << 24)
-            || raw.tick_spacing <= 0
-            || raw.tick_spacing >= (1 << 23)
+        if raw.pool_fee >= (1 << 24) || (is_v1 && raw.pool_fee == 0) {
+            return Err(anyhow!("privacy-swap pool fee is outside the admitted ABI/profile bounds"));
+        }
+        let tick_spacing = if is_v2 {
+            raw.tick_spacing.ok_or_else(|| anyhow!("Pons v2 tickSpacing missing"))?
+        } else {
+            0
+        };
+        let hook_fee_bps = if is_v2 {
+            raw.hook_fee_bps.ok_or_else(|| anyhow!("Pons v2 hookFeeBps missing"))?
+        } else {
+            0
+        };
+        let creator_tax_bps = if is_v2 {
+            raw.creator_tax_bps.ok_or_else(|| anyhow!("Pons v2 creatorTaxBps missing"))?
+        } else {
+            0
+        };
+        if is_v2
+            && (raw.pool_fee != 0
+                || tick_spacing <= 0
+                || tick_spacing >= (1 << 23)
+                || u32::from(hook_fee_bps) + u32::from(creator_tax_bps) > 2_000)
         {
-            return Err(anyhow!("privacy-swap pool fee/tick spacing is outside ABI bounds"));
+            return Err(anyhow!("privacy-swap Pons v2 pool/fee policy is outside protocol bounds"));
+        }
+        if is_v1
+            && (raw.tick_spacing.is_some()
+                || raw.hook_fee_bps.is_some()
+                || raw.creator_tax_bps.is_some())
+        {
+            return Err(anyhow!("privacy-swap Pons v1 route contains v2-only fields"));
+        }
+        if is_v2
+            && (raw.v3_factory.is_some()
+                || raw.v3_factory_runtime_codehash.is_some()
+                || raw.pool.is_some()
+                || raw.pool_runtime_codehash.is_some())
+        {
+            return Err(anyhow!("privacy-swap Pons v2 route contains v1-only fields"));
         }
         let route_id = privacy_swap::parse_fixed_hex::<32>(&raw.route_id, "routeId")?;
         if route_id == [0u8; 32] {
@@ -1313,20 +1358,43 @@ async fn privacy_swap_configs_from_env(
         let output_token = normalize_evm_address(&raw.output_token)?;
         let adapter = normalize_evm_address(&raw.adapter)?;
         let factory = normalize_evm_address(&raw.factory)?;
-        let pool_manager = normalize_evm_address(&raw.pool_manager)?;
-        let hook = normalize_evm_address(&raw.hook)?;
-        let weth = normalize_evm_address(&raw.weth)?;
+        let zero_address = format!("0x{}", "00".repeat(20));
+        let pool_manager = if is_v2 {
+            normalize_evm_address(raw.pool_manager.as_deref().ok_or_else(|| anyhow!("Pons v2 poolManager missing"))?)?
+        } else {
+            zero_address.clone()
+        };
+        let hook = if is_v2 {
+            normalize_evm_address(raw.hook.as_deref().ok_or_else(|| anyhow!("Pons v2 hook missing"))?)?
+        } else {
+            zero_address.clone()
+        };
+        let weth = if is_v2 {
+            normalize_evm_address(raw.weth.as_deref().ok_or_else(|| anyhow!("Pons v2 WETH missing"))?)?
+        } else {
+            zero_address.clone()
+        };
+        let v3_factory = if is_v1 {
+            normalize_evm_address(raw.v3_factory.as_deref().ok_or_else(|| anyhow!("Pons v1 v3Factory missing"))?)?
+        } else {
+            zero_address.clone()
+        };
+        let pool = if is_v1 {
+            normalize_evm_address(raw.pool.as_deref().ok_or_else(|| anyhow!("Pons v1 pool missing"))?)?
+        } else {
+            zero_address.clone()
+        };
         let meme_token = normalize_evm_address(&raw.meme_token)?;
         let pair_token = normalize_evm_address(&raw.pair_token)?;
         let fee_collector = normalize_evm_address(&raw.fee_collector)?;
         let guardian = normalize_evm_address(&raw.guardian)?;
         let quoter = normalize_evm_address(&raw.quoter)?;
-        if pool_manager != privacy_swap::ROBINHOOD_V4_POOL_MANAGER
-            || quoter != privacy_swap::ROBINHOOD_V4_QUOTER
+        if (is_v2
+            && (pool_manager != privacy_swap::ROBINHOOD_V4_POOL_MANAGER
+                || quoter != privacy_swap::ROBINHOOD_V4_QUOTER))
+            || (is_v1 && quoter != privacy_swap::ROBINHOOD_V3_QUOTER)
         {
-            return Err(anyhow!(
-                "privacy-swap must use the canonical Robinhood V4 PoolManager and Quoter"
-            ));
+            return Err(anyhow!("privacy-swap market uses a non-canonical Robinhood Quoter/manager"));
         }
         let input_verifier_set_id =
             privacy_swap::parse_fixed_hex(&raw.input_verifier_set_id, "inputVerifierSetId")?;
@@ -1346,10 +1414,32 @@ async fn privacy_swap_configs_from_env(
             &raw.quoter_runtime_codehash,
             "quoterRuntimeCodehash",
         )?;
-        if market_profile != privacy_swap::MARKET_PROFILE_HASH
+        let v3_factory_runtime_codehash = if is_v1 {
+            privacy_swap::parse_fixed_hex(
+                raw.v3_factory_runtime_codehash.as_deref().ok_or_else(|| anyhow!("Pons v1 v3FactoryRuntimeCodehash missing"))?,
+                "v3FactoryRuntimeCodehash",
+            )?
+        } else {
+            [0u8; 32]
+        };
+        let pool_runtime_codehash = if is_v1 {
+            privacy_swap::parse_fixed_hex(
+                raw.pool_runtime_codehash.as_deref().ok_or_else(|| anyhow!("Pons v1 poolRuntimeCodehash missing"))?,
+                "poolRuntimeCodehash",
+            )?
+        } else {
+            [0u8; 32]
+        };
+        let expected_profile = if is_v1 {
+            privacy_swap::PONS_V1_MARKET_PROFILE_HASH
+        } else {
+            privacy_swap::PONS_V2_MARKET_PROFILE_HASH
+        };
+        if market_profile != expected_profile
             || adapter_runtime_codehash == [0u8; 32]
             || factory_runtime_codehash == [0u8; 32]
             || quoter_runtime_codehash == [0u8; 32]
+            || (is_v1 && (v3_factory_runtime_codehash == [0u8; 32] || pool_runtime_codehash == [0u8; 32]))
         {
             return Err(anyhow!("privacy-swap codehash/profile pins must be non-zero and reviewed"));
         }
@@ -1373,10 +1463,8 @@ async fn privacy_swap_configs_from_env(
             ("input pool", input_pool.as_str()),
             ("output pool", output_pool.as_str()),
             ("Adapter", adapter.as_str()),
-            ("V4 Quoter", quoter.as_str()),
+            ("market Quoter", quoter.as_str()),
             ("Pons factory", factory.as_str()),
-            ("V4 PoolManager", pool_manager.as_str()),
-            ("Pons hook", hook.as_str()),
             ("meme token", meme_token.as_str()),
             ("input token", input_token.as_str()),
             ("output token", output_token.as_str()),
@@ -1385,15 +1473,25 @@ async fn privacy_swap_configs_from_env(
                 .await
                 .with_context(|| format!("privacy-swap {label} code gate"))?;
         }
-        if pair_token != format!("0x{}", "00".repeat(20)) {
+        if pair_token != zero_address {
             rpc.require_code(&pair_token).await.context("privacy-swap pair token code gate")?;
-        } else {
+        } else if is_v2 {
             rpc.require_code(&weth).await.context("privacy-swap WETH code gate")?;
+        }
+        if is_v1 {
+            rpc.require_code(&v3_factory).await.context("privacy-swap V3 factory code gate")?;
+            rpc.require_code(&pool).await.context("privacy-swap V3 pool code gate")?;
+        } else {
+            rpc.require_code(&pool_manager).await.context("privacy-swap V4 PoolManager code gate")?;
+            rpc.require_code(&hook).await.context("privacy-swap Pons hook code gate")?;
         }
         if rpc.runtime_codehash(&quoter).await? != quoter_runtime_codehash
             || rpc.runtime_codehash(&factory).await? != factory_runtime_codehash
+            || (is_v1
+                && (rpc.runtime_codehash(&v3_factory).await? != v3_factory_runtime_codehash
+                    || rpc.runtime_codehash(&pool).await? != pool_runtime_codehash))
         {
-            return Err(anyhow!("privacy-swap Quoter/factory runtime codehash drift"));
+            return Err(anyhow!("privacy-swap market dependency runtime codehash drift"));
         }
         rpc.verify_protocol_version(&coordinator, privacy_swap::PROTOCOL_VERSION)
             .await?;
@@ -1447,9 +1545,6 @@ async fn privacy_swap_configs_from_env(
         }
         for (field, actual, expected) in [
             ("factory", rpc.read_address(&adapter, "factory()").await?, factory.as_str()),
-            ("poolManager", rpc.read_address(&adapter, "poolManager()").await?, pool_manager.as_str()),
-            ("hook", rpc.read_address(&adapter, "hook()").await?, hook.as_str()),
-            ("weth", rpc.read_address(&adapter, "weth()").await?, weth.as_str()),
             ("memeToken", rpc.read_address(&adapter, "memeToken()").await?, meme_token.as_str()),
             ("pairToken", rpc.read_address(&adapter, "pairToken()").await?, pair_token.as_str()),
             ("inputToken", rpc.read_address(&adapter, "inputToken()").await?, input_token.as_str()),
@@ -1459,15 +1554,38 @@ async fn privacy_swap_configs_from_env(
                 return Err(anyhow!("privacy-swap Adapter {field} differs from Manifest"));
             }
         }
+        let variant_dependencies = if is_v1 {
+            vec![
+                ("v3Factory", rpc.read_address(&adapter, "v3Factory()").await?, v3_factory.as_str()),
+                ("pool", rpc.read_address(&adapter, "pool()").await?, pool.as_str()),
+            ]
+        } else {
+            vec![
+                ("poolManager", rpc.read_address(&adapter, "poolManager()").await?, pool_manager.as_str()),
+                ("hook", rpc.read_address(&adapter, "hook()").await?, hook.as_str()),
+                ("weth", rpc.read_address(&adapter, "weth()").await?, weth.as_str()),
+            ]
+        };
+        for (field, actual, expected) in variant_dependencies {
+            if actual != expected {
+                return Err(anyhow!("privacy-swap Adapter {field} differs from Manifest"));
+            }
+        }
         if rpc.read_u64(&adapter, "adapterVersion()").await? != 2
             || rpc.read_bytes32(&adapter, "marketProfile()").await? != market_profile
             || rpc.read_u64(&adapter, "poolFee()").await? != u64::from(raw.pool_fee)
-            || rpc.read_u64(&adapter, "tickSpacing()").await?
-                != u64::try_from(raw.tick_spacing).expect("positive checked")
             || rpc.read_bool(&adapter, "zeroForOne()").await? != raw.zero_for_one
             || rpc.read_bytes32(&adapter, "routeHash()").await? != route_hash
         {
             return Err(anyhow!("privacy-swap Adapter pool/route profile differs from Manifest"));
+        }
+        if is_v2
+            && (rpc.read_u64(&adapter, "tickSpacing()").await?
+                != u64::try_from(tick_spacing).expect("positive checked")
+                || rpc.read_u64(&adapter, "hookFeeBps()").await? != u64::from(hook_fee_bps)
+                || rpc.read_u64(&adapter, "creatorTaxBps()").await? != u64::from(creator_tax_bps))
+        {
+            return Err(anyhow!("privacy-swap Adapter Pons v2 fee policy differs from Manifest"));
         }
         rpc.eth_call(&adapter, &view_selector("validateMarket()"))
             .await
@@ -1499,6 +1617,7 @@ async fn privacy_swap_configs_from_env(
             route_key,
             privacy_swap::PrivacySwapConfig {
                 accepting,
+                market: raw.market,
                 route_id,
                 direction: raw.direction,
                 asset_symbol: raw.asset_symbol,
@@ -1535,11 +1654,17 @@ async fn privacy_swap_configs_from_env(
                 pool_manager,
                 hook,
                 weth,
+                v3_factory,
+                v3_factory_runtime_codehash,
+                pool,
+                pool_runtime_codehash,
                 meme_token,
                 pair_token,
                 pool_fee: raw.pool_fee,
-                tick_spacing: raw.tick_spacing,
+                tick_spacing,
                 zero_for_one: raw.zero_for_one,
+                hook_fee_bps,
+                creator_tax_bps,
                 guardian,
                 gas_limit,
                 min_broadcast_window_seconds,
@@ -1550,7 +1675,7 @@ async fn privacy_swap_configs_from_env(
 
     let mut by_meme: HashMap<String, Vec<&privacy_swap::PrivacySwapConfig>> = HashMap::new();
     for route in routes.values() {
-        by_meme.entry(route.meme_token.clone()).or_default().push(route);
+        by_meme.entry(format!("{}:{}", route.market, route.meme_token)).or_default().push(route);
     }
     for pair in by_meme.values() {
         if pair.len() != 2 {
@@ -1561,7 +1686,8 @@ async fn privacy_swap_configs_from_env(
         let (Some(buy), Some(sell)) = (buy, sell) else {
             return Err(anyhow!("each admitted meme requires both directions"));
         };
-        if buy.asset_symbol != sell.asset_symbol
+        if buy.market != sell.market
+            || buy.asset_symbol != sell.asset_symbol
             || buy.asset_name != sell.asset_name
             || buy.input_pool != sell.output_pool
             || buy.output_pool != sell.input_pool
@@ -1578,9 +1704,15 @@ async fn privacy_swap_configs_from_env(
             || buy.pool_manager != sell.pool_manager
             || buy.hook != sell.hook
             || buy.weth != sell.weth
+            || buy.v3_factory != sell.v3_factory
+            || buy.v3_factory_runtime_codehash != sell.v3_factory_runtime_codehash
+            || buy.pool != sell.pool
+            || buy.pool_runtime_codehash != sell.pool_runtime_codehash
             || buy.pair_token != sell.pair_token
             || buy.pool_fee != sell.pool_fee
             || buy.tick_spacing != sell.tick_spacing
+            || buy.hook_fee_bps != sell.hook_fee_bps
+            || buy.creator_tax_bps != sell.creator_tax_bps
             || buy.zero_for_one == sell.zero_for_one
             || buy.fee_collector != sell.fee_collector
             || buy.guardian != sell.guardian
@@ -2625,7 +2757,7 @@ async fn http_health(
     let privacy_swap = serde_json::json!({
         "configured": !cfg.privacy_swaps.is_empty(),
         "accepting": cfg.privacy_swaps.values().any(|route| route.accepting),
-        "market": privacy_swap::MARKET_PROFILE,
+        "markets": cfg.privacy_swaps.values().map(|route| route.market.as_str()).collect::<HashSet<_>>(),
         "route_count": cfg.privacy_swaps.len(),
     });
     match cfg.tx_queue.stats() {
@@ -3238,9 +3370,13 @@ async fn http_privacy_buy(
         .estimate_gas(&sender, &config.coordinator, &calldata, 0)
         .await
         .map_err(http_error)?;
-    let _signed_gas_limit =
-        gas_limit_with_margin(estimated, cfg.gas_limit_margin_bps, config.gas_limit)
-            .map_err(http_error)?;
+    let _signed_gas_limit = gas_limit_with_margin(
+        gas_knob_for_kind("privacy_buy"),
+        estimated,
+        cfg.gas_limit_margin_bps,
+        config.gas_limit,
+    )
+    .map_err(http_error)?;
     let nullifiers = privacy_buy_nullifiers(&config, &req.unshield_bundle, &req.shield_bundle)
         .map_err(http_error)?;
     let admission_block = client
@@ -3287,21 +3423,56 @@ async fn quote_privacy_swap(
 ) -> Result<ethabi::Uint> {
     if client.runtime_codehash(&config.quoter).await? != config.quoter_runtime_codehash
         || client.runtime_codehash(&config.factory).await? != config.factory_runtime_codehash
+        || (config.market == privacy_swap::PONS_V1_MARKET
+            && (client.runtime_codehash(&config.v3_factory).await? != config.v3_factory_runtime_codehash
+                || client.runtime_codehash(&config.pool).await? != config.pool_runtime_codehash))
     {
-        return Err(anyhow!("privacy-swap Quoter/factory codehash changed after startup"));
+        return Err(anyhow!("privacy-swap market dependency codehash changed after startup"));
     }
     let launch_call = privacy_swap::encode_get_launch_calldata(&config.meme_token)?;
     let launch = client
         .eth_call(&config.factory, &format!("0x{}", hex::encode(launch_call)))
         .await
-        .context("privacy-swap Pons PoolCreated check")?;
-    privacy_swap::validate_launch_result(&launch, config)?;
-    let quote_call = privacy_swap::encode_v4_quote_calldata(config, validated.want_output_wei)?;
+        .context("privacy-swap Pons launch check")?;
+    let quote_call = if config.market == privacy_swap::PONS_V1_MARKET {
+        privacy_swap::validate_v1_launch_result(&launch, config)?;
+        let graduation = client
+            .eth_call(
+                &config.factory,
+                &format!(
+                    "0x{}",
+                    hex::encode(privacy_swap::encode_v1_graduation_status_calldata(&config.meme_token)?)
+                ),
+            )
+            .await
+            .context("privacy-swap Pons v1 graduation check")?;
+        privacy_swap::validate_v1_graduation_result(&graduation)?;
+        let pool_result = client
+            .eth_call(
+                &config.v3_factory,
+                &format!("0x{}", hex::encode(privacy_swap::encode_v3_get_pool_calldata(config)?)),
+            )
+            .await
+            .context("privacy-swap Pons v1 V3 getPool check")?;
+        privacy_swap::validate_v3_pool_result(&pool_result, config)?;
+        privacy_swap::encode_v3_quote_calldata(config, validated.want_output_wei)?
+    } else {
+        privacy_swap::validate_launch_result(&launch, config)?;
+        let hook_result = client
+            .eth_call(
+                &config.hook,
+                &format!("0x{}", hex::encode(privacy_swap::encode_hook_launch_calldata(config)?)),
+            )
+            .await
+            .context("privacy-swap Pons v2 hook fee check")?;
+        privacy_swap::validate_hook_fee_result(&hook_result, config)?;
+        privacy_swap::encode_v4_quote_calldata(config, validated.want_output_wei)?
+    };
     let result = client
         .eth_call(&config.quoter, &format!("0x{}", hex::encode(quote_call)))
         .await
-        .context("privacy-swap V4 exact-output quote")?;
-    privacy_swap::parse_first_abi_uint(&result, "V4Quoter.quoteExactOutputSingle")
+        .context("privacy-swap market exact-output quote")?;
+    privacy_swap::parse_first_abi_uint(&result, "market exact-output quote")
 }
 
 fn privacy_swap_nullifiers(
@@ -3441,8 +3612,13 @@ async fn http_privacy_swap(
         .estimate_gas(&sender, &config.coordinator, &calldata, 0)
         .await
         .map_err(http_error)?;
-    gas_limit_with_margin(estimated, cfg.gas_limit_margin_bps, config.gas_limit)
-        .map_err(http_error)?;
+    gas_limit_with_margin(
+        gas_knob_for_kind("privacy_swap"),
+        estimated,
+        cfg.gas_limit_margin_bps,
+        config.gas_limit,
+    )
+    .map_err(http_error)?;
     let nullifiers =
         privacy_swap_nullifiers(&config, &req.unshield_bundle, &req.shield_bundle)
             .map_err(http_error)?;
@@ -8568,6 +8744,8 @@ mod tests {
         assert!(
             gas_knob_for_kind("native_eth_unshield").contains("PRIVACYBTC_GAS_LIMIT_UNSHIELD")
         );
+        assert!(gas_knob_for_kind("privacy_buy").contains("PRIVACYBTC_GAS_LIMIT_PRIVACY_BUY"));
+        assert!(gas_knob_for_kind("privacy_swap").contains("PRIVACYBTC_GAS_LIMIT_PRIVACY_SWAP"));
         assert_eq!(gas_knob_for_kind("something_new"), "queued transaction");
     }
 
@@ -9022,6 +9200,8 @@ mod tests {
                     "salt": format!("0x{}", "00".repeat(32))
                 },
                 "quote_evidence": {
+                    "market": "pons-v2-graduated-v4",
+                    "market_version": 2,
                     "chain_id": 4663,
                     "route_id": format!("0x{}", "11".repeat(32)),
                     "block_number": 1,
@@ -9031,10 +9211,13 @@ mod tests {
                     "factory": "0x2222222222222222222222222222222222222222",
                     "factory_runtime_codehash": format!("0x{}", "44".repeat(32)),
                     "launch_phase": 2,
+                    "pool_fee": 0,
+                    "hook_fee_bps": 100,
+                    "creator_tax_bps": 0,
                     "want_output_wei": "1",
                     "amount_in_wei": "1"
                 },
-                "route_data": format!("0x{}", "00".repeat(13 * 32)),
+                "route_data": format!("0x{}", "00".repeat(15 * 32)),
                 "unshield_bundle": test_bundle(),
                 "shield_bundle": test_bundle()
             })),
