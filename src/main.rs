@@ -5,6 +5,7 @@
 //! relay EOA is replaced by multisig execution; this binary stays single-key for local signing.
 
 mod fee_calldata;
+mod pool_verifier_sets;
 mod privacy_buy;
 mod privacy_swap;
 mod screening;
@@ -768,6 +769,7 @@ struct RelayerHttpConfig {
     protocol_pools: HashSet<String>,
     expected_protocol_version: u64,
     expected_verifier_set_id: [u8; 32],
+    verifier_set_overrides: pool_verifier_sets::PoolVerifierSets,
     /// Immutable, boot-verified fixed-pair privacy-buy capability. None keeps the route
     /// fail-closed while still exposing a stable typed endpoint.
     privacy_buy: Option<privacy_buy::PrivacyBuyConfig>,
@@ -792,6 +794,7 @@ const CURRENT_PROTOCOL_VERSION: u64 = 3;
 struct ProtocolExpectation {
     version: u64,
     verifier_set_id: [u8; 32],
+    verifier_set_overrides: pool_verifier_sets::PoolVerifierSets,
     pools: HashSet<String>,
 }
 
@@ -823,7 +826,14 @@ fn protocol_expectation_from_env(default_pool: &str) -> Result<ProtocolExpectati
             "PRIVACYBTC_CONTRACT_ADDRESS {default_pool} is missing from PRIVACYBTC_RELAYER_PROTOCOL_POOLS"
         ));
     }
+    let verifier_set_overrides = pool_verifier_sets::PoolVerifierSets::from_json(
+        &std::env::var("PRIVACYBTC_RELAYER_VERIFIER_SET_OVERRIDES").unwrap_or_else(|_| "[]".into())
+    ).context("PRIVACYBTC_RELAYER_VERIFIER_SET_OVERRIDES")?;
+    if verifier_set_overrides.pools().any(|pool| !pools.contains(pool)) {
+        return Err(anyhow!("verifier override pool is outside PRIVACYBTC_RELAYER_PROTOCOL_POOLS"));
+    }
     Ok(ProtocolExpectation {
+        verifier_set_overrides,
         version,
         verifier_set_id,
         pools,
@@ -1027,7 +1037,7 @@ async fn privacy_buy_config_from_env(
                 "privacy-buy pool {pool} is missing from PRIVACYBTC_RELAYER_PROTOCOL_POOLS"
             ));
         }
-        rpc.verify_pool_protocol(pool, protocol.version, &protocol.verifier_set_id)
+        rpc.verify_pool_protocol(pool, protocol.version, protocol.verifier_set_overrides.expected(pool, &protocol.verifier_set_id))
             .await
             .with_context(|| format!("privacy-buy protocol gate for pool {pool}"))?;
         rpc.verify_registry_pool(&registry, pool)
@@ -1041,8 +1051,8 @@ async fn privacy_buy_config_from_env(
     let target_verifier_set_id = rpc
         .read_bytes32(&coordinator, "targetVerifierSetId()")
         .await?;
-    if quote_verifier_set_id != protocol.verifier_set_id
-        || target_verifier_set_id != protocol.verifier_set_id
+    if quote_verifier_set_id != *protocol.verifier_set_overrides.expected(&quote_pool, &protocol.verifier_set_id)
+        || target_verifier_set_id != *protocol.verifier_set_overrides.expected(&target_pool, &protocol.verifier_set_id)
         || quote_verifier_set_id != expected_quote_verifier_set_id
         || target_verifier_set_id != expected_target_verifier_set_id
     {
@@ -1520,7 +1530,7 @@ async fn privacy_swap_configs_from_env(
             if !protocol.pools.contains(pool) {
                 return Err(anyhow!("privacy-swap pool {pool} is outside protocol allowlist"));
             }
-            rpc.verify_pool_protocol(pool, protocol.version, &protocol.verifier_set_id)
+            rpc.verify_pool_protocol(pool, protocol.version, protocol.verifier_set_overrides.expected(pool, &protocol.verifier_set_id))
                 .await?;
             rpc.verify_registry_pool(&registry, pool).await?;
         }
@@ -1528,8 +1538,8 @@ async fn privacy_swap_configs_from_env(
             != input_verifier_set_id
             || rpc.read_bytes32(&coordinator, "outputVerifierSetId()").await?
                 != output_verifier_set_id
-            || input_verifier_set_id != protocol.verifier_set_id
-            || output_verifier_set_id != protocol.verifier_set_id
+            || input_verifier_set_id != *protocol.verifier_set_overrides.expected(&input_pool, &protocol.verifier_set_id)
+            || output_verifier_set_id != *protocol.verifier_set_overrides.expected(&output_pool, &protocol.verifier_set_id)
             || rpc.read_bytes32(&coordinator, "marketProfile()").await? != market_profile
             || rpc.read_bytes32(&coordinator, "routeId()").await? != route_id
             || rpc.read_bytes32(&coordinator, "routeHash()").await? != route_hash
@@ -2427,7 +2437,7 @@ async fn run_http_server(
     let rpc = EthRpcClient::new(rpc_url.to_string());
     validate_gas_caps_against_chain(&rpc, &gas_caps).await?;
     for pool in &protocol.pools {
-        rpc.verify_pool_protocol(pool, protocol.version, &protocol.verifier_set_id)
+        rpc.verify_pool_protocol(pool, protocol.version, protocol.verifier_set_overrides.expected(pool, &protocol.verifier_set_id))
             .await
             .with_context(|| format!("protocol gate for pool {pool}"))?;
     }
@@ -2652,6 +2662,7 @@ async fn run_http_server(
         protocol_pools: protocol.pools,
         expected_protocol_version: protocol.version,
         expected_verifier_set_id: protocol.verifier_set_id,
+        verifier_set_overrides: protocol.verifier_set_overrides,
         privacy_buy,
         privacy_swaps,
     });
@@ -3281,7 +3292,7 @@ async fn http_privacy_buy(
             .verify_pool_protocol(
                 pool,
                 cfg.expected_protocol_version,
-                &cfg.expected_verifier_set_id,
+                cfg.verifier_set_overrides.expected(pool, &cfg.expected_verifier_set_id),
             )
             .await
             .map_err(http_error)?;
@@ -3531,7 +3542,7 @@ async fn http_privacy_swap(
     let client = EthRpcClient::new(cfg.rpc_url.clone());
     for pool in [&config.input_pool, &config.output_pool] {
         client
-            .verify_pool_protocol(pool, cfg.expected_protocol_version, &cfg.expected_verifier_set_id)
+            .verify_pool_protocol(pool, cfg.expected_protocol_version, cfg.verifier_set_overrides.expected(pool, &cfg.expected_verifier_set_id))
             .await
             .map_err(http_error)?;
         client
@@ -8682,6 +8693,7 @@ mod tests {
             .collect(),
             expected_protocol_version: 3,
             expected_verifier_set_id: [0xabu8; 32],
+            verifier_set_overrides: pool_verifier_sets::PoolVerifierSets::default(),
             privacy_buy: None,
             privacy_swaps: HashMap::new(),
         })
